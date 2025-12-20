@@ -1,0 +1,519 @@
+
+
+## Production-ready approach (Spring Batch → Kafka for Spark)
+
+The most reliable way to **resume after crashes** with *millions* of files is to **persist “what’s done” outside the JVM** (DB table), not only rely on an in-memory file scan.
+
+### High-level architecture
+
+* **PostgreSQL**
+    * Spring Batch `JobRepository` tables (restart metadata)
+    * A custom **work table** `image_work` (business checkpoint: NEW/RETRY/SENT/FAILED)
+* **Spring Batch job**
+    * `indexFilesStep` (tasklet): scan filesystem and upsert file paths into `image_work`
+    * `publishToKafkaStep` (chunk): read NEW/RETRY rows, read bytes, send to Kafka, mark SENT/RETRY/FAILED
+* **Kafka message**
+    * `key`: stable id (e.g., path or SHA-256)
+    * `value`: raw `byte[]` image payload (Spark reads it as binary)
+    * headers: path, filename, contentType, size, lastModified, sha256
+
+This ensures that after a crash/restart, the job continues by selecting only rows that are not `SENT`.
+
+---
+
+## DB schema (work table)
+
+Create a work table to persist progress:
+
+```sql
+create table image_work (
+    id bigserial primary key,
+    path text not null unique,
+    size_bytes bigint not null,
+    last_modified timestamptz not null,
+
+    status varchar(16) not null, -- NEW, RETRY, SENT, FAILED
+    attempts int not null default 0,
+    last_error text,
+
+    sent_at timestamptz,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create index idx_image_work_status_id on image_work(status, id);
+```
+
+Use Flyway/Liquibase in production (recommended) and also apply the standard Spring Batch schema for PostgreSQL.
+
+---
+
+## Maven dependencies (pom.xml)
+
+```xml
+<project>
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.4.0</version>
+    </parent>
+
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-batch</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+    </dependencies>
+</project>
+```
+
+---
+
+## application.yml (Kafka + Batch + your tuning)
+
+```yaml
+spring:
+    datasource:
+        url: jdbc:postgresql://localhost:5432/image_batch
+        username: image_batch
+        password: image_batch
+
+    batch:
+        jdbc:
+            initialize-schema: never
+        job:
+            enabled: true
+
+    kafka:
+        bootstrap-servers: localhost:9092
+        producer:
+            key-serializer: org.apache.kafka.common.serialization.StringSerializer
+            value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+            properties:
+                acks: all
+                enable.idempotence: true
+                retries: 2147483647
+                max.in.flight.requests.per.connection: 5
+                linger.ms: 20
+                batch.size: 65536
+                delivery.timeout.ms: 120000
+                request.timeout.ms: 30000
+                max.request.size: 10485760
+
+management:
+    endpoints:
+        web:
+            exposure:
+                include: health,info,metrics,prometheus
+
+image:
+    batch:
+        root-dir: /data/images
+        topic: images.raw
+        chunk-size: 10
+        page-size: 200
+        max-file-size-bytes: 10485760
+        max-attempts: 5
+        kafka-send-timeout-seconds: 30
+```
+
+**Important:** Kafka brokers also need `message.max.bytes` high enough for your images (and Spark consumers need matching fetch limits).
+
+---
+
+## Core Spring Batch job (index + publish + restartable)
+
+### Properties
+
+```java
+package com.example.imagebatch;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+@ConfigurationProperties(prefix = "image.batch")
+public record ImageBatchProperties(
+    String rootDir,
+    String topic,
+    int chunkSize,
+    int pageSize,
+    long maxFileSizeBytes,
+    int maxAttempts,
+    int kafkaSendTimeoutSeconds
+) {}
+```
+
+### Job configuration
+
+```java
+package com.example.imagebatch.batch;
+
+import com.example.imagebatch.ImageBatchProperties;
+import com.example.imagebatch.model.ImageWorkItem;
+import javax.sql.DataSource;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.item.database.JdbcPagingItemReader;
+import org.springframework.batch.item.database.Order;
+import org.springframework.batch.item.database.builder.JdbcPagingItemReaderBuilder;
+import org.springframework.batch.item.database.support.PostgresPagingQueryProvider;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.util.Map;
+
+@Configuration
+public class ImageToKafkaJobConfig {
+
+    @Bean
+    public Job imageToKafkaJob(
+        JobRepository jobRepository,
+        Step indexFilesStep,
+        Step publishToKafkaStep
+    ) {
+        return new JobBuilder("imageToKafkaJob", jobRepository)
+            .start(indexFilesStep)
+            .next(publishToKafkaStep)
+            .build();
+    }
+
+    @Bean
+    public Step publishToKafkaStep(
+        JobRepository jobRepository,
+        PlatformTransactionManager transactionManager,
+        JdbcPagingItemReader<ImageWorkItem> imageWorkReader,
+        ImageToKafkaWriter writer,
+        ImageBatchProperties props
+    ) {
+        return new org.springframework.batch.core.step.builder.StepBuilder("publishToKafkaStep", jobRepository)
+            .<ImageWorkItem, ImageWorkItem>chunk(props.chunkSize(), transactionManager)
+            .reader(imageWorkReader)
+            .processor(item -> item)
+            .writer(writer)
+            .build();
+    }
+
+    @Bean
+    public JdbcPagingItemReader<ImageWorkItem> imageWorkReader(DataSource dataSource, ImageBatchProperties props) {
+        PostgresPagingQueryProvider provider = new PostgresPagingQueryProvider();
+        provider.setSelectClause("select id, path, size_bytes, last_modified");
+        provider.setFromClause("from image_work");
+        provider.setWhereClause("where status in ('NEW','RETRY') and attempts < :maxAttempts");
+        provider.setSortKeys(Map.of("id", Order.ASCENDING));
+
+        return new JdbcPagingItemReaderBuilder<ImageWorkItem>()
+            .name("imageWorkReader")
+            .dataSource(dataSource)
+            .queryProvider(provider)
+            .parameterValues(Map.of("maxAttempts", props.maxAttempts()))
+            .pageSize(props.pageSize())
+            .saveState(false)
+            .rowMapper((rs, rowNum) -> new ImageWorkItem(
+                rs.getLong("id"),
+                rs.getString("path"),
+                rs.getLong("size_bytes"),
+                rs.getTimestamp("last_modified").toInstant()
+            ))
+            .build();
+    }
+
+    @Bean
+    public JdbcTemplate jdbcTemplate(DataSource ds) {
+        return new JdbcTemplate(ds);
+    }
+}
+```
+
+`saveState(false)` is intentional here: **the DB status is the checkpoint**, so restarts don’t depend on reader cursor state.
+
+---
+
+## Indexing step (tasklet) to populate the work table
+
+```java
+package com.example.imagebatch.batch;
+
+import com.example.imagebatch.ImageBatchProperties;
+import org.springframework.batch.core.StepContribution;
+import org.springframework.batch.core.scope.context.ChunkContext;
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.repeat.RepeatStatus;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.stream.Stream;
+
+public class IndexFilesTasklet implements Tasklet {
+
+    private static final Set<String> EXT = Set.of("jpg","jpeg","png","gif","bmp","tiff","webp");
+
+    private final JdbcTemplate jdbcTemplate;
+    private final ImageBatchProperties props;
+
+    public IndexFilesTasklet(JdbcTemplate jdbcTemplate, ImageBatchProperties props) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.props = props;
+    }
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+        Path root = Path.of(props.rootDir());
+
+        List<Object[]> batch = new ArrayList<>(1_000);
+        try (Stream<Path> s = Files.walk(root)) {
+            s.filter(Files::isRegularFile)
+                .filter(this::isImage)
+                .forEach(p -> {
+                    try {
+                        BasicFileAttributes a = Files.readAttributes(p, BasicFileAttributes.class);
+                        batch.add(new Object[] {
+                            p.toAbsolutePath().toString(),
+                            a.size(),
+                            Instant.ofEpochMilli(a.lastModifiedTime().toMillis())
+                        });
+                        if (batch.size() >= 1_000) {
+                            flush(batch);
+                            batch.clear();
+                        }
+                    } catch (Exception ignored) {
+                    }
+                });
+        }
+
+        flush(batch);
+        return RepeatStatus.FINISHED;
+    }
+
+    private boolean isImage(Path p) {
+        String name = p.getFileName().toString().toLowerCase(Locale.ROOT);
+        int dot = name.lastIndexOf('.');
+        return dot > 0 && EXT.contains(name.substring(dot + 1));
+    }
+
+    private void flush(List<Object[]> batch) {
+        if (batch.isEmpty()) return;
+
+        jdbcTemplate.batchUpdate(
+            """
+            insert into image_work(path, size_bytes, last_modified, status)
+            values (?, ?, ?, 'NEW')
+            on conflict (path) do nothing
+            """,
+            batch
+        );
+    }
+}
+```
+
+---
+
+## Kafka writer (reads bytes, sends, updates DB status)
+
+```java
+package com.example.imagebatch.batch;
+
+import com.example.imagebatch.ImageBatchProperties;
+import com.example.imagebatch.model.ImageWorkItem;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.springframework.batch.item.Chunk;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+public class ImageToKafkaWriter implements ItemWriter<ImageWorkItem> {
+
+    private record Pending(long id, CompletableFutureAdapter future, String errContext) {}
+
+    private final KafkaTemplate<String, byte[]> kafkaTemplate;
+    private final JdbcTemplate jdbcTemplate;
+    private final ImageBatchProperties props;
+
+    public ImageToKafkaWriter(KafkaTemplate<String, byte[]> kafkaTemplate, JdbcTemplate jdbcTemplate, ImageBatchProperties props) {
+        this.kafkaTemplate = kafkaTemplate;
+        this.jdbcTemplate = jdbcTemplate;
+        this.props = props;
+    }
+
+    @Override
+    public void write(Chunk<? extends ImageWorkItem> chunk) throws Exception {
+        List<Long> successIds = new ArrayList<>(chunk.size());
+        List<Object[]> failures = new ArrayList<>();
+
+        List<PendingSend> pending = new ArrayList<>(chunk.size());
+
+        for (ImageWorkItem item : chunk.getItems()) {
+            try {
+                Path path = Path.of(item.path());
+
+                if (!Files.exists(path)) {
+                    failures.add(failRow(item.id(), "File not found: " + item.path()));
+                    continue;
+                }
+                if (item.sizeBytes() > props.maxFileSizeBytes()) {
+                    failures.add(failRow(item.id(), "File too large (" + item.sizeBytes() + " bytes): " + item.path()));
+                    continue;
+                }
+
+                byte[] bytes = Files.readAllBytes(path);
+                String sha256 = sha256Hex(bytes);
+                String key = sha256;
+
+                ProducerRecord<String, byte[]> record = new ProducerRecord<>(props.topic(), key, bytes);
+                record.headers().add(new RecordHeader("path", item.path().getBytes()));
+                record.headers().add(new RecordHeader("size_bytes", Long.toString(item.sizeBytes()).getBytes()));
+                record.headers().add(new RecordHeader("last_modified", item.lastModified().toString().getBytes()));
+                record.headers().add(new RecordHeader("sha256", sha256.getBytes()));
+
+                pending.add(new PendingSend(item.id(), kafkaTemplate.send(record)));
+
+            } catch (Exception e) {
+                failures.add(failRow(item.id(), abbreviate(e)));
+            }
+        }
+
+        for (PendingSend p : pending) {
+            try {
+                p.future().get(props.kafkaSendTimeoutSeconds(), TimeUnit.SECONDS);
+                successIds.add(p.id());
+            } catch (Exception e) {
+                failures.add(failRow(p.id(), abbreviate(e)));
+            }
+        }
+
+        markSuccess(successIds);
+        markFailures(failures);
+    }
+
+    private void markSuccess(List<Long> ids) {
+        if (ids.isEmpty()) return;
+
+        jdbcTemplate.batchUpdate(
+            "update image_work set status='SENT', sent_at=now(), updated_at=now() where id=?",
+            ids,
+            1_000,
+            (ps, id) -> ps.setLong(1, id)
+        );
+    }
+
+    private void markFailures(List<Object[]> failures) {
+        if (failures.isEmpty()) return;
+
+        jdbcTemplate.batchUpdate(
+            """
+            update image_work
+            set attempts = attempts + 1,
+                status = case when attempts + 1 >= ? then 'FAILED' else 'RETRY' end,
+                last_error = ?,
+                updated_at = now()
+            where id = ?
+            """,
+            failures
+        );
+    }
+
+    private Object[] failRow(long id, String err) {
+        return new Object[] { props.maxAttempts(), err, id };
+    }
+
+    private static String sha256Hex(byte[] data) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] digest = md.digest(data);
+        StringBuilder sb = new StringBuilder(digest.length * 2);
+        for (byte b : digest) sb.append(String.format("%02x", b));
+        return sb.toString();
+    }
+
+    private static String abbreviate(Exception e) {
+        String msg = e.getClass().getSimpleName() + ": " + (e.getMessage() == null ? "" : e.getMessage());
+        return msg.length() <= 2_000 ? msg : msg.substring(0, 2_000);
+    }
+}
+```
+
+This writer updates the DB for every chunk, so after a crash you resume from the remaining `NEW/RETRY` rows.
+
+---
+
+## Spark consumption (binary payload)
+
+In Spark Structured Streaming, `value` will be `binary`:
+
+```python
+df = (spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "localhost:9092")
+    .option("subscribe", "images.raw")
+    .option("startingOffsets", "earliest")
+    .load())
+
+images = df.selectExpr(
+    "CAST(key AS STRING) as image_id",
+    "value as bytes",
+    "headers"
+)
+```
+
+---
+
+## Production notes (the parts people usually miss)
+
+* **Kafka message size:** default broker limit is commonly 1 MB. If images are larger, you must raise broker + producer + Spark consumer fetch limits.
+* **Duplicates:** if you crash after Kafka send but before DB commit, that file can be resent. Mitigate by:
+    * stable key (path/sha256) and consumer-side dedupe, or
+    * topic compaction if key is unique and you want “latest wins”, or
+    * an outbox pattern if you truly need “exactly once”.
+* **Throughput tuning:** start with `chunk-size=10..50` (depends on average image size), and scale with partitioning or multiple app instances only if needed.
+
+If you want, I can provide a complete repo-style layout (package structure + Flyway migrations + Docker Compose for Kafka/Postgres + partitioning for parallelism) using the exact code above as a baseline.
+
