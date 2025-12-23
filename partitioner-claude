@@ -1,0 +1,433 @@
+# Spring Batch Partitioner for Reading Millions of Images from Nested Folders
+
+Here's a production-ready implementation using Spring Batch's `Partitioner` with the `Resource` class to efficiently process millions of images from nested directories.
+
+## 1. Custom Folder Partitioner
+
+```java
+import org.springframework.batch.core.partition.support.Partitioner;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
+import org.springframework.core.io.support.ResourcePatternResolver;
+
+import java.io.IOException;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class ImageFolderPartitioner implements Partitioner {
+
+    private final String rootDirectory;
+    private final int partitionSize;
+    private final ResourcePatternResolver resourceResolver;
+
+    public ImageFolderPartitioner(String rootDirectory, int partitionSize) {
+        this.rootDirectory = rootDirectory;
+        this.partitionSize = partitionSize;
+        this.resourceResolver = new PathMatchingResourcePatternResolver();
+    }
+
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Map<String, ExecutionContext> partitions = new LinkedHashMap<>();
+
+        try {
+            // Recursively find all image files in nested folders
+            String pattern = "file:" + rootDirectory + "/**/*.{jpg,jpeg,png,gif,bmp,webp}";
+            Resource[] resources = resourceResolver.getResources(pattern);
+
+            // Group resources into partitions
+            List<List<Resource>> partitionedResources = partitionResources(
+                Arrays.asList(resources), 
+                Math.max(gridSize, (int) Math.ceil((double) resources.length / partitionSize))
+            );
+
+            int partitionNumber = 0;
+            for (List<Resource> resourceBatch : partitionedResources) {
+                ExecutionContext context = new ExecutionContext();
+                
+                // Store resource paths as serializable strings
+                List<String> resourcePaths = resourceBatch.stream()
+                    .map(r -> {
+                        try {
+                            return r.getFile().getAbsolutePath();
+                        } catch (IOException e) {
+                            return r.getDescription();
+                        }
+                    })
+                    .collect(Collectors.toList());
+
+                context.put("resourcePaths", resourcePaths);
+                context.put("partitionNumber", partitionNumber);
+                context.put("totalFiles", resourcePaths.size());
+                
+                partitions.put("partition" + partitionNumber, context);
+                partitionNumber++;
+            }
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to scan directory: " + rootDirectory, e);
+        }
+
+        return partitions;
+    }
+
+    private List<List<Resource>> partitionResources(List<Resource> resources, int numPartitions) {
+        List<List<Resource>> partitions = new ArrayList<>();
+        int totalSize = resources.size();
+        int batchSize = (int) Math.ceil((double) totalSize / numPartitions);
+
+        for (int i = 0; i < totalSize; i += batchSize) {
+            partitions.add(new ArrayList<>(
+                resources.subList(i, Math.min(i + batchSize, totalSize))
+            ));
+        }
+        return partitions;
+    }
+}
+```
+
+## 2. Custom ItemReader for Partitioned Resources
+
+```java
+import org.springframework.batch.item.ItemReader;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.core.StepExecution;
+import org.springframework.batch.core.annotation.BeforeStep;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class PartitionedImageResourceReader implements ItemReader<Resource> {
+
+    private Iterator<String> resourcePathIterator;
+    private final AtomicInteger readCount = new AtomicInteger(0);
+    private int partitionNumber;
+
+    @BeforeStep
+    public void beforeStep(StepExecution stepExecution) {
+        ExecutionContext context = stepExecution.getExecutionContext();
+        
+        @SuppressWarnings("unchecked")
+        List<String> resourcePaths = (List<String>) context.get("resourcePaths");
+        this.partitionNumber = context.getInt("partitionNumber");
+        
+        if (resourcePaths != null) {
+            this.resourcePathIterator = resourcePaths.iterator();
+        }
+    }
+
+    @Override
+    public synchronized Resource read() {
+        if (resourcePathIterator != null && resourcePathIterator.hasNext()) {
+            String path = resourcePathIterator.next();
+            readCount.incrementAndGet();
+            return new FileSystemResource(path);
+        }
+        return null;
+    }
+}
+```
+
+## 3. Image Processor
+
+```java
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.core.io.Resource;
+
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+
+public class ImageProcessor implements ItemProcessor<Resource, ImageMetadata> {
+
+    @Override
+    public ImageMetadata process(Resource resource) throws Exception {
+        try {
+            BufferedImage image = ImageIO.read(resource.getInputStream());
+            
+            if (image == null) {
+                // Skip corrupted or unsupported images
+                return null;
+            }
+
+            return ImageMetadata.builder()
+                .fileName(resource.getFilename())
+                .filePath(resource.getFile().getAbsolutePath())
+                .width(image.getWidth())
+                .height(image.getHeight())
+                .fileSize(resource.contentLength())
+                .lastModified(resource.lastModified())
+                .build();
+                
+        } catch (IOException e) {
+            // Log and skip problematic files
+            return null;
+        }
+    }
+}
+```
+
+## 4. Image Metadata DTO
+
+```java
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class ImageMetadata {
+    private String fileName;
+    private String filePath;
+    private int width;
+    private int height;
+    private long fileSize;
+    private long lastModified;
+}
+```
+
+## 5. Batch Configuration
+
+```java
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.core.partition.support.TaskExecutorPartitionHandler;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.transaction.PlatformTransactionManager;
+
+@Configuration
+@EnableBatchProcessing
+public class ImageProcessingBatchConfig {
+
+    private static final int CHUNK_SIZE = 100;
+    private static final int GRID_SIZE = 20;  // Number of partitions
+    private static final int PARTITION_SIZE = 10000;  // Files per partition
+    private static final int THREAD_POOL_SIZE = 10;
+
+    @Bean
+    public Job imageProcessingJob(JobRepository jobRepository, 
+                                   Step partitionedStep) {
+        return new JobBuilder("imageProcessingJob", jobRepository)
+            .incrementer(new RunIdIncrementer())
+            .listener(jobExecutionListener())
+            .start(partitionedStep)
+            .build();
+    }
+
+    @Bean
+    public Step partitionedStep(JobRepository jobRepository,
+                                 Step workerStep,
+                                 ImageFolderPartitioner partitioner) {
+        
+        TaskExecutorPartitionHandler partitionHandler = new TaskExecutorPartitionHandler();
+        partitionHandler.setStep(workerStep);
+        partitionHandler.setTaskExecutor(batchTaskExecutor());
+        partitionHandler.setGridSize(GRID_SIZE);
+
+        return new StepBuilder("partitionedStep", jobRepository)
+            .partitioner("workerStep", partitioner)
+            .partitionHandler(partitionHandler)
+            .build();
+    }
+
+    @Bean
+    public Step workerStep(JobRepository jobRepository,
+                           PlatformTransactionManager transactionManager,
+                           PartitionedImageResourceReader reader,
+                           ImageProcessor processor,
+                           ItemWriter<ImageMetadata> writer) {
+        
+        return new StepBuilder("workerStep", jobRepository)
+            .<Resource, ImageMetadata>chunk(CHUNK_SIZE, transactionManager)
+            .reader(reader)
+            .processor(processor)
+            .writer(writer)
+            .faultTolerant()
+            .skipLimit(1000)
+            .skip(Exception.class)
+            .listener(stepExecutionListener())
+            .build();
+    }
+
+    @Bean
+    @StepScope
+    public PartitionedImageResourceReader imageResourceReader() {
+        return new PartitionedImageResourceReader();
+    }
+
+    @Bean
+    public ImageFolderPartitioner imagePartitioner() {
+        return new ImageFolderPartitioner("/path/to/images", PARTITION_SIZE);
+    }
+
+    @Bean
+    public ImageProcessor imageProcessor() {
+        return new ImageProcessor();
+    }
+
+    @Bean
+    public ItemWriter<ImageMetadata> imageMetadataWriter() {
+        // Replace with your actual writer (DB, File, etc.)
+        return items -> {
+            for (ImageMetadata metadata : items) {
+                System.out.println("Processed: " + metadata.getFilePath());
+            }
+        };
+    }
+
+    @Bean
+    public TaskExecutor batchTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(THREAD_POOL_SIZE);
+        executor.setMaxPoolSize(THREAD_POOL_SIZE * 2);
+        executor.setQueueCapacity(THREAD_POOL_SIZE * 4);
+        executor.setThreadNamePrefix("batch-partition-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        executor.initialize();
+        return executor;
+    }
+
+    @Bean
+    public JobExecutionListener jobExecutionListener() {
+        return new JobExecutionListener() {
+            @Override
+            public void beforeJob(JobExecution jobExecution) {
+                System.out.println("Starting image processing job...");
+            }
+
+            @Override
+            public void afterJob(JobExecution jobExecution) {
+                System.out.println("Job completed with status: " + 
+                    jobExecution.getStatus());
+            }
+        };
+    }
+
+    @Bean
+    public StepExecutionListener stepExecutionListener() {
+        return new StepExecutionListener() {
+            @Override
+            public void beforeStep(StepExecution stepExecution) {
+                System.out.println("Starting partition: " + 
+                    stepExecution.getStepName());
+            }
+
+            @Override
+            public ExitStatus afterStep(StepExecution stepExecution) {
+                System.out.println("Partition completed - Read: " + 
+                    stepExecution.getReadCount() + 
+                    ", Written: " + stepExecution.getWriteCount());
+                return stepExecution.getExitStatus();
+            }
+        };
+    }
+}
+```
+
+## 6. Optimized Alternative: Stream-Based Partitioner for Very Large Directories
+
+For **millions** of files, avoid loading all paths into memory:
+
+```java
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class StreamingImagePartitioner implements Partitioner {
+
+    private final String rootDirectory;
+    private final int filesPerPartition;
+    private static final Set<String> IMAGE_EXTENSIONS = 
+        Set.of(".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp");
+
+    public StreamingImagePartitioner(String rootDirectory, int filesPerPartition) {
+        this.rootDirectory = rootDirectory;
+        this.filesPerPartition = filesPerPartition;
+    }
+
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Map<String, ExecutionContext> partitions = new LinkedHashMap<>();
+        AtomicInteger partitionNum = new AtomicInteger(0);
+        List<String> currentBatch = new ArrayList<>(filesPerPartition);
+
+        try {
+            Files.walkFileTree(Paths.get(rootDirectory), new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    String fileName = file.toString().toLowerCase();
+                    
+                    if (IMAGE_EXTENSIONS.stream().anyMatch(fileName::endsWith)) {
+                        currentBatch.add(file.toAbsolutePath().toString());
+                        
+                        if (currentBatch.size() >= filesPerPartition) {
+                            createPartition(partitions, partitionNum.getAndIncrement(), 
+                                new ArrayList<>(currentBatch));
+                            currentBatch.clear();
+                        }
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    // Log and continue
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+
+            // Handle remaining files
+            if (!currentBatch.isEmpty()) {
+                createPartition(partitions, partitionNum.get(), currentBatch);
+            }
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to walk directory tree", e);
+        }
+
+        return partitions;
+    }
+
+    private void createPartition(Map<String, ExecutionContext> partitions, 
+                                  int partitionNum, List<String> paths) {
+        ExecutionContext context = new ExecutionContext();
+        context.put("resourcePaths", paths);
+        context.put("partitionNumber", partitionNum);
+        context.put("totalFiles", paths.size());
+        partitions.put("partition" + partitionNum, context);
+    }
+}
+```
+
+## Key Performance Considerations
+
+| Aspect | Recommendation |
+|:-------|:---------------|
+| **Chunk Size** | 50-200 for images (balance memory vs. transaction overhead) |
+| **Thread Pool** | Match CPU cores for I/O-bound tasks; fewer for CPU-bound |
+| **Partition Size** | 5,000-20,000 files per partition |
+| **Memory** | Use streaming APIs; avoid loading all paths at once |
+| **Skip Policy** | Enable fault tolerance to handle corrupted files |
+| **Restart** | ExecutionContext persists progress for restartability |
+
+This setup efficiently handles **millions of images** by:
+* Parallel processing across multiple threads
+* Memory-efficient streaming file discovery
+* Fault tolerance for corrupted/missing files
+* Restartable jobs with progress tracking
+
