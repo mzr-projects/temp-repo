@@ -1,0 +1,55 @@
+{
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "filterjoin": {
+            "indices": ["crime"],
+            "on": ["user_id", "user_id"],
+            "request": {
+              "query": {
+                "match_all": {}
+              }
+            }
+          }
+        },
+        {
+          "filterjoin": {
+            "indices": ["transfer"],
+            "on": ["user_id", "user_id"],
+            "request": {
+              "query": {
+                "term": {
+                  "city": "Seattle"
+                }
+              },
+              "aggs": {
+                "transfer_count": {
+                  "value_count": {
+                    "field": "user_id"
+                  }
+                }
+              },
+              "post_filter": {
+                "script": {
+                  "script": {
+                    "source": "doc_count > 3"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "users": {
+      "terms": {
+        "field": "user_id",
+        "size": 10000
+      }
+    }
+  }
+}
