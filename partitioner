@@ -1,0 +1,395 @@
+
+
+## Why *not* `ResourcePatternResolver.getResources("**/*")` for millions
+`PathMatchingResourcePatternResolver` typically resolves **all** matches up front into an array of `Resource`s. With millions of files this becomes slow, memory-heavy, and hard to restart.
+
+A production-friendly approach is:
+
+* **Partition** by a small number of root subtrees (e.g., first-level folders).
+* In each worker step, **stream** file paths with `Files.walk(...)` / `Files.find(...)` and convert each to a `Resource` (`FileSystemResource`) on demand.
+* Make the reader **restartable** by checkpointing the last processed path in the `ExecutionContext`.
+
+---
+
+## Production-ready example (Spring Batch 5, Java) using `Resource`
+
+### 1) Partitioner: split work by first-level subdirectories
+This creates one partition per immediate subdirectory under a root folder. If the root has no subdirs, it creates a single partition for the root itself.
+
+```java
+package com.example.batch;
+
+import org.springframework.batch.core.partition.support.Partitioner;
+import org.springframework.batch.item.ExecutionContext;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class DirectoryPartitioner implements Partitioner {
+
+    private final Path rootDir;
+
+    public DirectoryPartitioner(Path rootDir) {
+        this.rootDir = rootDir.toAbsolutePath().normalize();
+    }
+
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        // gridSize is advisory; we partition by real directories.
+        List<Path> partitions = listImmediateSubdirectories(rootDir);
+        if (partitions.isEmpty()) {
+            partitions = List.of(rootDir);
+        }
+
+        Map<String, ExecutionContext> map = new LinkedHashMap<>();
+        int i = 0;
+        for (Path p : partitions) {
+            ExecutionContext ctx = new ExecutionContext();
+            ctx.putString("partitionRoot", p.toString());
+            ctx.putString("partitionName", "p" + i);
+            map.put("partition-" + i, ctx);
+            i++;
+        }
+        return map;
+    }
+
+    private static List<Path> listImmediateSubdirectories(Path root) {
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(root)) {
+            List<Path> dirs = new ArrayList<>();
+            for (Path p : ds) {
+                if (Files.isDirectory(p)) {
+                    dirs.add(p.toAbsolutePath().normalize());
+                }
+            }
+            return dirs.stream().sorted().collect(Collectors.toList());
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to list subdirectories of " + root, e);
+        }
+    }
+}
+```
+
+---
+
+### 2) Restartable streaming reader: yields `Resource` (one file at a time)
+This reader walks the partition subtree and emits each file as a `FileSystemResource`. It checkpoints the **last returned path** so a restart can skip already-processed files.
+
+```java
+package com.example.batch;
+
+import org.springframework.batch.item.*;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.Iterator;
+import java.util.Spliterator;
+import java.util.Spliterators;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
+public class RecursiveDirectoryResourceItemReader implements ItemStreamReader<Resource> {
+
+    private final Path startDir;
+    private final int maxDepth;
+    private final ImageFileFilter filter;
+
+    private Stream<Path> stream;
+    private Iterator<Path> iterator;
+
+    private String lastReturnedPath;     // checkpointed
+    private boolean initialized;
+
+    public RecursiveDirectoryResourceItemReader(Path startDir, int maxDepth, ImageFileFilter filter) {
+        this.startDir = startDir.toAbsolutePath().normalize();
+        this.maxDepth = maxDepth;
+        this.filter = filter;
+    }
+
+    @Override
+    public Resource read() {
+        if (!initialized) {
+            throw new IllegalStateException("Reader not opened. Ensure it is managed by Spring Batch.");
+        }
+        while (iterator.hasNext()) {
+            Path p = iterator.next();
+            if (filter.accept(p)) {
+                lastReturnedPath = p.toString();
+                return new FileSystemResource(p);
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public void open(ExecutionContext executionContext) throws ItemStreamException {
+        try {
+            lastReturnedPath = executionContext.getString("lastReturnedPath", null);
+
+            stream = Files.walk(startDir, maxDepth)
+                    .filter(Files::isRegularFile)
+                    .sorted(); // deterministic ordering -> stable restarts
+
+            Stream<Path> effective = stream;
+            if (lastReturnedPath != null) {
+                // Skip everything up to and including the last returned path.
+                effective = streamSkipPast(effective, Paths.get(lastReturnedPath));
+            }
+
+            iterator = effective.iterator();
+            initialized = true;
+        } catch (IOException e) {
+            throw new ItemStreamException("Failed to open reader for " + startDir, e);
+        }
+    }
+
+    @Override
+    public void update(ExecutionContext executionContext) throws ItemStreamException {
+        if (lastReturnedPath != null) {
+            executionContext.putString("lastReturnedPath", lastReturnedPath);
+        }
+    }
+
+    @Override
+    public void close() throws ItemStreamException {
+        initialized = false;
+        if (stream != null) {
+            stream.close();
+        }
+    }
+
+    private static Stream<Path> streamSkipPast(Stream<Path> in, Path last) {
+        Spliterator<Path> spliterator = new SkippingSpliterator(in.spliterator(), last.toString());
+        return StreamSupport.stream(spliterator, false);
+    }
+
+    /**
+     * Skips until the first element strictly greater than `lastPathString` (lexicographic).
+     * Works because we sorted() the stream and we store exact path strings.
+     */
+    private static class SkippingSpliterator extends Spliterators.AbstractSpliterator<Path> {
+        private final Spliterator<Path> delegate;
+        private final String lastPathString;
+        private boolean skipping = true;
+
+        protected SkippingSpliterator(Spliterator<Path> delegate, String lastPathString) {
+            super(delegate.estimateSize(), delegate.characteristics());
+            this.delegate = delegate;
+            this.lastPathString = lastPathString;
+        }
+
+        @Override
+        public boolean tryAdvance(java.util.function.Consumer<? super Path> action) {
+            return delegate.tryAdvance(p -> {
+                if (skipping) {
+                    String s = p.toString();
+                    if (s.compareTo(lastPathString) <= 0) {
+                        // keep skipping
+                        return;
+                    }
+                    skipping = false;
+                }
+                action.accept(p);
+            });
+        }
+    }
+
+    @FunctionalInterface
+    public interface ImageFileFilter {
+        boolean accept(Path path);
+    }
+}
+```
+
+A simple filter:
+
+```java
+package com.example.batch;
+
+import java.nio.file.Path;
+import java.util.Set;
+
+public class ExtensionImageFileFilter implements RecursiveDirectoryResourceItemReader.ImageFileFilter {
+
+    private final Set<String> extsLower;
+
+    public ExtensionImageFileFilter(Set<String> extsLower) {
+        this.extsLower = extsLower;
+    }
+
+    @Override
+    public boolean accept(Path path) {
+        String name = path.getFileName().toString().toLowerCase();
+        int dot = name.lastIndexOf('.');
+        if (dot < 0) return false;
+        return extsLower.contains(name.substring(dot + 1));
+    }
+}
+```
+
+---
+
+### 3) Batch configuration: partitioned master step + worker step
+This uses a thread pool so partitions run in parallel on the same JVM (you can swap to remote partitioning later).
+
+```java
+package com.example.batch;
+
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.partition.support.PartitionStepBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.*;
+import org.springframework.core.io.Resource;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.ResourcelessTransactionManager;
+
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Set;
+
+@Configuration
+@EnableBatchProcessing
+public class ImagePartitionedJobConfig {
+
+    @Bean
+    public PlatformTransactionManager transactionManager() {
+        // If you also write to a DB, use the DataSource transaction manager instead.
+        return new ResourcelessTransactionManager();
+    }
+
+    @Bean
+    public ThreadPoolTaskExecutor partitionExecutor(
+            @Value("${images.partition.poolSize:8}") int poolSize,
+            @Value("${images.partition.queueCapacity:0}") int queueCapacity
+    ) {
+        ThreadPoolTaskExecutor exec = new ThreadPoolTaskExecutor();
+        exec.setCorePoolSize(poolSize);
+        exec.setMaxPoolSize(poolSize);
+        exec.setQueueCapacity(queueCapacity);
+        exec.setThreadNamePrefix("img-part-");
+        exec.initialize();
+        return exec;
+    }
+
+    @Bean
+    public Job imageJob(JobRepository jobRepository, Step masterStep) {
+        return new JobBuilder("imageJob", jobRepository)
+                .start(masterStep)
+                .build();
+    }
+
+    @Bean
+    public Step masterStep(
+            JobRepository jobRepository,
+            PlatformTransactionManager transactionManager,
+            Step workerStep,
+            ThreadPoolTaskExecutor partitionExecutor,
+            @Value("${images.rootDir}") String rootDir,
+            @Value("${images.partition.gridSize:8}") int gridSize
+    ) {
+        DirectoryPartitioner partitioner = new DirectoryPartitioner(Paths.get(rootDir));
+
+        return new PartitionStepBuilder(new StepBuilder("masterStep", jobRepository))
+                .partitioner("workerStep", partitioner)
+                .step(workerStep)
+                .gridSize(gridSize)
+                .taskExecutor(partitionExecutor)
+                .build();
+    }
+
+    @Bean
+    public Step workerStep(
+            JobRepository jobRepository,
+            PlatformTransactionManager transactionManager,
+            org.springframework.batch.item.ItemReader<Resource> imageReader,
+            ItemProcessor<Resource, ImageWorkItem> imageProcessor,
+            ItemWriter<ImageWorkItem> imageWriter,
+            @Value("${images.chunkSize:50}") int chunkSize
+    ) {
+        return new StepBuilder("workerStep", jobRepository)
+                .<Resource, ImageWorkItem>chunk(chunkSize, transactionManager)
+                .reader(imageReader)
+                .processor(imageProcessor)
+                .writer(imageWriter)
+                .faultTolerant()
+                .skipLimit(10_000)
+                .skip(Exception.class)
+                .build();
+    }
+
+    @Bean
+    @StepScope
+    public org.springframework.batch.item.ItemReader<Resource> imageReader(
+            @Value("#{stepExecutionContext['partitionRoot']}") String partitionRoot,
+            @Value("${images.maxDepth:64}") int maxDepth
+    ) {
+        Path start = Paths.get(partitionRoot);
+        return new RecursiveDirectoryResourceItemReader(
+                start,
+                maxDepth,
+                new ExtensionImageFileFilter(Set.of("jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp"))
+        );
+    }
+
+    @Bean
+    @StepScope
+    public ItemProcessor<Resource, ImageWorkItem> imageProcessor() {
+        return resource -> {
+            // Keep it streaming-friendly: avoid loading full image unless required.
+            // For example, extract path + size; you can add hashing/dimensions as needed.
+            String path = resource.getFile().toPath().toString();
+            long size = resource.contentLength();
+            return new ImageWorkItem(path, size);
+        };
+    }
+
+    @Bean
+    @StepScope
+    public ItemWriter<ImageWorkItem> imageWriter() {
+        return items -> {
+            // Replace with DB batch insert, Kafka publish, S3 upload, etc.
+            // In prod, keep this idempotent.
+            for (ImageWorkItem item : items) {
+                // no-op
+            }
+        };
+    }
+
+    public record ImageWorkItem(String path, long sizeBytes) {}
+}
+```
+
+---
+
+### 4) `application.yml`
+```yaml
+images:
+    rootDir: /data/images
+    chunkSize: 50
+    maxDepth: 64
+    partition:
+        gridSize: 8
+        poolSize: 8
+        queueCapacity: 0
+```
+
+---
+
+## Notes that matter in production
+* **Idempotency**: Your writer should tolerate re-processing (restarts can replay the last chunk).
+* **Deterministic ordering**: `sorted()` in the reader makes restarts stable. Keep file naming/pathing stable during runs.
+* **Avoid decoding images in the processor** unless needed; if you must, stream from `resource.getInputStream()` and close promptly.
+* **Grid size vs pool size**: `gridSize` ≈ number of partitions; `poolSize` ≈ parallelism. If you have 1,000 subfolders, you may want to *coalesce* them into ~N partitions (say 32) instead of 1,000 partitions—easy to add if you want.
+
+If you tell me your folder shape (e.g., `/root/customerId/date/...`) and what you need to do with each image (hashing, resizing, metadata to DB, upload), I can adapt this into a more exact “drop-in” job (including coalesced partitions and a DB-backed checkpoint strategy).
+
