@@ -53,3 +53,8 @@
     }
   }
 }
+
+
+######
+
+{ "query": { "bool": { "must": [ { "term": { "name": "John" } }, { "join": { "indices": ["crimes"], "on": ["user_id", "user_id"], "request": { "query": { "match_all": {} } } } }, { "join": { "indices": ["travels"], "on": ["user_id", "user_id"], "request": { "query": { "term": { "destination": "Seattle" } }, "runtime_mappings": { "count_me": { "type": "long", "script": "emit(1L)" } }, "project": [ { "field": { "name": "count_me", "alias": "travel_counts" } } ] } } }, { "script": { "script": { "source": "doc['travel_counts'].size() > 3", "lang": "painless" } } } ] } } }
