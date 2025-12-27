@@ -1,0 +1,292 @@
+import org.springframework.batch.item.ItemReader;
+import org.springframework.batch.item.file.ResourceAwareItemReaderItemStream;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.FileSystemResource;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Iterator;
+import java.util.stream.Stream;
+
+/**
+ * Memory-efficient Stream-based ItemReader for processing millions of images
+ * from nested folders without loading all paths into memory.
+ */
+public class StreamBasedImageReader implements ItemReader<Resource>, 
+        ResourceAwareItemReaderItemStream<Resource> {
+    
+    private final Path rootDirectory;
+    private final String[] imageExtensions;
+    private Iterator<Path> pathIterator;
+    private Stream<Path> pathStream;
+    private volatile boolean initialized = false;
+    
+    public StreamBasedImageReader(String rootDirectoryPath, String... imageExtensions) {
+        this.rootDirectory = Paths.get(rootDirectoryPath);
+        this.imageExtensions = imageExtensions.length > 0 ? 
+            imageExtensions : new String[]{".jpg", ".jpeg", ".png", ".gif", ".bmp"};
+    }
+    
+    @Override
+    public void open(ExecutionContext executionContext) {
+        try {
+            // Create a lazy stream that walks the file tree
+            pathStream = Files.walk(rootDirectory)
+                .filter(Files::isRegularFile)
+                .filter(this::isImageFile);
+            
+            pathIterator = pathStream.iterator();
+            initialized = true;
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to initialize file stream", e);
+        }
+    }
+    
+    @Override
+    public Resource read() {
+        if (!initialized) {
+            throw new IllegalStateException("Reader not initialized. Call open() first.");
+        }
+        
+        if (pathIterator.hasNext()) {
+            Path imagePath = pathIterator.next();
+            return new FileSystemResource(imagePath.toFile());
+        }
+        
+        return null; // Signal end of data
+    }
+    
+    @Override
+    public void close() {
+        if (pathStream != null) {
+            pathStream.close();
+        }
+        initialized = false;
+    }
+    
+    @Override
+    public void update(ExecutionContext executionContext) {
+        // For restart capability, you could track position here
+        // This basic implementation doesn't support restart
+    }
+    
+    private boolean isImageFile(Path path) {
+        String fileName = path.getFileName().toString().toLowerCase();
+        for (String ext : imageExtensions) {
+            if (fileName.endsWith(ext.toLowerCase())) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    @Override
+    public void setResource(Resource resource) {
+        // Not needed for this implementation
+    }
+}
+
+
+/**
+ * Alternative implementation with FileVisitor for even more control
+ * and better memory efficiency with very deep nested structures.
+ */
+class FileVisitorBasedImageReader implements ItemReader<Resource>, 
+        ResourceAwareItemReaderItemStream<Resource> {
+    
+    private final Path rootDirectory;
+    private final String[] imageExtensions;
+    private ImageFileIterator fileIterator;
+    
+    public FileVisitorBasedImageReader(String rootDirectoryPath, String... imageExtensions) {
+        this.rootDirectory = Paths.get(rootDirectoryPath);
+        this.imageExtensions = imageExtensions.length > 0 ? 
+            imageExtensions : new String[]{".jpg", ".jpeg", ".png", ".gif", ".bmp"};
+    }
+    
+    @Override
+    public void open(ExecutionContext executionContext) {
+        fileIterator = new ImageFileIterator(rootDirectory, imageExtensions);
+        fileIterator.start();
+    }
+    
+    @Override
+    public Resource read() {
+        Path nextPath = fileIterator.next();
+        return nextPath != null ? new FileSystemResource(nextPath.toFile()) : null;
+    }
+    
+    @Override
+    public void close() {
+        if (fileIterator != null) {
+            fileIterator.close();
+        }
+    }
+    
+    @Override
+    public void update(ExecutionContext executionContext) {
+        // Basic implementation without restart support
+    }
+    
+    @Override
+    public void setResource(Resource resource) {
+        // Not needed
+    }
+    
+    /**
+     * Custom iterator using FileVisitor pattern for lazy file discovery
+     */
+    private static class ImageFileIterator extends SimpleFileVisitor<Path> {
+        private final Path startPath;
+        private final String[] extensions;
+        private final BlockingQueue<Path> buffer = new LinkedBlockingQueue<>(1000);
+        private volatile boolean walkComplete = false;
+        private Thread walkThread;
+        private volatile Exception walkException;
+        
+        public ImageFileIterator(Path startPath, String[] extensions) {
+            this.startPath = startPath;
+            this.extensions = extensions;
+        }
+        
+        public void start() {
+            walkThread = new Thread(() -> {
+                try {
+                    Files.walkFileTree(startPath, this);
+                    walkComplete = true;
+                } catch (Exception e) {
+                    walkException = e;
+                } finally {
+                    // Add sentinel value to signal completion
+                    try {
+                        buffer.put(Paths.get(""));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            walkThread.setDaemon(true);
+            walkThread.start();
+        }
+        
+        @Override
+        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+            if (attrs.isRegularFile() && isImageFile(file)) {
+                try {
+                    buffer.put(file);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return FileVisitResult.TERMINATE;
+                }
+            }
+            return FileVisitResult.CONTINUE;
+        }
+        
+        public Path next() {
+            try {
+                Path path = buffer.take();
+                
+                if (walkException != null) {
+                    throw new RuntimeException("Error walking file tree", walkException);
+                }
+                
+                // Empty path signals completion
+                if (path.toString().isEmpty()) {
+                    return null;
+                }
+                
+                return path;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        
+        private boolean isImageFile(Path path) {
+            String fileName = path.getFileName().toString().toLowerCase();
+            for (String ext : extensions) {
+                if (fileName.endsWith(ext.toLowerCase())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        
+        public void close() {
+            if (walkThread != null && walkThread.isAlive()) {
+                walkThread.interrupt();
+            }
+        }
+    }
+}
+
+
+/**
+ * Spring Batch Job Configuration Example
+ */
+@Configuration
+@EnableBatchProcessing
+class ImageProcessingJobConfig {
+    
+    @Bean
+    public Step imageProcessingStep(JobRepository jobRepository,
+                                   PlatformTransactionManager transactionManager) {
+        return new StepBuilder("imageProcessingStep", jobRepository)
+                .<Resource, ProcessedImage>chunk(100, transactionManager)
+                .reader(imageReader())
+                .processor(imageProcessor())
+                .writer(imageWriter())
+                .build();
+    }
+    
+    @Bean
+    @StepScope
+    public StreamBasedImageReader imageReader() {
+        return new StreamBasedImageReader(
+            "/path/to/images",
+            ".jpg", ".jpeg", ".png"
+        );
+    }
+    
+    @Bean
+    public ItemProcessor<Resource, ProcessedImage> imageProcessor() {
+        return resource -> {
+            // Process your image here
+            // Example: read metadata, resize, etc.
+            return new ProcessedImage(resource.getFilename());
+        };
+    }
+    
+    @Bean
+    public ItemWriter<ProcessedImage> imageWriter() {
+        return items -> {
+            // Write processed images or metadata
+            items.forEach(item -> {
+                // Your writing logic
+                System.out.println("Processed: " + item.getName());
+            });
+        };
+    }
+    
+    @Bean
+    public Job imageProcessingJob(JobRepository jobRepository, 
+                                 Step imageProcessingStep) {
+        return new JobBuilder("imageProcessingJob", jobRepository)
+                .start(imageProcessingStep)
+                .build();
+    }
+    
+    // Simple DTO for processed images
+    static class ProcessedImage {
+        private final String name;
+        
+        public ProcessedImage(String name) {
+            this.name = name;
+        }
+        
+        public String getName() {
+            return name;
+        }
+    }
+}
