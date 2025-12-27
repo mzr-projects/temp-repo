@@ -1,292 +1,440 @@
-import org.springframework.batch.item.ItemReader;
-import org.springframework.batch.item.file.ResourceAwareItemReaderItemStream;
-import org.springframework.core.io.Resource;
-import org.springframework.core.io.FileSystemResource;
+You're absolutely right. Here are **truly memory-efficient solutions** that avoid storing millions of paths in RAM:
+
+---
+
+## Solution 1: Directory-Based Partitioning (Best for Nested Folders)
+
+Partition by **directories** instead of files — each worker scans only its assigned directories:
+
+```java
+import org.springframework.batch.core.partition.support.Partitioner;
+import org.springframework.batch.item.ExecutionContext;
 
 import java.io.IOException;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.util.Iterator;
-import java.util.stream.Stream;
+import java.util.*;
 
-/**
- * Memory-efficient Stream-based ItemReader for processing millions of images
- * from nested folders without loading all paths into memory.
- */
-public class StreamBasedImageReader implements ItemReader<Resource>, 
-        ResourceAwareItemReaderItemStream<Resource> {
-    
-    private final Path rootDirectory;
-    private final String[] imageExtensions;
-    private Iterator<Path> pathIterator;
-    private Stream<Path> pathStream;
-    private volatile boolean initialized = false;
-    
-    public StreamBasedImageReader(String rootDirectoryPath, String... imageExtensions) {
-        this.rootDirectory = Paths.get(rootDirectoryPath);
-        this.imageExtensions = imageExtensions.length > 0 ? 
-            imageExtensions : new String[]{".jpg", ".jpeg", ".png", ".gif", ".bmp"};
+public class DirectoryBasedPartitioner implements Partitioner {
+
+    private final String rootDirectory;
+    private final int maxDepth;
+
+    public DirectoryBasedPartitioner(String rootDirectory, int maxDepth) {
+        this.rootDirectory = rootDirectory;
+        this.maxDepth = maxDepth;
     }
-    
+
     @Override
-    public void open(ExecutionContext executionContext) {
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Map<String, ExecutionContext> partitions = new LinkedHashMap<>();
+        List<Path> directories = new ArrayList<>();
+
         try {
-            // Create a lazy stream that walks the file tree
-            pathStream = Files.walk(rootDirectory)
-                .filter(Files::isRegularFile)
-                .filter(this::isImageFile);
-            
-            pathIterator = pathStream.iterator();
-            initialized = true;
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to initialize file stream", e);
-        }
-    }
-    
-    @Override
-    public Resource read() {
-        if (!initialized) {
-            throw new IllegalStateException("Reader not initialized. Call open() first.");
-        }
-        
-        if (pathIterator.hasNext()) {
-            Path imagePath = pathIterator.next();
-            return new FileSystemResource(imagePath.toFile());
-        }
-        
-        return null; // Signal end of data
-    }
-    
-    @Override
-    public void close() {
-        if (pathStream != null) {
-            pathStream.close();
-        }
-        initialized = false;
-    }
-    
-    @Override
-    public void update(ExecutionContext executionContext) {
-        // For restart capability, you could track position here
-        // This basic implementation doesn't support restart
-    }
-    
-    private boolean isImageFile(Path path) {
-        String fileName = path.getFileName().toString().toLowerCase();
-        for (String ext : imageExtensions) {
-            if (fileName.endsWith(ext.toLowerCase())) {
-                return true;
+            // Collect only directories at a certain depth (NOT files)
+            Files.walkFileTree(Paths.get(rootDirectory), 
+                EnumSet.noneOf(FileVisitOption.class), 
+                maxDepth, 
+                new SimpleFileVisitor<>() {
+                    @Override
+                    public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                        directories.add(dir);
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
+
+            // Distribute directories across partitions
+            List<List<Path>> distributedDirs = distributeEvenly(directories, gridSize);
+
+            for (int i = 0; i < distributedDirs.size(); i++) {
+                ExecutionContext context = new ExecutionContext();
+                
+                // Store only directory paths (much smaller than file paths)
+                List<String> dirPaths = distributedDirs.get(i).stream()
+                    .map(Path::toString)
+                    .toList();
+
+                context.put("directoryPaths", dirPaths);
+                context.put("partitionNumber", i);
+                partitions.put("partition" + i, context);
             }
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to scan directories", e);
         }
-        return false;
+
+        return partitions;
     }
-    
-    @Override
-    public void setResource(Resource resource) {
-        // Not needed for this implementation
+
+    private List<List<Path>> distributeEvenly(List<Path> items, int buckets) {
+        List<List<Path>> result = new ArrayList<>();
+        for (int i = 0; i < buckets; i++) {
+            result.add(new ArrayList<>());
+        }
+        for (int i = 0; i < items.size(); i++) {
+            result.get(i % buckets).add(items.get(i));
+        }
+        result.removeIf(List::isEmpty);
+        return result;
     }
 }
+```
 
+### Streaming Reader (Discovers Files On-Demand)
 
-/**
- * Alternative implementation with FileVisitor for even more control
- * and better memory efficiency with very deep nested structures.
- */
-class FileVisitorBasedImageReader implements ItemReader<Resource>, 
-        ResourceAwareItemReaderItemStream<Resource> {
-    
-    private final Path rootDirectory;
-    private final String[] imageExtensions;
-    private ImageFileIterator fileIterator;
-    
-    public FileVisitorBasedImageReader(String rootDirectoryPath, String... imageExtensions) {
-        this.rootDirectory = Paths.get(rootDirectoryPath);
-        this.imageExtensions = imageExtensions.length > 0 ? 
-            imageExtensions : new String[]{".jpg", ".jpeg", ".png", ".gif", ".bmp"};
-    }
-    
-    @Override
-    public void open(ExecutionContext executionContext) {
-        fileIterator = new ImageFileIterator(rootDirectory, imageExtensions);
-        fileIterator.start();
-    }
-    
-    @Override
-    public Resource read() {
-        Path nextPath = fileIterator.next();
-        return nextPath != null ? new FileSystemResource(nextPath.toFile()) : null;
-    }
-    
-    @Override
-    public void close() {
-        if (fileIterator != null) {
-            fileIterator.close();
+```java
+import org.springframework.batch.core.StepExecution;
+import org.springframework.batch.core.annotation.BeforeStep;
+import org.springframework.batch.item.ItemReader;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+import java.util.stream.Stream;
+
+public class DirectoryStreamingImageReader implements ItemReader<Resource> {
+
+    private static final Set<String> IMAGE_EXTENSIONS = 
+        Set.of(".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp");
+
+    private Iterator<Path> directoryIterator;
+    private Iterator<Path> currentFileIterator;
+    private Stream<Path> currentStream;
+
+    @BeforeStep
+    public void beforeStep(StepExecution stepExecution) {
+        @SuppressWarnings("unchecked")
+        List<String> directoryPaths = (List<String>) 
+            stepExecution.getExecutionContext().get("directoryPaths");
+
+        if (directoryPaths != null) {
+            this.directoryIterator = directoryPaths.stream()
+                .map(Paths::get)
+                .iterator();
         }
     }
-    
+
     @Override
-    public void update(ExecutionContext executionContext) {
-        // Basic implementation without restart support
-    }
-    
-    @Override
-    public void setResource(Resource resource) {
-        // Not needed
-    }
-    
-    /**
-     * Custom iterator using FileVisitor pattern for lazy file discovery
-     */
-    private static class ImageFileIterator extends SimpleFileVisitor<Path> {
-        private final Path startPath;
-        private final String[] extensions;
-        private final BlockingQueue<Path> buffer = new LinkedBlockingQueue<>(1000);
-        private volatile boolean walkComplete = false;
-        private Thread walkThread;
-        private volatile Exception walkException;
-        
-        public ImageFileIterator(Path startPath, String[] extensions) {
-            this.startPath = startPath;
-            this.extensions = extensions;
-        }
-        
-        public void start() {
-            walkThread = new Thread(() -> {
-                try {
-                    Files.walkFileTree(startPath, this);
-                    walkComplete = true;
-                } catch (Exception e) {
-                    walkException = e;
-                } finally {
-                    // Add sentinel value to signal completion
-                    try {
-                        buffer.put(Paths.get(""));
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-            });
-            walkThread.setDaemon(true);
-            walkThread.start();
-        }
-        
-        @Override
-        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-            if (attrs.isRegularFile() && isImageFile(file)) {
-                try {
-                    buffer.put(file);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return FileVisitResult.TERMINATE;
-                }
+    public synchronized Resource read() {
+        while (true) {
+            // Try to get next file from current directory stream
+            if (currentFileIterator != null && currentFileIterator.hasNext()) {
+                return new FileSystemResource(currentFileIterator.next().toFile());
             }
-            return FileVisitResult.CONTINUE;
-        }
-        
-        public Path next() {
-            try {
-                Path path = buffer.take();
-                
-                if (walkException != null) {
-                    throw new RuntimeException("Error walking file tree", walkException);
+
+            // Close previous stream
+            closeCurrentStream();
+
+            // Move to next directory
+            if (directoryIterator != null && directoryIterator.hasNext()) {
+                Path nextDir = directoryIterator.next();
+                try {
+                    currentStream = Files.walk(nextDir, 1)  // depth 1 = immediate children only
+                        .filter(this::isImageFile);
+                    currentFileIterator = currentStream.iterator();
+                } catch (IOException e) {
+                    // Skip problematic directories, continue to next
+                    continue;
                 }
-                
-                // Empty path signals completion
-                if (path.toString().isEmpty()) {
-                    return null;
-                }
-                
-                return path;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            } else {
+                // No more directories
                 return null;
             }
         }
-        
-        private boolean isImageFile(Path path) {
-            String fileName = path.getFileName().toString().toLowerCase();
-            for (String ext : extensions) {
-                if (fileName.endsWith(ext.toLowerCase())) {
-                    return true;
-                }
-            }
-            return false;
-        }
-        
-        public void close() {
-            if (walkThread != null && walkThread.isAlive()) {
-                walkThread.interrupt();
-            }
+    }
+
+    private boolean isImageFile(Path path) {
+        if (!Files.isRegularFile(path)) return false;
+        String name = path.toString().toLowerCase();
+        return IMAGE_EXTENSIONS.stream().anyMatch(name::endsWith);
+    }
+
+    private void closeCurrentStream() {
+        if (currentStream != null) {
+            currentStream.close();
+            currentStream = null;
         }
     }
 }
+```
 
+---
 
-/**
- * Spring Batch Job Configuration Example
- */
-@Configuration
-@EnableBatchProcessing
-class ImageProcessingJobConfig {
+## Solution 2: File-Index Based Partitioning (Write to Temp Files)
+
+For **truly massive datasets**, write paths to temporary index files. Each worker reads from its own file:
+
+```java
+import org.springframework.batch.core.partition.support.Partitioner;
+import org.springframework.batch.item.ExecutionContext;
+
+import java.io.*;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.*;
+
+public class FileIndexPartitioner implements Partitioner {
+
+    private static final Set<String> IMAGE_EXTENSIONS = 
+        Set.of(".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp");
     
-    @Bean
-    public Step imageProcessingStep(JobRepository jobRepository,
-                                   PlatformTransactionManager transactionManager) {
-        return new StepBuilder("imageProcessingStep", jobRepository)
-                .<Resource, ProcessedImage>chunk(100, transactionManager)
-                .reader(imageReader())
-                .processor(imageProcessor())
-                .writer(imageWriter())
-                .build();
+    private final String rootDirectory;
+    private final int filesPerPartition;
+    private final Path tempDir;
+
+    public FileIndexPartitioner(String rootDirectory, int filesPerPartition) {
+        this.rootDirectory = rootDirectory;
+        this.filesPerPartition = filesPerPartition;
+        try {
+            this.tempDir = Files.createTempDirectory("batch-partitions-");
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create temp directory", e);
+        }
     }
-    
-    @Bean
-    @StepScope
-    public StreamBasedImageReader imageReader() {
-        return new StreamBasedImageReader(
-            "/path/to/images",
-            ".jpg", ".jpeg", ".png"
+
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Map<String, ExecutionContext> partitions = new LinkedHashMap<>();
+        
+        try {
+            final int[] partitionNum = {0};
+            final int[] fileCount = {0};
+            final BufferedWriter[] currentWriter = {createPartitionFile(partitionNum[0])};
+
+            Files.walkFileTree(Paths.get(rootDirectory), new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) 
+                        throws IOException {
+                    
+                    if (isImageFile(file)) {
+                        currentWriter[0].write(file.toAbsolutePath().toString());
+                        currentWriter[0].newLine();
+                        fileCount[0]++;
+
+                        // Rotate to new partition file when limit reached
+                        if (fileCount[0] >= filesPerPartition) {
+                            currentWriter[0].close();
+                            registerPartition(partitions, partitionNum[0], fileCount[0]);
+                            
+                            partitionNum[0]++;
+                            fileCount[0] = 0;
+                            currentWriter[0] = createPartitionFile(partitionNum[0]);
+                        }
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+
+            // Close and register the last partition
+            currentWriter[0].close();
+            if (fileCount[0] > 0) {
+                registerPartition(partitions, partitionNum[0], fileCount[0]);
+            } else {
+                // Delete empty last file
+                Files.deleteIfExists(getPartitionFilePath(partitionNum[0]));
+            }
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create partition index files", e);
+        }
+
+        return partitions;
+    }
+
+    private BufferedWriter createPartitionFile(int partitionNum) throws IOException {
+        Path filePath = getPartitionFilePath(partitionNum);
+        return new BufferedWriter(new FileWriter(filePath.toFile()), 64 * 1024); // 64KB buffer
+    }
+
+    private Path getPartitionFilePath(int partitionNum) {
+        return tempDir.resolve("partition-" + partitionNum + ".idx");
+    }
+
+    private void registerPartition(Map<String, ExecutionContext> partitions, 
+                                    int partitionNum, int fileCount) {
+        ExecutionContext context = new ExecutionContext();
+        context.putString("indexFilePath", getPartitionFilePath(partitionNum).toString());
+        context.putInt("partitionNumber", partitionNum);
+        context.putInt("totalFiles", fileCount);
+        partitions.put("partition" + partitionNum, context);
+    }
+
+    private boolean isImageFile(Path path) {
+        String name = path.toString().toLowerCase();
+        return IMAGE_EXTENSIONS.stream().anyMatch(name::endsWith);
+    }
+}
+```
+
+### File-Index Reader (Streams from Index File)
+
+```java
+import org.springframework.batch.core.StepExecution;
+import org.springframework.batch.core.annotation.BeforeStep;
+import org.springframework.batch.core.annotation.AfterStep;
+import org.springframework.batch.item.ItemReader;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+
+import java.io.*;
+import java.nio.file.*;
+
+public class FileIndexImageReader implements ItemReader<Resource> {
+
+    private BufferedReader indexReader;
+    private String indexFilePath;
+
+    @BeforeStep
+    public void beforeStep(StepExecution stepExecution) throws IOException {
+        this.indexFilePath = stepExecution.getExecutionContext()
+            .getString("indexFilePath");
+        
+        this.indexReader = new BufferedReader(
+            new FileReader(indexFilePath), 
+            64 * 1024  // 64KB buffer for efficient reading
         );
     }
-    
-    @Bean
-    public ItemProcessor<Resource, ProcessedImage> imageProcessor() {
-        return resource -> {
-            // Process your image here
-            // Example: read metadata, resize, etc.
-            return new ProcessedImage(resource.getFilename());
-        };
-    }
-    
-    @Bean
-    public ItemWriter<ProcessedImage> imageWriter() {
-        return items -> {
-            // Write processed images or metadata
-            items.forEach(item -> {
-                // Your writing logic
-                System.out.println("Processed: " + item.getName());
-            });
-        };
-    }
-    
-    @Bean
-    public Job imageProcessingJob(JobRepository jobRepository, 
-                                 Step imageProcessingStep) {
-        return new JobBuilder("imageProcessingJob", jobRepository)
-                .start(imageProcessingStep)
-                .build();
-    }
-    
-    // Simple DTO for processed images
-    static class ProcessedImage {
-        private final String name;
+
+    @Override
+    public synchronized Resource read() throws IOException {
+        String line = indexReader.readLine();
         
-        public ProcessedImage(String name) {
-            this.name = name;
+        if (line != null && !line.isBlank()) {
+            Path path = Paths.get(line.trim());
+            if (Files.exists(path)) {
+                return new FileSystemResource(path.toFile());
+            }
         }
-        
-        public String getName() {
-            return name;
+        return null;
+    }
+
+    @AfterStep
+    public void afterStep(StepExecution stepExecution) {
+        try {
+            if (indexReader != null) {
+                indexReader.close();
+            }
+            // Cleanup temp file
+            Files.deleteIfExists(Paths.get(indexFilePath));
+        } catch (IOException e) {
+            // Log warning
         }
     }
 }
+```
+
+---
+
+## Solution 3: Database-Backed Partitioning (Best for Restartability)
+
+Store paths in a database table, use cursor-based pagination:
+
+```java
+// 1. First, run a setup step to populate the database
+@Bean
+public Step indexingStep(JobRepository jobRepository,
+                         PlatformTransactionManager transactionManager) {
+    return new StepBuilder("indexingStep", jobRepository)
+        .tasklet((contribution, chunkContext) -> {
+            jdbcTemplate.execute("TRUNCATE TABLE image_index");
+            
+            AtomicLong id = new AtomicLong(0);
+            
+            Files.walkFileTree(Paths.get(rootDirectory), new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    if (isImageFile(file)) {
+                        jdbcTemplate.update(
+                            "INSERT INTO image_index (id, file_path, partition_id, processed) VALUES (?, ?, ?, ?)",
+                            id.incrementAndGet(),
+                            file.toAbsolutePath().toString(),
+                            id.get() % partitionCount,  // Assign partition
+                            false
+                        );
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+            
+            return RepeatStatus.FINISHED;
+        }, transactionManager)
+        .build();
+}
+
+// 2. Partitioner reads partition ranges from DB
+public class DatabasePartitioner implements Partitioner {
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Map<String, ExecutionContext> partitions = new LinkedHashMap<>();
+        
+        List<Map<String, Object>> partitionInfo = jdbcTemplate.queryForList(
+            "SELECT partition_id, MIN(id) as min_id, MAX(id) as max_id, COUNT(*) as total " +
+            "FROM image_index GROUP BY partition_id"
+        );
+
+        for (Map<String, Object> info : partitionInfo) {
+            ExecutionContext context = new ExecutionContext();
+            context.putInt("partitionId", ((Number) info.get("partition_id")).intValue());
+            context.putLong("minId", ((Number) info.get("min_id")).longValue());
+            context.putLong("maxId", ((Number) info.get("max_id")).longValue());
+            
+            partitions.put("partition" + info.get("partition_id"), context);
+        }
+
+        return partitions;
+    }
+}
+
+// 3. Cursor-based reader - memory efficient
+@Bean
+@StepScope
+public JdbcCursorItemReader<Resource> databaseImageReader(
+        @Value("#{stepExecutionContext['partitionId']}") Integer partitionId) {
+    
+    return new JdbcCursorItemReaderBuilder<Resource>()
+        .name("imagePathReader")
+        .dataSource(dataSource)
+        .sql("SELECT file_path FROM image_index WHERE partition_id = ? AND processed = false")
+        .preparedStatementSetter(ps -> ps.setInt(1, partitionId))
+        .rowMapper((rs, rowNum) -> new FileSystemResource(rs.getString("file_path")))
+        .fetchSize(1000)  // Cursor fetch size
+        .build();
+}
+```
+
+---
+
+## Comparison
+
+| Solution | Memory Usage | Restartability | Setup Complexity | Best For |
+|:---------|:-------------|:---------------|:-----------------|:---------|
+| **Directory-Based** | Very Low | Medium | Low | Deeply nested structures |
+| **File-Index** | Minimal | Low | Medium | One-time processing |
+| **Database-Backed** | Minimal | Excellent | High | Enterprise, auditing needs |
+
+---
+
+## Recommendation
+
+For **millions of images in nested folders**, use **Solution 1 (Directory-Based)** because:
+
+* Zero file paths stored in memory during partitioning
+* Each worker lazily streams files from its assigned directories
+* Natural fit for nested folder structures
+* Simple to implement and maintain
+
+Use **Solution 2 (File-Index)** if directories are flat or unevenly distributed.
+
+Use **Solution 3 (Database)** if you need job restartability, audit trails, or tracking processed files.
+
