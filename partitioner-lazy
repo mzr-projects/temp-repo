@@ -1,0 +1,423 @@
+I'll show you how to implement a partitioner-based solution that distributes subdirectories across multiple partitions for parallel processing:
+
+## Complete Partitioner-Based Solution
+
+### 1. Directory Partitioner
+
+```java
+import org.springframework.batch.core.partition.support.Partitioner;
+import org.springframework.batch.item.ExecutionContext;
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class DirectoryPartitioner implements Partitioner {
+    
+    private final String rootDirectory;
+    private final int maxDepth;
+    
+    public DirectoryPartitioner(String rootDirectory, int maxDepth) {
+        this.rootDirectory = rootDirectory;
+        this.maxDepth = maxDepth;
+    }
+    
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Map<String, ExecutionContext> partitions = new HashMap<>();
+        
+        try {
+            // Find all subdirectories at specified depth
+            List<Path> directories = findDirectoriesToPartition();
+            
+            if (directories.isEmpty()) {
+                // If no subdirectories, use root directory
+                ExecutionContext context = new ExecutionContext();
+                context.putString("directory", rootDirectory);
+                context.putString("partitionName", "partition0");
+                partitions.put("partition0", context);
+                return partitions;
+            }
+            
+            // Distribute directories across partitions
+            int partitionCount = Math.min(gridSize, directories.size());
+            
+            for (int i = 0; i < partitionCount; i++) {
+                ExecutionContext context = new ExecutionContext();
+                
+                // Collect directories for this partition
+                List<String> partitionDirs = new ArrayList<>();
+                for (int j = i; j < directories.size(); j += partitionCount) {
+                    partitionDirs.add(directories.get(j).toString());
+                }
+                
+                context.putString("directories", String.join(",", partitionDirs));
+                context.putString("partitionName", "partition" + i);
+                context.putInt("partitionNumber", i);
+                
+                partitions.put("partition" + i, context);
+            }
+            
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to partition directories", e);
+        }
+        
+        return partitions;
+    }
+    
+    private List<Path> findDirectoriesToPartition() throws IOException {
+        Path root = Paths.get(rootDirectory);
+        
+        // Find directories at specified depth for partitioning
+        List<Path> directories = Files.walk(root, maxDepth)
+            .filter(Files::isDirectory)
+            .filter(path -> !path.equals(root))
+            .collect(Collectors.toList());
+        
+        return directories;
+    }
+}
+```
+
+### 2. Partitioned File Reader
+
+```java
+import org.springframework.batch.item.ItemReader;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.support.AbstractItemCountingItemStreamItemReader;
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+import java.util.stream.Stream;
+
+public class PartitionedFileItemReader extends AbstractItemCountingItemStreamItemReader<Path> {
+    
+    private final List<String> directories;
+    private final String filePattern;
+    private Iterator<Path> fileIterator;
+    private Stream<Path> fileStream;
+    
+    public PartitionedFileItemReader(String directories, String filePattern) {
+        this.directories = Arrays.asList(directories.split(","));
+        this.filePattern = filePattern;
+        setName("partitionedFileReader");
+    }
+    
+    @Override
+    protected void doOpen() throws Exception {
+        // Create a stream that walks multiple directories
+        Stream<Path> combinedStream = directories.stream()
+            .map(Paths::get)
+            .flatMap(dir -> {
+                try {
+                    return Files.walk(dir)
+                        .filter(Files::isRegularFile)
+                        .filter(path -> path.toString().matches(filePattern));
+                } catch (IOException e) {
+                    throw new RuntimeException("Error walking directory: " + dir, e);
+                }
+            });
+        
+        fileStream = combinedStream;
+        fileIterator = fileStream.iterator();
+    }
+    
+    @Override
+    protected Path doRead() throws Exception {
+        if (fileIterator != null && fileIterator.hasNext()) {
+            return fileIterator.next();
+        }
+        return null;
+    }
+    
+    @Override
+    protected void doClose() throws Exception {
+        if (fileStream != null) {
+            fileStream.close();
+        }
+    }
+}
+```
+
+### 3. Spring Batch Configuration with Partitioning
+
+```java
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.configuration.annotation.*;
+import org.springframework.batch.core.partition.support.*;
+import org.springframework.batch.core.scope.context.ChunkContext;
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.item.*;
+import org.springframework.batch.repeat.RepeatStatus;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+@Configuration
+@EnableBatchProcessing
+public class PartitionedImageProcessingConfig {
+    
+    @Bean
+    public Job imageProcessingJob(JobRepository jobRepository,
+                                   Step partitionStep) {
+        return new JobBuilder("imageProcessingJob", jobRepository)
+            .start(partitionStep)
+            .build();
+    }
+    
+    @Bean
+    public Step partitionStep(JobRepository jobRepository,
+                              Step workerStep,
+                              Partitioner partitioner,
+                              TaskExecutor taskExecutor) {
+        return new StepBuilder("partitionStep", jobRepository)
+            .partitioner("workerStep", partitioner)
+            .step(workerStep)
+            .gridSize(20) // Number of parallel partitions
+            .taskExecutor(taskExecutor)
+            .build();
+    }
+    
+    @Bean
+    public Step workerStep(JobRepository jobRepository,
+                           PlatformTransactionManager transactionManager,
+                           ItemReader<Path> partitionedReader,
+                           ItemProcessor<Path, ProcessedImage> imageProcessor,
+                           ItemWriter<ProcessedImage> imageWriter) {
+        return new StepBuilder("workerStep", jobRepository)
+            .<Path, ProcessedImage>chunk(50, transactionManager)
+            .reader(partitionedReader)
+            .processor(imageProcessor)
+            .writer(imageWriter)
+            .build();
+    }
+    
+    @Bean
+    @StepScope
+    public Partitioner partitioner(
+            @Value("#{jobParameters['inputDirectory']}") String inputDirectory,
+            @Value("#{jobParameters['partitionDepth']}") Integer partitionDepth) {
+        return new DirectoryPartitioner(
+            inputDirectory, 
+            partitionDepth != null ? partitionDepth : 2
+        );
+    }
+    
+    @Bean
+    @StepScope
+    public PartitionedFileItemReader partitionedReader(
+            @Value("#{stepExecutionContext['directories']}") String directories,
+            @Value("#{jobParameters['filePattern']}") String filePattern) {
+        return new PartitionedFileItemReader(
+            directories,
+            filePattern != null ? filePattern : ".*\\.(jpg|jpeg|png|gif|bmp)$"
+        );
+    }
+    
+    @Bean
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(20);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix("partition-");
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+### 4. Image Processor (Enhanced)
+
+```java
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.stereotype.Component;
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.nio.file.Path;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@Component
+public class ImageProcessor implements ItemProcessor<Path, ProcessedImage> {
+    
+    private static final Logger logger = LoggerFactory.getLogger(ImageProcessor.class);
+    
+    @Override
+    public ProcessedImage process(Path imagePath) throws Exception {
+        try {
+            logger.debug("Processing image: {}", imagePath);
+            
+            BufferedImage image = ImageIO.read(imagePath.toFile());
+            
+            if (image == null) {
+                logger.warn("Could not read image: {}", imagePath);
+                return null;
+            }
+            
+            ProcessedImage processed = new ProcessedImage();
+            processed.setOriginalPath(imagePath.toString());
+            processed.setFileName(imagePath.getFileName().toString());
+            processed.setWidth(image.getWidth());
+            processed.setHeight(image.getHeight());
+            processed.setFileSize(imagePath.toFile().length());
+            
+            // Add your custom processing logic here:
+            // - Resize images
+            // - Extract EXIF metadata
+            // - Generate thumbnails
+            // - Detect faces/objects
+            // - Convert formats
+            
+            return processed;
+            
+        } catch (Exception e) {
+            logger.error("Error processing image: {} - {}", imagePath, e.getMessage());
+            return null; // Skip problematic images
+        }
+    }
+}
+```
+
+### 5. Image Writer (Enhanced)
+
+```java
+import org.springframework.batch.item.Chunk;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.stereotype.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.util.List;
+
+@Component
+public class ImageWriter implements ItemWriter<ProcessedImage> {
+    
+    private static final Logger logger = LoggerFactory.getLogger(ImageWriter.class);
+    
+    @Override
+    public void write(Chunk<? extends ProcessedImage> chunk) throws Exception {
+        List<? extends ProcessedImage> items = chunk.getItems();
+        
+        for (ProcessedImage image : items) {
+            // Save to database
+            // saveToDatabase(image);
+            
+            // Or write to file system
+            // writeToFileSystem(image);
+            
+            // Or upload to cloud storage (S3, Azure Blob, etc.)
+            // uploadToCloud(image);
+            
+            logger.info("Processed: {} - {}x{} - {} bytes", 
+                image.getFileName(), 
+                image.getWidth(), 
+                image.getHeight(),
+                image.getFileSize());
+        }
+    }
+}
+```
+
+### 6. ProcessedImage DTO
+
+```java
+public class ProcessedImage {
+    private String originalPath;
+    private String fileName;
+    private int width;
+    private int height;
+    private long fileSize;
+    private String thumbnailPath;
+    
+    // Getters and setters
+    public String getOriginalPath() { return originalPath; }
+    public void setOriginalPath(String originalPath) { this.originalPath = originalPath; }
+    
+    public String getFileName() { return fileName; }
+    public void setFileName(String fileName) { this.fileName = fileName; }
+    
+    public int getWidth() { return width; }
+    public void setWidth(int width) { this.width = width; }
+    
+    public int getHeight() { return height; }
+    public void setHeight(int height) { this.height = height; }
+    
+    public long getFileSize() { return fileSize; }
+    public void setFileSize(long fileSize) { this.fileSize = fileSize; }
+    
+    public String getThumbnailPath() { return thumbnailPath; }
+    public void setThumbnailPath(String thumbnailPath) { this.thumbnailPath = thumbnailPath; }
+}
+```
+
+### 7. Job Launcher
+
+```java
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.repository.JobExecutionAlreadyRunningException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ImageProcessingJobLauncher {
+    
+    @Autowired
+    private JobLauncher jobLauncher;
+    
+    @Autowired
+    private Job imageProcessingJob;
+    
+    public JobExecution runImageProcessing(String inputDirectory, 
+                                          String filePattern,
+                                          int partitionDepth) throws Exception {
+        
+        JobParameters params = new JobParametersBuilder()
+            .addString("inputDirectory", inputDirectory)
+            .addString("filePattern", filePattern)
+            .addLong("timestamp", System.currentTimeMillis())
+            .addLong("partitionDepth", (long) partitionDepth)
+            .toJobParameters();
+        
+        return jobLauncher.run(imageProcessingJob, params);
+    }
+}
+```
+
+### 8. Application Properties
+
+```properties
+# application.properties
+spring.batch.job.enabled=false
+spring.datasource.url=jdbc:h2:mem:batchdb
+spring.datasource.driver-class-name=org.h2.Driver
+spring.jpa.hibernate.ddl-auto=create-drop
+
+# Batch configuration
+spring.batch.jdbc.initialize-schema=always
+```
+
+## Running the Job
+
+```java
+// Example usage
+imageProcessingJobLauncher.runImageProcessing(
+    "/path/to/millions/of/images",
+    ".*\\.(jpg|jpeg|png)$",
+    2  // Partition at depth 2 (subdirectories 2 levels deep)
+);
+```
+
+## Key Advantages of This Partitioned Approach
+
+1. **True Parallelism**: Multiple partitions process different directory trees simultaneously
+2. **Memory Efficient**: Each partition streams files lazily
+3. **Scalable**: Can handle millions of files across thousands of directories
+4. **Fault Tolerant**: If one partition fails, others continue
+5. **Load Balanced**: Directories are distributed evenly across partitions
+6. **Configurable**: Adjust partition depth and grid size based on your directory structure
+
+The partitioner will divide your nested folder structure across multiple threads, with each thread processing its assigned directories independently without loading all file paths into memory!
