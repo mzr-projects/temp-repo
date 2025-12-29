@@ -1,0 +1,77 @@
+// Script 1: Check if date is AFTER a reference date
+// Usage in query: pass params.reference_date as ISO string (e.g., "2024-01-15T00:00:00Z")
+if (doc['your_date_field'].size() == 0) {
+  return false;
+}
+ZonedDateTime docDate = doc['your_date_field'].value;
+ZonedDateTime referenceDate = ZonedDateTime.parse(params.reference_date);
+return docDate.isAfter(referenceDate);
+
+// ============================================
+
+// Script 2: Check if date is BEFORE a reference date
+// Usage in query: pass params.reference_date as ISO string
+if (doc['your_date_field'].size() == 0) {
+  return false;
+}
+ZonedDateTime docDate = doc['your_date_field'].value;
+ZonedDateTime referenceDate = ZonedDateTime.parse(params.reference_date);
+return docDate.isBefore(referenceDate);
+
+// ============================================
+
+// Script 3: Check if date is BETWEEN two dates (inclusive)
+// Usage in query: pass params.start_date and params.end_date as ISO strings
+if (doc['your_date_field'].size() == 0) {
+  return false;
+}
+ZonedDateTime docDate = doc['your_date_field'].value;
+ZonedDateTime startDate = ZonedDateTime.parse(params.start_date);
+ZonedDateTime endDate = ZonedDateTime.parse(params.end_date);
+return (docDate.isAfter(startDate) || docDate.isEqual(startDate)) && 
+       (docDate.isBefore(endDate) || docDate.isEqual(endDate));
+
+// ============================================
+// Example Query Usage:
+// ============================================
+
+/*
+// Using Script 1 (AFTER):
+GET /your_index/_search
+{
+  "query": {
+    "bool": {
+      "filter": {
+        "script": {
+          "script": {
+            "source": "if (doc['created_at'].size() == 0) { return false; } ZonedDateTime docDate = doc['created_at'].value; ZonedDateTime referenceDate = ZonedDateTime.parse(params.reference_date); return docDate.isAfter(referenceDate);",
+            "params": {
+              "reference_date": "2024-06-01T00:00:00Z"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Using Script 3 (BETWEEN):
+GET /your_index/_search
+{
+  "query": {
+    "bool": {
+      "filter": {
+        "script": {
+          "script": {
+            "source": "if (doc['created_at'].size() == 0) { return false; } ZonedDateTime docDate = doc['created_at'].value; ZonedDateTime startDate = ZonedDateTime.parse(params.start_date); ZonedDateTime endDate = ZonedDateTime.parse(params.end_date); return (docDate.isAfter(startDate) || docDate.isEqual(startDate)) && (docDate.isBefore(endDate) || docDate.isEqual(endDate));",
+            "params": {
+              "start_date": "2024-01-01T00:00:00Z",
+              "end_date": "2024-12-31T23:59:59Z"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+*/
