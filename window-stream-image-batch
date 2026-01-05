@@ -1,0 +1,462 @@
+You're absolutely right! Let me provide a **streaming window-based partitioning** approach where partitions are created and processed incrementally:
+
+## 1. Streaming Window-Based Partitioner
+
+```java
+@Component
+public class StreamingWindowPartitioner implements Partitioner {
+    
+    private static final int FILES_PER_PARTITION = 100_000; // 100K files per partition
+    
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        // This creates just ONE window of partitions at a time
+        // gridSize determines how many partitions in this window
+        Map<String, ExecutionContext> partitions = new HashMap<>();
+        
+        for (int i = 0; i < gridSize; i++) {
+            ExecutionContext context = new ExecutionContext();
+            context.putInt("partitionNumber", i);
+            context.putLong("filesPerPartition", FILES_PER_PARTITION);
+            partitions.put("partition" + i, context);
+        }
+        
+        return partitions;
+    }
+}
+```
+
+## 2. Stateful File Discovery Reader (Streams Files Window by Window)
+
+```java
+@StepScope
+@Component
+public class WindowedFileStreamReader implements ItemStreamReader<Resource> {
+    
+    private final String baseImagePath;
+    private Stream<Path> currentStream;
+    private Iterator<Path> currentIterator;
+    
+    // State for restartability
+    private String lastProcessedFile;
+    private long filesProcessedInPartition = 0;
+    private long filesPerPartition;
+    private int partitionNumber;
+    
+    // Persistent state tracker
+    private TreeSet<String> processedFiles; // For consistent ordering
+    
+    @Value("#{stepExecutionContext['partitionNumber']}")
+    public void setPartitionNumber(int partitionNumber) {
+        this.partitionNumber = partitionNumber;
+    }
+    
+    @Value("#{stepExecutionContext['filesPerPartition']}")
+    public void setFilesPerPartition(long filesPerPartition) {
+        this.filesPerPartition = filesPerPartition;
+    }
+    
+    @Value("${image.base.path}")
+    public void setBaseImagePath(String baseImagePath) {
+        this.baseImagePath = baseImagePath;
+    }
+
+    @Override
+    public void open(ExecutionContext executionContext) throws ItemStreamException {
+        // Restore state from database on restart
+        lastProcessedFile = executionContext.getString("lastProcessedFile", null);
+        filesProcessedInPartition = executionContext.getLong("filesProcessed", 0L);
+        
+        try {
+            // Stream files with a predicate to skip already processed
+            currentStream = Files.walk(Paths.get(baseImagePath))
+                    .filter(Files::isRegularFile)
+                    .filter(this::isImageFile)
+                    .sorted() // Critical for restartability
+                    .filter(p -> shouldProcessFile(p)); // Skip already processed
+            
+            currentIterator = currentStream.iterator();
+            
+        } catch (IOException e) {
+            throw new ItemStreamException("Failed to open streaming window", e);
+        }
+    }
+
+    @Override
+    public Resource read() throws Exception {
+        if (currentIterator == null) {
+            return null;
+        }
+        
+        // Check if we've reached the window limit for this partition
+        if (filesProcessedInPartition >= filesPerPartition) {
+            return null; // End of this partition's window
+        }
+        
+        if (currentIterator.hasNext()) {
+            Path path = currentIterator.next();
+            lastProcessedFile = path.toString();
+            filesProcessedInPartition++;
+            
+            return new FileSystemResource(path.toFile());
+        }
+        
+        return null; // No more files
+    }
+
+    @Override
+    public void update(ExecutionContext executionContext) throws ItemStreamException {
+        // Save state for restart - this is called after each chunk commit
+        executionContext.putString("lastProcessedFile", lastProcessedFile);
+        executionContext.putLong("filesProcessed", filesProcessedInPartition);
+    }
+
+    @Override
+    public void close() throws ItemStreamException {
+        if (currentStream != null) {
+            currentStream.close();
+        }
+    }
+    
+    private boolean shouldProcessFile(Path path) {
+        if (lastProcessedFile == null) {
+            return true; // First run
+        }
+        // Skip files until we reach the last processed file
+        return path.toString().compareTo(lastProcessedFile) > 0;
+    }
+    
+    private boolean isImageFile(Path path) {
+        String fileName = path.getFileName().toString().toLowerCase();
+        return fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") ||
+               fileName.endsWith(".png") || fileName.endsWith(".gif") ||
+               fileName.endsWith(".bmp") || fileName.endsWith(".tiff");
+    }
+}
+```
+
+## 3. Window-Based Partition Handler (Processes Windows Sequentially)
+
+```java
+@Component
+public class StreamingWindowPartitionHandler implements PartitionHandler {
+    
+    private final Step workerStep;
+    private final TaskExecutor taskExecutor;
+    private final JobExplorer jobExplorer;
+    private final int partitionsPerWindow;
+    
+    public StreamingWindowPartitionHandler(
+            Step workerStep,
+            TaskExecutor taskExecutor,
+            JobExplorer jobExplorer,
+            @Value("${batch.partitions.per.window:10}") int partitionsPerWindow) {
+        this.workerStep = workerStep;
+        this.taskExecutor = taskExecutor;
+        this.jobExplorer = jobExplorer;
+        this.partitionsPerWindow = partitionsPerWindow;
+    }
+
+    @Override
+    public Collection<StepExecution> handle(StepExecutionSplitter stepSplitter,
+                                             StepExecution masterStepExecution) 
+            throws Exception {
+        
+        List<StepExecution> allStepExecutions = new ArrayList<>();
+        long windowNumber = getLastWindowNumber(masterStepExecution);
+        boolean moreFilesToProcess = true;
+        
+        while (moreFilesToProcess) {
+            // Create ONE window of partitions
+            Set<StepExecution> windowExecutions = 
+                    stepSplitter.split(masterStepExecution, partitionsPerWindow);
+            
+            if (windowExecutions.isEmpty()) {
+                break;
+            }
+            
+            // Add window number to each partition's context
+            for (StepExecution execution : windowExecutions) {
+                execution.getExecutionContext().putLong("windowNumber", windowNumber);
+            }
+            
+            // Execute this window of partitions in parallel
+            TaskExecutorPartitionHandler handler = new TaskExecutorPartitionHandler();
+            handler.setStep(workerStep);
+            handler.setTaskExecutor(taskExecutor);
+            handler.setGridSize(partitionsPerWindow);
+            handler.afterPropertiesSet();
+            
+            Collection<StepExecution> completedExecutions = 
+                    handler.handle(stepSplitter, masterStepExecution);
+            
+            allStepExecutions.addAll(completedExecutions);
+            
+            // Check if all partitions in this window are exhausted
+            moreFilesToProcess = hasMoreFiles(completedExecutions);
+            
+            if (moreFilesToProcess) {
+                windowNumber++;
+                saveWindowNumber(masterStepExecution, windowNumber);
+            }
+            
+            // Log progress
+            System.out.println("Completed window " + windowNumber + 
+                             ", Total files processed: " + getTotalFilesProcessed(allStepExecutions));
+        }
+        
+        return allStepExecutions;
+    }
+    
+    private boolean hasMoreFiles(Collection<StepExecution> executions) {
+        // If all partitions read fewer files than their limit, we're done
+        return executions.stream()
+                .anyMatch(e -> e.getReadCount() > 0);
+    }
+    
+    private long getTotalFilesProcessed(List<StepExecution> executions) {
+        return executions.stream()
+                .mapToLong(StepExecution::getReadCount)
+                .sum();
+    }
+    
+    private long getLastWindowNumber(StepExecution masterStepExecution) {
+        return masterStepExecution.getExecutionContext().getLong("lastWindowNumber", 0L);
+    }
+    
+    private void saveWindowNumber(StepExecution masterStepExecution, long windowNumber) {
+        masterStepExecution.getExecutionContext().putLong("lastWindowNumber", windowNumber);
+    }
+}
+```
+
+## 4. Alternative: File Offset-Based Streaming (More Efficient)
+
+For extreme scale, use file offsets instead of file paths:
+
+```java
+@Component
+@StepScope
+public class OffsetBasedFileStreamReader implements ItemStreamReader<Resource> {
+    
+    private final String baseImagePath;
+    private RandomAccessFile indexFile; // Pre-built index of file paths
+    private long currentOffset = 0;
+    private long endOffset;
+    private BufferedReader reader;
+    
+    @Value("#{stepExecutionContext['startOffset']}")
+    private long startOffset;
+    
+    @Value("#{stepExecutionContext['offsetRange']}")
+    private long offsetRange;
+    
+    @Value("${image.index.file.path}") // Pre-built index file
+    private String indexFilePath;
+
+    @Override
+    public void open(ExecutionContext executionContext) throws ItemStreamException {
+        currentOffset = executionContext.getLong("currentOffset", startOffset);
+        endOffset = startOffset + offsetRange;
+        
+        try {
+            // Open index file and seek to position
+            randomAccessFile = new RandomAccessFile(indexFilePath, "r");
+            randomAccessFile.seek(currentOffset);
+            reader = new BufferedReader(
+                    new InputStreamReader(
+                            new FileInputStream(randomAccessFile.getFD())));
+            
+        } catch (IOException e) {
+            throw new ItemStreamException("Failed to open index file", e);
+        }
+    }
+
+    @Override
+    public Resource read() throws Exception {
+        if (currentOffset >= endOffset) {
+            return null; // Reached end of this partition's range
+        }
+        
+        String filePath = reader.readLine();
+        if (filePath == null) {
+            return null; // End of file
+        }
+        
+        currentOffset += filePath.getBytes().length + 1; // +1 for newline
+        
+        File imageFile = new File(filePath);
+        if (imageFile.exists()) {
+            return new FileSystemResource(imageFile);
+        }
+        
+        return read(); // Skip missing files recursively
+    }
+
+    @Override
+    public void update(ExecutionContext executionContext) throws ItemStreamException {
+        executionContext.putLong("currentOffset", currentOffset);
+    }
+
+    @Override
+    public void close() throws ItemStreamException {
+        try {
+            if (reader != null) reader.close();
+            if (randomAccessFile != null) randomAccessFile.close();
+        } catch (IOException e) {
+            throw new ItemStreamException("Failed to close index file", e);
+        }
+    }
+}
+```
+
+## 5. Index File Generator (Run Once)
+
+```java
+@Component
+public class FileIndexGenerator {
+    
+    /**
+     * Generates an index file with all image paths (run once, not part of main job)
+     * This takes the "forever" operation out of the main processing
+     */
+    public void generateIndex(String baseImagePath, String indexFilePath) throws IOException {
+        try (BufferedWriter writer = Files.newBufferedWriter(
+                Paths.get(indexFilePath), 
+                StandardOpenOption.CREATE, 
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            
+            AtomicLong count = new AtomicLong(0);
+            
+            Files.walk(Paths.get(baseImagePath))
+                    .filter(Files::isRegularFile)
+                    .filter(this::isImageFile)
+                    .sorted()
+                    .forEach(path -> {
+                        try {
+                            writer.write(path.toString());
+                            writer.newLine();
+                            
+                            long current = count.incrementAndGet();
+                            if (current % 1_000_000 == 0) {
+                                System.out.println("Indexed " + current + " files...");
+                            }
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    });
+            
+            System.out.println("Total files indexed: " + count.get());
+        }
+    }
+    
+    private boolean isImageFile(Path path) {
+        String fileName = path.getFileName().toString().toLowerCase();
+        return fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") ||
+               fileName.endsWith(".png") || fileName.endsWith(".gif");
+    }
+}
+```
+
+## 6. Configuration with Windowed Processing
+
+```java
+@Configuration
+@EnableBatchProcessing
+public class WindowedBatchConfig {
+
+    @Bean
+    public Job imageProcessingJob(JobBuilderFactory jobBuilderFactory,
+                                   Step masterStep) {
+        return jobBuilderFactory.get("imageProcessingJob")
+                .incrementer(new RunIdIncrementer())
+                .start(masterStep)
+                .listener(new JobProgressListener()) // Track overall progress
+                .build();
+    }
+
+    @Bean
+    public Step masterStep(StepBuilderFactory stepBuilderFactory,
+                          StreamingWindowPartitioner partitioner,
+                          StreamingWindowPartitionHandler partitionHandler) {
+        return stepBuilderFactory.get("masterStep")
+                .partitioner("workerStep", partitioner)
+                .partitionHandler(partitionHandler)
+                .build();
+    }
+    
+    @Bean
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(50);
+        executor.setThreadNamePrefix("window-worker-");
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(300);
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+## 7. Progress Tracking
+
+```java
+@Component
+public class JobProgressListener implements JobExecutionListener {
+    
+    @Override
+    public void beforeJob(JobExecution jobExecution) {
+        System.out.println("Starting windowed image processing job...");
+    }
+    
+    @Override
+    public void afterJob(JobExecution jobExecution) {
+        long totalRead = jobExecution.getStepExecutions().stream()
+                .mapToLong(StepExecution::getReadCount)
+                .sum();
+        
+        System.out.println("Job completed!");
+        System.out.println("Total images processed: " + totalRead);
+        System.out.println("Status: " + jobExecution.getStatus());
+    }
+}
+```
+
+## 8. Application Properties
+
+```properties
+# Windowing configuration
+batch.partitions.per.window=10
+batch.files.per.partition=100000
+image.base.path=/data/images
+image.index.file.path=/data/image-index.txt
+
+# Database
+spring.datasource.url=jdbc:postgresql://localhost:5432/batchdb
+spring.batch.jdbc.initialize-schema=always
+
+# Commit every 1000 files
+spring.batch.chunk-size=1000
+```
+
+## How It Works:
+
+1. **Window 1**: Creates 10 partitions, each processes 100K files in parallel
+2. **Window 2**: After Window 1 completes, creates next 10 partitions for next 100K files each
+3. **Window N**: Continues until all 150M files processed
+4. **Restart**: On JVM restart, resumes from last committed window and file offset
+
+## Execution Flow:
+
+```
+Window 1: Partitions 0-9   → Process files    0 - 1M
+Window 2: Partitions 10-19 → Process files   1M - 2M  
+Window 3: Partitions 20-29 → Process files   2M - 3M
+...
+Window 150: Final window   → Process files 149M - 150M
+```
+
+This approach **never loads all 150M paths into memory** and processes partitions **incrementally in windows**! 🚀
+
