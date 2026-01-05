@@ -1,0 +1,182 @@
+
+
+## What you want is only possible if the “stream” is resumable
+Spring Batch can restart after a JVM crash **only** if the step can reopen the input stream at a precise checkpoint stored in the **persistent `JobRepository`** (ExecutionContext in DB).  
+So your reader must be able to resume from a **stable cursor** (DB key, file offset, etc.). If you only “walk the filesystem” with no persisted cursor, you’ll either:
+* re-walk from the beginning on restart (often unacceptable at 150M), or
+* need some external state (DB table, manifest files, or moving processed files).
+
+Below are two designs that satisfy all your constraints (no in-memory path list, partitioned, JVM-restartable).
+
+---
+
+## Design A (most robust): DB-backed work table + partitioning by ID (no paths in memory)
+You store *paths on disk/DB*, but **never in JVM memory** beyond a chunk. This gives the cleanest restart + visibility + retries.
+
+### 1) Table (example)
+```sql
+create table image_work (
+  id bigserial primary key,
+  path text not null unique,
+  status varchar(16) not null default 'READY',
+  updated_at timestamp not null default now()
+);
+
+create index image_work_status_id on image_work(status, id);
+```
+
+### 2) Partition without loading paths
+Partition by ID ranges (or by a precomputed `shard` column).
+
+```java
+public class IdRangePartitioner implements Partitioner {
+    private final JdbcTemplate jdbc;
+
+    public IdRangePartitioner(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Long min = jdbc.queryForObject(
+            "select min(id) from image_work where status='READY'", Long.class);
+        Long max = jdbc.queryForObject(
+            "select max(id) from image_work where status='READY'", Long.class);
+
+        if (min == null || max == null) return Map.of();
+
+        long targetSize = ((max - min) / gridSize) + 1;
+
+        Map<String, ExecutionContext> map = new HashMap<>();
+        long start = min;
+        long end = start + targetSize - 1;
+
+        for (int i = 0; i < gridSize && start <= max; i++) {
+            ExecutionContext ctx = new ExecutionContext();
+            ctx.putLong("minId", start);
+            ctx.putLong("maxId", Math.min(end, max));
+            map.put("partition-" + i, ctx);
+
+            start += targetSize;
+            end += targetSize;
+        }
+        return map;
+    }
+}
+```
+
+### 3) Restartable streaming reader (no in-memory list)
+Use `JdbcPagingItemReader` so the restart state is efficient (it stores the last sort key values).
+
+```java
+@Bean
+@StepScope
+public JdbcPagingItemReader<ImageWork> imageReader(
+        DataSource ds,
+        @Value("#{stepExecutionContext['minId']}") long minId,
+        @Value("#{stepExecutionContext['maxId']}") long maxId) {
+
+    return new JdbcPagingItemReaderBuilder<ImageWork>()
+        .name("imageReader")
+        .dataSource(ds)
+        .selectClause("select id, path")
+        .fromClause("from image_work")
+        .whereClause("where status='READY' and id between :minId and :maxId")
+        .sortKeys(Map.of("id", Order.ASCENDING))
+        .parameterValues(Map.of("minId", minId, "maxId", maxId))
+        .rowMapper((rs, n) -> new ImageWork(rs.getLong("id"), rs.getString("path")))
+        .pageSize(2000)
+        .build();
+}
+```
+
+### 4) Hand the “resource” to Spark (processor) and do Spark work in the writer
+Processor: convert DB row to a Spark-friendly reference (usually just a URI/path).
+```java
+@Bean
+public ItemProcessor<ImageWork, String> toSparkPath() {
+    return item -> item.path(); // keep it as a String/URI; Spark reads from this
+}
+```
+
+Writer: process a *chunk* (micro-batch) with Spark.
+```java
+@Component
+@StepScope
+public class SparkImageWriter implements ItemWriter<String> {
+
+    private final SparkSession spark;
+
+    public SparkImageWriter(SparkSession spark) { this.spark = spark; }
+
+    @Override
+    public void write(Chunk<? extends String> chunk) {
+        List<? extends String> paths = chunk.getItems();
+
+        // Spark micro-batch
+        Dataset<Row> images = spark.read()
+            .format("image")
+            .load(paths.toArray(String[]::new));
+
+        // transform + write
+        images.write().mode(SaveMode.Append).parquet("s3a://bucket/out/");
+    }
+}
+```
+
+Then update `status='DONE'` **in the same chunk** (preferably same DB transaction as the step) using a second writer or a composite writer.  
+Important: Spark file writes are **not** part of your DB transaction. For true restart safety, make the output idempotent (e.g., write per-image deterministic output path, or write to temp + atomic rename).
+
+---
+
+## Design B (no DB for 150M paths): “manifest shards” + partition by shard file (still restartable)
+If you refuse a 150M-row work table, create immutable manifest files once:
+
+* `manifest-0000.txt`
+* `manifest-0001.txt`
+* …
+Each line = one image URI/path.
+
+This is still “streaming paths” (line-by-line), and Spring Batch restart is easy.
+
+### 1) Partition = one manifest shard (few hundred/thousand shards)
+Partitioner loads only the *shard file list* (tiny), not 150M paths.
+
+### 2) Reader = `FlatFileItemReader` with `saveState=true`
+```java
+@Bean
+@StepScope
+public FlatFileItemReader<String> manifestReader(
+        @Value("#{stepExecutionContext['manifestUri']}") String manifestUri) throws Exception {
+
+    return new FlatFileItemReaderBuilder<String>()
+        .name("manifestReader")
+        .resource(new UrlResource(manifestUri))
+        .lineMapper((line, lineNum) -> line)
+        .saveState(true)     // state stored in JobRepository -> restartable across JVM
+        .build();
+}
+```
+
+If you shard so each manifest has, say, 1–5 million lines, restart “skip to last line” is usually acceptable. If you expect frequent restarts and huge shard files, implement a **byte-offset** reader (stores file offset in ExecutionContext) for fast resume.
+
+Writer/processor is identical to Design A (Spark micro-batch per chunk).
+
+---
+
+## Non-negotiables for “completely restartable after JVM restart”
+* **Use a JDBC `JobRepository`** (not in-memory). Spring Batch stores step + reader state there.
+* Ensure your reader is an `ItemStream` and has `saveState=true` (paging readers + flat file readers already do).
+* **Deterministic partitioning**: same job parameters must map to the same partitions.
+* Don’t use `RunIdIncrementer` if you expect “restart the same instance”; restart requires the **same JobParameters** (or use `JobOperator.restart(executionExecutionId)`).
+* Make the writer **idempotent** (or “exactly once” via output semantics), because failed chunks will be re-run.
+
+---
+
+## Spark-specific constraint you must satisfy
+Spark executors must be able to read the image paths you send. That usually means:
+* Use shared storage: `s3a://`, `abfs://`, `hdfs://`, or a shared NFS mount.
+* Do **not** send local-only paths from the Spring Batch machine unless Spark is running in local mode on that same machine.
+
+---
+
+If you tell me where the images live (local disk vs S3/HDFS) and whether you can afford a DB work table, I can give you a concrete end-to-end Spring Batch config (master/worker steps, remote partitioning vs local threads, composite writer to update status, and SparkSession lifecycle) that fits your environment.
+
