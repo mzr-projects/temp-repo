@@ -1,0 +1,450 @@
+You're absolutely right. Let me provide a solution that streams folders on-demand without scanning all files upfront:
+
+## 1. Lightweight Folder-Based Partitioner
+
+```java
+@Component
+public class StreamingFolderPartitioner implements Partitioner {
+    
+    @Value("${batch.folders.per.partition:10}")
+    private int foldersPerPartition;
+    
+    @Value("${image.root.path}")
+    private String rootPath;
+    
+    @Value("${image.max.depth:3}")
+    private int maxDepth;
+    
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Map<String, ExecutionContext> partitions = new HashMap<>();
+        
+        try {
+            // Only collect folder paths, not files
+            List<Path> folders = collectFoldersOnly();
+            
+            // Create partitions with folder paths only
+            int partitionNumber = 0;
+            for (int i = 0; i < folders.size(); i += foldersPerPartition) {
+                ExecutionContext context = new ExecutionContext();
+                
+                int endIndex = Math.min(i + foldersPerPartition, folders.size());
+                List<String> folderBatch = folders.subList(i, endIndex).stream()
+                    .map(Path::toString)
+                    .collect(Collectors.toList());
+                
+                context.put("folders", new ArrayList<>(folderBatch));
+                context.put("partitionNumber", partitionNumber);
+                context.putInt("currentFolderIndex", 0);
+                
+                partitions.put("partition" + partitionNumber, context);
+                partitionNumber++;
+            }
+            
+        } catch (IOException e) {
+            throw new RuntimeException("Error creating partitions", e);
+        }
+        
+        return partitions;
+    }
+    
+    private List<Path> collectFoldersOnly() throws IOException {
+        List<Path> folders = new ArrayList<>();
+        
+        Files.walk(Paths.get(rootPath), maxDepth)
+            .filter(Files::isDirectory)
+            .filter(path -> !path.equals(Paths.get(rootPath))) // Exclude root
+            .sorted()
+            .forEach(folders::add);
+        
+        return folders;
+    }
+}
+```
+
+## 2. Streaming File Reader with Processing Tracker
+
+```java
+@Component
+@StepScope
+public class StreamingImageReader implements ItemReader<ImageFile>, ItemStream {
+    
+    @Value("#{stepExecutionContext['folders']}")
+    private List<String> folders;
+    
+    @Value("#{stepExecution.id}")
+    private Long stepExecutionId;
+    
+    @Value("${image.root.path}")
+    private String rootPath;
+    
+    private int currentFolderIndex = 0;
+    private DirectoryStream<Path> currentStream;
+    private Iterator<Path> currentIterator;
+    private String processedFilesKey;
+    private Set<String> processedFilesInCurrentRun;
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    @Override
+    public void open(ExecutionContext executionContext) {
+        // Restore state on restart
+        if (executionContext.containsKey("currentFolderIndex")) {
+            currentFolderIndex = executionContext.getInt("currentFolderIndex");
+        }
+        
+        processedFilesKey = "processed_files_step_" + stepExecutionId;
+        processedFilesInCurrentRun = new HashSet<>();
+        
+        // Create tracking table if not exists
+        createTrackingTableIfNeeded();
+        
+        openNextFolder();
+    }
+    
+    private void createTrackingTableIfNeeded() {
+        try {
+            jdbcTemplate.execute(
+                "CREATE TABLE IF NOT EXISTS processed_images (" +
+                "file_path VARCHAR(1000) PRIMARY KEY, " +
+                "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, " +
+                "step_execution_id BIGINT)"
+            );
+            
+            jdbcTemplate.execute(
+                "CREATE INDEX IF NOT EXISTS idx_step_exec ON processed_images(step_execution_id)"
+            );
+        } catch (Exception e) {
+            // Table already exists
+        }
+    }
+    
+    @Override
+    public synchronized ImageFile read() {
+        while (true) {
+            // If current folder exhausted, move to next
+            if (currentIterator == null || !currentIterator.hasNext()) {
+                closeCurrentStream();
+                currentFolderIndex++;
+                
+                if (currentFolderIndex >= folders.size()) {
+                    return null; // All folders processed
+                }
+                
+                openNextFolder();
+                continue;
+            }
+            
+            Path imagePath = currentIterator.next();
+            
+            if (!isImageFile(imagePath)) {
+                continue;
+            }
+            
+            String relativePath = Paths.get(rootPath).relativize(imagePath).toString();
+            
+            // Check if already processed
+            if (isAlreadyProcessed(relativePath)) {
+                continue; // Skip this file
+            }
+            
+            return new ImageFile(imagePath, relativePath);
+        }
+    }
+    
+    private void openNextFolder() {
+        if (currentFolderIndex >= folders.size()) {
+            return;
+        }
+        
+        try {
+            Path folderPath = Paths.get(folders.get(currentFolderIndex));
+            currentStream = Files.newDirectoryStream(folderPath, this::isImageFileFilter);
+            currentIterator = currentStream.iterator();
+        } catch (IOException e) {
+            throw new RuntimeException("Error opening folder: " + folders.get(currentFolderIndex), e);
+        }
+    }
+    
+    private void closeCurrentStream() {
+        if (currentStream != null) {
+            try {
+                currentStream.close();
+            } catch (IOException e) {
+                // Log warning
+            }
+        }
+    }
+    
+    private boolean isImageFile(Path path) {
+        if (!Files.isRegularFile(path)) {
+            return false;
+        }
+        String fileName = path.getFileName().toString().toLowerCase();
+        return fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || 
+               fileName.endsWith(".png") || fileName.endsWith(".gif") ||
+               fileName.endsWith(".bmp") || fileName.endsWith(".tiff");
+    }
+    
+    private boolean isImageFileFilter(Path path) {
+        return isImageFile(path);
+    }
+    
+    private boolean isAlreadyProcessed(String relativePath) {
+        // Check in-memory cache first
+        if (processedFilesInCurrentRun.contains(relativePath)) {
+            return true;
+        }
+        
+        // Check database
+        Integer count = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM processed_images WHERE file_path = ?",
+            Integer.class,
+            relativePath
+        );
+        
+        boolean processed = count != null && count > 0;
+        
+        if (processed) {
+            processedFilesInCurrentRun.add(relativePath);
+        }
+        
+        return processed;
+    }
+    
+    @Override
+    public void update(ExecutionContext executionContext) {
+        // Save position for restart
+        executionContext.putInt("currentFolderIndex", currentFolderIndex);
+    }
+    
+    @Override
+    public void close() {
+        closeCurrentStream();
+        processedFilesInCurrentRun.clear();
+    }
+}
+
+@Data
+@AllArgsConstructor
+public class ImageFile {
+    private Path absolutePath;
+    private String relativePath;
+}
+```
+
+## 3. Processor (Unchanged)
+
+```java
+@Component
+public class ImageProcessor implements ItemProcessor<ImageFile, ProcessedImage> {
+    
+    @Override
+    public ProcessedImage process(ImageFile item) throws Exception {
+        try {
+            // Your image processing logic
+            BufferedImage image = ImageIO.read(item.getAbsolutePath().toFile());
+            
+            // Example processing
+            byte[] processedData = processImage(image);
+            
+            return new ProcessedImage(item.getRelativePath(), processedData, null);
+        } catch (Exception e) {
+            return new ProcessedImage(item.getRelativePath(), null, e.getMessage());
+        }
+    }
+    
+    private byte[] processImage(BufferedImage image) {
+        // Your image processing logic here
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try {
+            ImageIO.write(image, "jpg", baos);
+            return baos.toByteArray();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+
+@Data
+@AllArgsConstructor
+public class ProcessedImage {
+    private String relativePath;
+    private byte[] data;
+    private String errorMessage;
+}
+```
+
+## 4. Writer with Batch Insert
+
+```java
+@Component
+public class ImageWriter implements ItemWriter<ProcessedImage> {
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    @Value("#{stepExecution.id}")
+    private Long stepExecutionId;
+    
+    @Override
+    public void write(Chunk<? extends ProcessedImage> chunk) throws Exception {
+        List<ProcessedImage> successList = new ArrayList<>();
+        List<ProcessedImage> failedList = new ArrayList<>();
+        
+        for (ProcessedImage item : chunk) {
+            if (item.getErrorMessage() != null) {
+                failedList.add(item);
+                // Log or handle failed items
+                System.err.println("Failed to process: " + item.getRelativePath() 
+                    + " - " + item.getErrorMessage());
+            } else {
+                successList.add(item);
+            }
+        }
+        
+        // Write successful items
+        if (!successList.isEmpty()) {
+            // Write processed data to your destination (S3, filesystem, etc.)
+            for (ProcessedImage item : successList) {
+                writeProcessedImage(item.getData(), item.getRelativePath());
+            }
+            
+            // Mark as processed in batch
+            batchInsertProcessedFiles(successList);
+        }
+    }
+    
+    private void batchInsertProcessedFiles(List<ProcessedImage> items) {
+        String sql = "INSERT INTO processed_images (file_path, step_execution_id) " +
+                     "VALUES (?, ?) ON CONFLICT (file_path) DO NOTHING";
+        
+        jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                ps.setString(1, items.get(i).getRelativePath());
+                ps.setLong(2, stepExecutionId);
+            }
+            
+            @Override
+            public int getBatchSize() {
+                return items.size();
+            }
+        });
+    }
+    
+    private void writeProcessedImage(byte[] data, String relativePath) {
+        // Write to your destination
+        // Example: write to output directory
+        try {
+            Path outputPath = Paths.get("/output", relativePath);
+            Files.createDirectories(outputPath.getParent());
+            Files.write(outputPath, data);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write image: " + relativePath, e);
+        }
+    }
+}
+```
+
+## 5. Job Configuration
+
+```java
+@Configuration
+public class StreamingImageJobConfig {
+    
+    @Autowired
+    private JobRepository jobRepository;
+    
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+    
+    @Bean
+    public Job streamingImageJob(Step managerStep) {
+        return new JobBuilder("streamingImageJob", jobRepository)
+            .start(managerStep)
+            .build();
+    }
+    
+    @Bean
+    public Step managerStep(Partitioner partitioner, Step workerStep, TaskExecutor taskExecutor) {
+        return new StepBuilder("managerStep", jobRepository)
+            .partitioner("workerStep", partitioner)
+            .step(workerStep)
+            .gridSize(10) // Parallel partitions
+            .taskExecutor(taskExecutor)
+            .build();
+    }
+    
+    @Bean
+    public Step workerStep(StreamingImageReader reader,
+                          ImageProcessor processor,
+                          ImageWriter writer) {
+        return new StepBuilder("workerStep", jobRepository)
+            .<ImageFile, ProcessedImage>chunk(50, transactionManager)
+            .reader(reader)
+            .processor(processor)
+            .writer(writer)
+            .faultTolerant()
+            .skipLimit(10000)
+            .skip(Exception.class)
+            .listener(new StepExecutionListener() {
+                @Override
+                public void beforeStep(StepExecution stepExecution) {
+                    System.out.println("Starting partition: " + 
+                        stepExecution.getExecutionContext().get("partitionNumber"));
+                }
+            })
+            .build();
+    }
+    
+    @Bean
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(50);
+        executor.setThreadNamePrefix("image-stream-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+## 6. Application Properties
+
+```properties
+image.root.path=/path/to/images
+image.max.depth=5
+batch.folders.per.partition=10
+
+spring.datasource.url=jdbc:postgresql://localhost:5432/imagedb
+spring.datasource.username=user
+spring.datasource.password=password
+
+# Connection pooling for better performance
+spring.datasource.hikari.maximum-pool-size=20
+spring.datasource.hikari.minimum-idle=5
+
+spring.batch.jdbc.initialize-schema=always
+```
+
+## Key Benefits
+
+1. **No Full Scan**: Only scans folder structure (directories), not files
+2. **Streaming**: Reads files one folder at a time using `DirectoryStream`
+3. **Memory Efficient**: Only keeps current folder's iterator in memory
+4. **Fully Restartable**: Saves current folder index and checks DB for processed files
+5. **Fast Lookup**: Uses indexed DB table with just file paths
+6. **Parallel Processing**: Multiple partitions process different folders simultaneously
+
+The job will:
+- Scan only directories to create partitions (fast)
+- Stream files from each folder on-demand
+- Check DB for each file before processing (indexed lookup is fast)
+- Skip already processed files automatically
+- Resume from the exact folder it stopped at after restart
+
+Memory usage is minimal - only the current folder's file list is in memory at any time.
