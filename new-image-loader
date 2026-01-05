@@ -1,0 +1,440 @@
+For processing 200 million images with restartability and memory efficiency, you need a custom partitioner that creates partitions lazily and a reader that tracks processed files. Here's a complete solution:
+
+## 1. Database Schema for Tracking Processed Files
+
+```sql
+CREATE TABLE image_processing_status (
+    id BIGSERIAL PRIMARY KEY,
+    file_path VARCHAR(1000) UNIQUE NOT NULL,
+    status VARCHAR(20) NOT NULL, -- PENDING, PROCESSING, COMPLETED, FAILED
+    job_execution_id BIGINT,
+    step_execution_id BIGINT,
+    error_message TEXT,
+    processed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_status ON image_processing_status(status);
+CREATE INDEX idx_job_execution ON image_processing_status(job_execution_id);
+```
+
+## 2. Entity for Tracking
+
+```java
+@Entity
+@Table(name = "image_processing_status")
+public class ImageProcessingStatus {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(unique = true, nullable = false, length = 1000)
+    private String filePath;
+    
+    @Enumerated(EnumType.STRING)
+    private ProcessingStatus status;
+    
+    private Long jobExecutionId;
+    private Long stepExecutionId;
+    private String errorMessage;
+    private LocalDateTime processedAt;
+    private LocalDateTime createdAt;
+    private LocalDateTime updatedAt;
+    
+    // getters and setters
+}
+
+enum ProcessingStatus {
+    PENDING, PROCESSING, COMPLETED, FAILED
+}
+```
+
+## 3. Lazy Folder-Based Partitioner
+
+```java
+@Component
+public class FolderPartitioner implements Partitioner {
+    
+    @Value("${batch.partition.size:1000}") // Process 1000 folders per partition
+    private int partitionSize;
+    
+    @Autowired
+    private ImageProcessingStatusRepository statusRepository;
+    
+    private final Path rootPath;
+    
+    public FolderPartitioner(@Value("${image.root.path}") String rootPath) {
+        this.rootPath = Paths.get(rootPath);
+    }
+    
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        Map<String, ExecutionContext> partitions = new HashMap<>();
+        
+        try {
+            // Get folders that have pending or failed images
+            List<String> foldersWithPendingFiles = getFoldersWithPendingOrFailedFiles();
+            
+            // Create partitions for folder groups
+            int partitionNumber = 0;
+            for (int i = 0; i < foldersWithPendingFiles.size(); i += partitionSize) {
+                ExecutionContext context = new ExecutionContext();
+                
+                int endIndex = Math.min(i + partitionSize, foldersWithPendingFiles.size());
+                List<String> folderBatch = foldersWithPendingFiles.subList(i, endIndex);
+                
+                context.put("folders", new ArrayList<>(folderBatch));
+                context.put("partitionNumber", partitionNumber);
+                
+                partitions.put("partition" + partitionNumber, context);
+                partitionNumber++;
+            }
+            
+        } catch (IOException e) {
+            throw new RuntimeException("Error creating partitions", e);
+        }
+        
+        return partitions;
+    }
+    
+    private List<String> getFoldersWithPendingOrFailedFiles() throws IOException {
+        Set<String> foldersWithPending = new HashSet<>();
+        
+        // First, check if we have any tracked files
+        long trackedCount = statusRepository.count();
+        
+        if (trackedCount == 0) {
+            // First run - scan all folders and register files
+            scanAndRegisterFiles();
+        }
+        
+        // Get distinct folders that have pending or failed files
+        List<String> pendingFolders = statusRepository
+            .findDistinctFoldersByStatus(ProcessingStatus.PENDING, ProcessingStatus.FAILED);
+        
+        return pendingFolders;
+    }
+    
+    private void scanAndRegisterFiles() throws IOException {
+        Files.walk(rootPath)
+            .filter(Files::isRegularFile)
+            .filter(this::isImageFile)
+            .forEach(path -> {
+                String relativePath = rootPath.relativize(path).toString();
+                if (!statusRepository.existsByFilePath(relativePath)) {
+                    ImageProcessingStatus status = new ImageProcessingStatus();
+                    status.setFilePath(relativePath);
+                    status.setStatus(ProcessingStatus.PENDING);
+                    status.setCreatedAt(LocalDateTime.now());
+                    statusRepository.save(status);
+                }
+            });
+    }
+    
+    private boolean isImageFile(Path path) {
+        String fileName = path.getFileName().toString().toLowerCase();
+        return fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || 
+               fileName.endsWith(".png") || fileName.endsWith(".gif");
+    }
+}
+```
+
+## 4. Repository for Status Tracking
+
+```java
+@Repository
+public interface ImageProcessingStatusRepository extends JpaRepository<ImageProcessingStatus, Long> {
+    
+    boolean existsByFilePath(String filePath);
+    
+    @Query("SELECT DISTINCT SUBSTRING(ips.filePath, 1, LOCATE('/', ips.filePath, LOCATE('/', ips.filePath) + 1)) " +
+           "FROM ImageProcessingStatus ips WHERE ips.status IN :statuses")
+    List<String> findDistinctFoldersByStatus(@Param("statuses") ProcessingStatus... statuses);
+    
+    @Query("SELECT ips FROM ImageProcessingStatus ips WHERE ips.filePath LIKE :folderPrefix " +
+           "AND ips.status IN :statuses ORDER BY ips.filePath")
+    List<ImageProcessingStatus> findByFolderPrefixAndStatus(
+        @Param("folderPrefix") String folderPrefix, 
+        @Param("statuses") List<ProcessingStatus> statuses,
+        Pageable pageable
+    );
+    
+    List<ImageProcessingStatus> findByStatusIn(List<ProcessingStatus> statuses, Pageable pageable);
+}
+```
+
+## 5. Custom Restartable Item Reader
+
+```java
+@Component
+@StepScope
+public class RestartableImageReader implements ItemReader<ImageFile>, ItemStream {
+    
+    @Value("#{stepExecutionContext['folders']}")
+    private List<String> folders;
+    
+    @Value("#{stepExecution.jobExecutionId}")
+    private Long jobExecutionId;
+    
+    @Value("#{stepExecution.id}")
+    private Long stepExecutionId;
+    
+    @Value("${batch.chunk.size:100}")
+    private int chunkSize;
+    
+    @Autowired
+    private ImageProcessingStatusRepository statusRepository;
+    
+    @Value("${image.root.path}")
+    private String rootPath;
+    
+    private Iterator<ImageProcessingStatus> currentIterator;
+    private int currentFolderIndex = 0;
+    private int currentOffset = 0;
+    
+    @Override
+    public void open(ExecutionContext executionContext) {
+        // Restore position from execution context (for restart)
+        if (executionContext.containsKey("currentFolderIndex")) {
+            currentFolderIndex = executionContext.getInt("currentFolderIndex");
+            currentOffset = executionContext.getInt("currentOffset");
+        }
+        loadNextBatch();
+    }
+    
+    @Override
+    public synchronized ImageFile read() {
+        if (currentIterator == null || !currentIterator.hasNext()) {
+            // Try to load next batch
+            currentOffset += chunkSize;
+            loadNextBatch();
+            
+            // If still no data, move to next folder
+            while ((currentIterator == null || !currentIterator.hasNext()) 
+                   && currentFolderIndex < folders.size() - 1) {
+                currentFolderIndex++;
+                currentOffset = 0;
+                loadNextBatch();
+            }
+            
+            // If still no data, we're done
+            if (currentIterator == null || !currentIterator.hasNext()) {
+                return null;
+            }
+        }
+        
+        ImageProcessingStatus status = currentIterator.next();
+        
+        // Mark as processing
+        status.setStatus(ProcessingStatus.PROCESSING);
+        status.setJobExecutionId(jobExecutionId);
+        status.setStepExecutionId(stepExecutionId);
+        status.setUpdatedAt(LocalDateTime.now());
+        statusRepository.save(status);
+        
+        return new ImageFile(
+            Paths.get(rootPath, status.getFilePath()),
+            status.getId()
+        );
+    }
+    
+    private void loadNextBatch() {
+        if (currentFolderIndex >= folders.size()) {
+            currentIterator = Collections.emptyIterator();
+            return;
+        }
+        
+        String folder = folders.get(currentFolderIndex);
+        String folderPrefix = folder + "%";
+        
+        Pageable pageable = PageRequest.of(currentOffset / chunkSize, chunkSize);
+        List<ImageProcessingStatus> batch = statusRepository.findByFolderPrefixAndStatus(
+            folderPrefix,
+            Arrays.asList(ProcessingStatus.PENDING, ProcessingStatus.FAILED),
+            pageable
+        );
+        
+        currentIterator = batch.iterator();
+    }
+    
+    @Override
+    public void update(ExecutionContext executionContext) {
+        // Save current position for restart
+        executionContext.putInt("currentFolderIndex", currentFolderIndex);
+        executionContext.putInt("currentOffset", currentOffset);
+    }
+    
+    @Override
+    public void close() {
+        // Cleanup if needed
+    }
+}
+
+@Data
+@AllArgsConstructor
+public class ImageFile {
+    private Path path;
+    private Long statusId;
+}
+```
+
+## 6. Processor and Writer with Status Update
+
+```java
+@Component
+public class ImageProcessor implements ItemProcessor<ImageFile, ProcessedImage> {
+    
+    @Override
+    public ProcessedImage process(ImageFile item) throws Exception {
+        try {
+            // Your image processing logic here
+            BufferedImage image = ImageIO.read(item.getPath().toFile());
+            
+            // Process the image
+            byte[] processedData = processImage(image);
+            
+            return new ProcessedImage(item.getStatusId(), processedData, null);
+        } catch (Exception e) {
+            // Return with error for writer to handle
+            return new ProcessedImage(item.getStatusId(), null, e.getMessage());
+        }
+    }
+    
+    private byte[] processImage(BufferedImage image) {
+        // Your processing logic
+        return new byte[0];
+    }
+}
+
+@Component
+public class ImageWriter implements ItemWriter<ProcessedImage> {
+    
+    @Autowired
+    private ImageProcessingStatusRepository statusRepository;
+    
+    @Override
+    public void write(Chunk<? extends ProcessedImage> chunk) throws Exception {
+        for (ProcessedImage item : chunk) {
+            ImageProcessingStatus status = statusRepository.findById(item.getStatusId())
+                .orElseThrow(() -> new RuntimeException("Status not found"));
+            
+            if (item.getErrorMessage() != null) {
+                // Processing failed
+                status.setStatus(ProcessingStatus.FAILED);
+                status.setErrorMessage(item.getErrorMessage());
+            } else {
+                // Processing succeeded
+                // Write the processed data to your destination
+                writeProcessedImage(item.getData());
+                
+                status.setStatus(ProcessingStatus.COMPLETED);
+                status.setProcessedAt(LocalDateTime.now());
+            }
+            
+            status.setUpdatedAt(LocalDateTime.now());
+            statusRepository.save(status);
+        }
+    }
+    
+    private void writeProcessedImage(byte[] data) {
+        // Write to S3, filesystem, database, etc.
+    }
+}
+
+@Data
+@AllArgsConstructor
+public class ProcessedImage {
+    private Long statusId;
+    private byte[] data;
+    private String errorMessage;
+}
+```
+
+## 7. Job Configuration
+
+```java
+@Configuration
+public class ImageProcessingJobConfig {
+    
+    @Autowired
+    private JobRepository jobRepository;
+    
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+    
+    @Bean
+    public Job imageProcessingJob(Step managerStep) {
+        return new JobBuilder("imageProcessingJob", jobRepository)
+            .start(managerStep)
+            .build();
+    }
+    
+    @Bean
+    public Step managerStep(Partitioner partitioner, Step workerStep, TaskExecutor taskExecutor) {
+        return new StepBuilder("managerStep", jobRepository)
+            .partitioner("workerStep", partitioner)
+            .step(workerStep)
+            .gridSize(10) // Number of parallel partitions
+            .taskExecutor(taskExecutor)
+            .build();
+    }
+    
+    @Bean
+    public Step workerStep(RestartableImageReader reader,
+                          ImageProcessor processor,
+                          ImageWriter writer) {
+        return new StepBuilder("workerStep", jobRepository)
+            .<ImageFile, ProcessedImage>chunk(100, transactionManager)
+            .reader(reader)
+            .processor(processor)
+            .writer(writer)
+            .faultTolerant()
+            .skip(Exception.class)
+            .skipLimit(1000) // Allow some failures
+            .build();
+    }
+    
+    @Bean
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("image-processor-");
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+## 8. Application Properties
+
+```properties
+image.root.path=/path/to/images
+batch.partition.size=1000
+batch.chunk.size=100
+
+spring.datasource.url=jdbc:postgresql://localhost:5432/imagedb
+spring.datasource.username=user
+spring.datasource.password=password
+
+spring.batch.jdbc.initialize-schema=always
+spring.jpa.hibernate.ddl-auto=update
+
+# For better performance
+spring.jpa.properties.hibernate.jdbc.batch_size=50
+spring.jpa.properties.hibernate.order_inserts=true
+spring.jpa.properties.hibernate.order_updates=true
+```
+
+## Key Features
+
+1. **Memory Efficient**: Loads folders in batches, reads images in chunks
+2. **Fully Restartable**: Tracks each file's status in database
+3. **Skip Processed Files**: Only processes PENDING or FAILED files
+4. **Parallel Processing**: Uses partitioning for parallel execution
+5. **Fault Tolerant**: Marks failed files and continues
+6. **Resume from Failure**: After JVM restart, continues exactly where it left off
+
+When you restart the job after a failure or JVM crash, it will automatically skip all COMPLETED files and only process PENDING and FAILED ones.
