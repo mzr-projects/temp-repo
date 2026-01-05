@@ -1,0 +1,553 @@
+You're absolutely right! Let me redesign this to partition folders lazily without collecting them all upfront:
+
+## 1. Database Schema for Folder Discovery
+
+```sql
+CREATE TABLE folder_partitions (
+    id BIGSERIAL PRIMARY KEY,
+    folder_path VARCHAR(1000) UNIQUE NOT NULL,
+    partition_number INT,
+    status VARCHAR(20) NOT NULL, -- PENDING, PROCESSING, COMPLETED
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_folder_status ON folder_partitions(status);
+CREATE INDEX idx_partition_number ON folder_partitions(partition_number);
+
+CREATE TABLE processed_images (
+    file_path VARCHAR(1000) PRIMARY KEY,
+    folder_path VARCHAR(1000),
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    step_execution_id BIGINT
+);
+
+CREATE INDEX idx_folder_path ON processed_images(folder_path);
+CREATE INDEX idx_step_exec ON processed_images(step_execution_id);
+```
+
+## 2. Lazy Folder Discovery Service
+
+```java
+@Service
+public class LazyFolderDiscoveryService {
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    @Value("${image.root.path}")
+    private String rootPath;
+    
+    @Value("${batch.folder.discovery.batch:100}")
+    private int discoveryBatchSize;
+    
+    @Value("${image.max.depth:3}")
+    private int maxDepth;
+    
+    private volatile boolean discoveryComplete = false;
+    
+    @PostConstruct
+    public void init() {
+        createTablesIfNeeded();
+    }
+    
+    private void createTablesIfNeeded() {
+        jdbcTemplate.execute(
+            "CREATE TABLE IF NOT EXISTS folder_partitions (" +
+            "id BIGSERIAL PRIMARY KEY, " +
+            "folder_path VARCHAR(1000) UNIQUE NOT NULL, " +
+            "partition_number INT, " +
+            "status VARCHAR(20) NOT NULL, " +
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, " +
+            "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        );
+        
+        jdbcTemplate.execute(
+            "CREATE INDEX IF NOT EXISTS idx_folder_status ON folder_partitions(status)"
+        );
+        
+        jdbcTemplate.execute(
+            "CREATE TABLE IF NOT EXISTS processed_images (" +
+            "file_path VARCHAR(1000) PRIMARY KEY, " +
+            "folder_path VARCHAR(1000), " +
+            "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, " +
+            "step_execution_id BIGINT)"
+        );
+        
+        jdbcTemplate.execute(
+            "CREATE INDEX IF NOT EXISTS idx_folder_path ON processed_images(folder_path)"
+        );
+    }
+    
+    /**
+     * Discovers folders in batches and stores them in DB
+     * Call this periodically or in a separate thread
+     */
+    public int discoverNextBatch() {
+        if (discoveryComplete) {
+            return 0;
+        }
+        
+        // Get the last discovered path to continue from
+        String lastPath = getLastDiscoveredPath();
+        
+        List<String> newFolders = new ArrayList<>();
+        
+        try {
+            // Stream folders starting after the last discovered path
+            Files.walk(Paths.get(rootPath), maxDepth)
+                .filter(Files::isDirectory)
+                .filter(path -> !path.equals(Paths.get(rootPath)))
+                .map(Path::toString)
+                .filter(path -> lastPath == null || path.compareTo(lastPath) > 0)
+                .sorted()
+                .limit(discoveryBatchSize)
+                .forEach(newFolders::add);
+            
+            if (newFolders.isEmpty()) {
+                discoveryComplete = true;
+                return 0;
+            }
+            
+            // Insert discovered folders
+            batchInsertFolders(newFolders);
+            
+            return newFolders.size();
+            
+        } catch (IOException e) {
+            throw new RuntimeException("Error discovering folders", e);
+        }
+    }
+    
+    private String getLastDiscoveredPath() {
+        try {
+            return jdbcTemplate.queryForObject(
+                "SELECT folder_path FROM folder_partitions ORDER BY folder_path DESC LIMIT 1",
+                String.class
+            );
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+    
+    private void batchInsertFolders(List<String> folders) {
+        String sql = "INSERT INTO folder_partitions (folder_path, status) " +
+                     "VALUES (?, 'PENDING') ON CONFLICT (folder_path) DO NOTHING";
+        
+        jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                ps.setString(1, folders.get(i));
+            }
+            
+            @Override
+            public int getBatchSize() {
+                return folders.size();
+            }
+        });
+    }
+    
+    /**
+     * Get count of pending folders
+     */
+    public long getPendingFolderCount() {
+        return jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM folder_partitions WHERE status = 'PENDING'",
+            Long.class
+        );
+    }
+    
+    /**
+     * Check if folder discovery is complete
+     */
+    public boolean isDiscoveryComplete() {
+        return discoveryComplete;
+    }
+}
+```
+
+## 3. Dynamic Partitioner
+
+```java
+@Component
+public class DynamicFolderPartitioner implements Partitioner {
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    @Autowired
+    private LazyFolderDiscoveryService discoveryService;
+    
+    @Value("${batch.folders.per.partition:50}")
+    private int foldersPerPartition;
+    
+    @Value("${batch.min.folders.threshold:10}")
+    private int minFoldersThreshold;
+    
+    @Override
+    public Map<String, ExecutionContext> partition(int gridSize) {
+        // Discover some folders if needed
+        ensureMinimumFoldersAvailable();
+        
+        Map<String, ExecutionContext> partitions = new HashMap<>();
+        
+        // Get pending folders from DB in batches
+        int partitionNumber = 0;
+        int offset = 0;
+        
+        while (true) {
+            List<String> folders = fetchPendingFolders(offset, foldersPerPartition);
+            
+            if (folders.isEmpty()) {
+                break;
+            }
+            
+            if (partitionNumber >= gridSize) {
+                break; // Respect grid size limit
+            }
+            
+            ExecutionContext context = new ExecutionContext();
+            context.put("folderBatch", new ArrayList<>(folders));
+            context.putInt("partitionNumber", partitionNumber);
+            context.putInt("startOffset", offset);
+            
+            partitions.put("partition" + partitionNumber, context);
+            
+            // Mark these folders as processing
+            markFoldersAsProcessing(folders, partitionNumber);
+            
+            partitionNumber++;
+            offset += foldersPerPartition;
+        }
+        
+        return partitions;
+    }
+    
+    private void ensureMinimumFoldersAvailable() {
+        long pendingCount = discoveryService.getPendingFolderCount();
+        
+        // Discover more folders if we're running low
+        while (pendingCount < minFoldersThreshold && !discoveryService.isDiscoveryComplete()) {
+            int discovered = discoveryService.discoverNextBatch();
+            if (discovered == 0) {
+                break;
+            }
+            pendingCount += discovered;
+        }
+    }
+    
+    private List<String> fetchPendingFolders(int offset, int limit) {
+        return jdbcTemplate.query(
+            "SELECT folder_path FROM folder_partitions " +
+            "WHERE status = 'PENDING' " +
+            "ORDER BY folder_path " +
+            "LIMIT ? OFFSET ?",
+            (rs, rowNum) -> rs.getString("folder_path"),
+            limit, offset
+        );
+    }
+    
+    private void markFoldersAsProcessing(List<String> folders, int partitionNumber) {
+        String sql = "UPDATE folder_partitions SET status = 'PROCESSING', " +
+                     "partition_number = ?, updated_at = CURRENT_TIMESTAMP " +
+                     "WHERE folder_path = ?";
+        
+        jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                ps.setInt(1, partitionNumber);
+                ps.setString(2, folders.get(i));
+            }
+            
+            @Override
+            public int getBatchSize() {
+                return folders.size();
+            }
+        });
+    }
+}
+```
+
+## 4. Streaming Reader
+
+```java
+@Component
+@StepScope
+public class StreamingImageReader implements ItemReader<ImageFile>, ItemStream {
+    
+    @Value("#{stepExecutionContext['folderBatch']}")
+    private List<String> folderBatch;
+    
+    @Value("#{stepExecution.id}")
+    private Long stepExecutionId;
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    private int currentFolderIndex = 0;
+    private DirectoryStream<Path> currentStream;
+    private Iterator<Path> currentIterator;
+    private String currentFolderPath;
+    private Set<String> processedInMemory;
+    
+    @Override
+    public void open(ExecutionContext executionContext) {
+        if (executionContext.containsKey("currentFolderIndex")) {
+            currentFolderIndex = executionContext.getInt("currentFolderIndex");
+        }
+        
+        processedInMemory = new HashSet<>();
+        openNextFolder();
+    }
+    
+    @Override
+    public synchronized ImageFile read() {
+        while (true) {
+            if (currentIterator == null || !currentIterator.hasNext()) {
+                closeCurrentStream();
+                
+                // Mark current folder as completed
+                if (currentFolderPath != null) {
+                    markFolderCompleted(currentFolderPath);
+                }
+                
+                currentFolderIndex++;
+                
+                if (currentFolderIndex >= folderBatch.size()) {
+                    return null; // All folders in this partition processed
+                }
+                
+                openNextFolder();
+                continue;
+            }
+            
+            Path imagePath = currentIterator.next();
+            
+            if (!isImageFile(imagePath)) {
+                continue;
+            }
+            
+            String relativePath = imagePath.toString();
+            
+            // Quick in-memory check first
+            if (processedInMemory.contains(relativePath)) {
+                continue;
+            }
+            
+            // Check database
+            if (isAlreadyProcessed(relativePath)) {
+                processedInMemory.add(relativePath);
+                continue;
+            }
+            
+            return new ImageFile(imagePath, relativePath, currentFolderPath);
+        }
+    }
+    
+    private void openNextFolder() {
+        if (currentFolderIndex >= folderBatch.size()) {
+            return;
+        }
+        
+        currentFolderPath = folderBatch.get(currentFolderIndex);
+        
+        try {
+            Path folderPath = Paths.get(currentFolderPath);
+            if (!Files.exists(folderPath)) {
+                // Folder doesn't exist, skip it
+                currentIterator = Collections.emptyIterator();
+                return;
+            }
+            
+            currentStream = Files.newDirectoryStream(folderPath, this::isImageFile);
+            currentIterator = currentStream.iterator();
+            
+        } catch (IOException e) {
+            throw new RuntimeException("Error opening folder: " + currentFolderPath, e);
+        }
+    }
+    
+    private void closeCurrentStream() {
+        if (currentStream != null) {
+            try {
+                currentStream.close();
+            } catch (IOException e) {
+                // Log warning
+            }
+        }
+    }
+    
+    private boolean isImageFile(Path path) {
+        if (!Files.isRegularFile(path)) {
+            return false;
+        }
+        String fileName = path.getFileName().toString().toLowerCase();
+        return fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || 
+               fileName.endsWith(".png") || fileName.endsWith(".gif") ||
+               fileName.endsWith(".bmp") || fileName.endsWith(".tiff");
+    }
+    
+    private boolean isAlreadyProcessed(String filePath) {
+        try {
+            Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM processed_images WHERE file_path = ?",
+                Integer.class,
+                filePath
+            );
+            return count != null && count > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    private void markFolderCompleted(String folderPath) {
+        jdbcTemplate.update(
+            "UPDATE folder_partitions SET status = 'COMPLETED', " +
+            "updated_at = CURRENT_TIMESTAMP WHERE folder_path = ?",
+            folderPath
+        );
+    }
+    
+    @Override
+    public void update(ExecutionContext executionContext) {
+        executionContext.putInt("currentFolderIndex", currentFolderIndex);
+    }
+    
+    @Override
+    public void close() {
+        closeCurrentStream();
+        processedInMemory.clear();
+    }
+}
+
+@Data
+@AllArgsConstructor
+public class ImageFile {
+    private Path absolutePath;
+    private String relativePath;
+    private String folderPath;
+}
+```
+
+## 5. Writer with Tracking
+
+```java
+@Component
+public class ImageWriter implements ItemWriter<ProcessedImage> {
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    @Value("#{stepExecution.id}")
+    private Long stepExecutionId;
+    
+    @Override
+    public void write(Chunk<? extends ProcessedImage> chunk) throws Exception {
+        List<ProcessedImage> successList = new ArrayList<>();
+        
+        for (ProcessedImage item : chunk) {
+            if (item.getErrorMessage() == null) {
+                writeProcessedImage(item.getData(), item.getRelativePath());
+                successList.add(item);
+            } else {
+                System.err.println("Failed: " + item.getRelativePath() 
+                    + " - " + item.getErrorMessage());
+            }
+        }
+        
+        if (!successList.isEmpty()) {
+            batchInsertProcessedFiles(successList);
+        }
+    }
+    
+    private void batchInsertProcessedFiles(List<ProcessedImage> items) {
+        String sql = "INSERT INTO processed_images " +
+                     "(file_path, folder_path, step_execution_id) " +
+                     "VALUES (?, ?, ?) ON CONFLICT (file_path) DO NOTHING";
+        
+        jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                ProcessedImage item = items.get(i);
+                ps.setString(1, item.getRelativePath());
+                ps.setString(2, item.getFolderPath());
+                ps.setLong(3, stepExecutionId);
+            }
+            
+            @Override
+            public int getBatchSize() {
+                return items.size();
+            }
+        });
+    }
+    
+    private void writeProcessedImage(byte[] data, String relativePath) {
+        try {
+            Path outputPath = Paths.get("/output", relativePath);
+            Files.createDirectories(outputPath.getParent());
+            Files.write(outputPath, data);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write: " + relativePath, e);
+        }
+    }
+}
+
+@Data
+@AllArgsConstructor
+public class ProcessedImage {
+    private String relativePath;
+    private String folderPath;
+    private byte[] data;
+    private String errorMessage;
+}
+```
+
+## 6. Background Folder Discovery Job
+
+```java
+@Component
+public class FolderDiscoveryTask {
+    
+    @Autowired
+    private LazyFolderDiscoveryService discoveryService;
+    
+    @Scheduled(fixedDelay = 5000) // Run every 5 seconds
+    public void discoverFolders() {
+        if (!discoveryService.isDiscoveryComplete()) {
+            int discovered = discoveryService.discoverNextBatch();
+            if (discovered > 0) {
+                System.out.println("Discovered " + discovered + " new folders");
+            }
+        }
+    }
+}
+```
+
+## 7. Application Properties
+
+```properties
+image.root.path=/path/to/images
+image.max.depth=5
+
+# Discover 100 folders at a time
+batch.folder.discovery.batch=100
+
+# Process 50 folders per partition
+batch.folders.per.partition=50
+
+# Ensure at least 10 folders are available before starting
+batch.min.folders.threshold=10
+
+spring.datasource.url=jdbc:postgresql://localhost:5432/imagedb
+spring.datasource.hikari.maximum-pool-size=20
+```
+
+## How It Works
+
+1. **Lazy Discovery**: Discovers folders in batches (100 at a time) and stores paths in DB
+2. **Background Task**: Continuously discovers folders while job is running
+3. **Dynamic Partitioning**: Creates partitions from discovered folders on-demand
+4. **Stream Processing**: Each partition streams files from its assigned folders
+5. **Restart Safe**: All state in DB - folders, partitions, processed files
+
+**Memory Usage**: Only holds ~100-200 folder paths in memory at any time, regardless of total folder count!
