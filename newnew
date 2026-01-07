@@ -1,0 +1,243 @@
+Ah, I see! You're using Spring Cloud Gateway's configuration-based routing in `application.properties`/`application.yml`. The issue is that by default, Spring Cloud Gateway WebMVC may buffer the entire image response in memory.
+
+Here's how to fix memory leaks with property-based routes:
+
+## Solution 1: Configure Route with Streaming (Recommended)
+
+**application.yml:**
+```yaml
+spring:
+  cloud:
+    gateway:
+      mvc:
+        routes:
+          - id: image-service
+            uri: http://your-image-service:8080
+            predicates:
+              - Path=/images/**
+            filters:
+              - StripPrefix=1
+              # Add these filters to prevent buffering
+              - name: RequestSize
+                args:
+                  maxSize: 50MB
+          
+        # Critical: Enable streaming mode
+        http-client:
+          max-in-memory-size: 512KB  # Small buffer, forces streaming
+          
+server:
+  tomcat:
+    max-swallow-size: -1  # Don't buffer request bodies
+    connection-timeout: 60000
+    threads:
+      max: 200
+
+# Prevent buffering
+spring:
+  codec:
+    max-in-memory-size: 512KB  # Force streaming for large responses
+```
+
+**application.properties equivalent:**
+```properties
+spring.cloud.gateway.mvc.routes[0].id=image-service
+spring.cloud.gateway.mvc.routes[0].uri=http://your-image-service:8080
+spring.cloud.gateway.mvc.routes[0].predicates[0]=Path=/images/**
+spring.cloud.gateway.mvc.routes[0].filters[0]=StripPrefix=1
+
+# Critical settings
+spring.cloud.gateway.mvc.http-client.max-in-memory-size=524288
+spring.codec.max-in-memory-size=524288
+server.tomcat.max-swallow-size=-1
+```
+
+## Solution 2: Custom RestClient Configuration
+
+Since you're using WebMVC, you need to configure the underlying HTTP client properly:
+
+```java
+@Configuration
+public class GatewayWebMvcConfig {
+    
+    @Bean
+    public RestClient.Builder restClientBuilder() {
+        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+        requestFactory.setBufferRequestBody(false);  // Don't buffer requests
+        requestFactory.setConnectTimeout(Duration.ofSeconds(10));
+        requestFactory.setReadTimeout(Duration.ofSeconds(60));
+        
+        return RestClient.builder()
+            .requestFactory(requestFactory);
+    }
+    
+    @Bean
+    public ProxyExchangeArgumentResolver proxyExchangeArgumentResolver(
+            RestClient.Builder restClientBuilder) {
+        return new ProxyExchangeArgumentResolver(restClientBuilder.build());
+    }
+}
+```
+
+## Solution 3: Add Response Streaming Configuration
+
+```java
+@Configuration
+public class StreamingConfig implements WebMvcConfigurer {
+    
+    @Override
+    public void configureAsyncSupport(AsyncSupportConfigurer configurer) {
+        configurer.setDefaultTimeout(60000); // 60 seconds for large images
+    }
+    
+    @Bean
+    public HttpMessageConverter<byte[]> byteArrayHttpMessageConverter() {
+        ByteArrayHttpMessageConverter converter = new ByteArrayHttpMessageConverter();
+        // Don't read everything into memory
+        converter.setSupportedMediaTypes(Arrays.asList(
+            MediaType.IMAGE_JPEG,
+            MediaType.IMAGE_PNG,
+            MediaType.IMAGE_GIF,
+            MediaType.APPLICATION_OCTET_STREAM
+        ));
+        return converter;
+    }
+}
+```
+
+## Solution 4: Add Global Filter for Streaming
+
+If configuration isn't enough, add a custom filter:
+
+```java
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class StreamingResponseFilter implements Filter {
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, 
+                        FilterChain chain) throws IOException, ServletException {
+        
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        
+        // Only for image routes
+        if (httpRequest.getRequestURI().startsWith("/images/")) {
+            // Disable response buffering
+            httpResponse.setBufferSize(8192); // 8KB buffer only
+            httpResponse.flushBuffer();
+        }
+        
+        chain.doFilter(request, response);
+    }
+}
+```
+
+## Complete Configuration Example
+
+**application.yml (Full):**
+```yaml
+spring:
+  cloud:
+    gateway:
+      mvc:
+        routes:
+          - id: image-service
+            uri: http://image-service:8080
+            predicates:
+              - Path=/images/**
+            filters:
+              - StripPrefix=1
+        
+        # Streaming configuration
+        http-client:
+          max-in-memory-size: 262144  # 256KB
+          connect-timeout: 10s
+          read-timeout: 60s
+          
+  # Global codec configuration
+  codec:
+    max-in-memory-size: 262144  # 256KB - forces streaming
+
+server:
+  port: 8080
+  tomcat:
+    # Critical for preventing buffering
+    max-swallow-size: -1
+    max-http-header-size: 8KB
+    connection-timeout: 60000
+    threads:
+      max: 200
+      min-spare: 10
+    # Important: Connection pool for upstream
+    max-connections: 200
+    accept-count: 100
+
+# Logging to debug
+logging:
+  level:
+    org.springframework.cloud.gateway: DEBUG
+    org.springframework.web.servlet.mvc: DEBUG
+
+# Memory management
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+```
+
+## Monitoring Memory
+
+Add actuator to monitor:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+Check metrics at: `http://localhost:8080/actuator/metrics/jvm.memory.used`
+
+## JVM Tuning
+
+Add these JVM options:
+```bash
+java -Xmx2g -Xms1g \
+  -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=200 \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=/tmp/heap-dump.hprof \
+  -jar your-gateway.jar
+```
+
+## Verify Your Dependencies
+
+Make sure you have the correct version:
+
+```xml
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway-mvc</artifactId>
+</dependency>
+```
+
+**NOT** this one (that's WebFlux):
+```xml
+<!-- DON'T use this with WebMVC -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+</dependency>
+```
+
+What version of Spring Cloud Gateway are you using? The streaming configuration options vary between versions. Also, can you share your current route configuration so I can provide more specific guidance?
