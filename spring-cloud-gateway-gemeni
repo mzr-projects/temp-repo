@@ -1,0 +1,121 @@
+To offload routing to NGINX while keeping your Spring Cloud Gateway WebMVC application as the authentication provider, you need to re-architect your setup so that NGINX acts as the reverse proxy (entry point) and uses your Spring Boot app purely for authentication checks via the `ngx_http_auth_request_module`.
+
+Here is the concise solution to implement this architecture.
+
+### 1. NGINX Configuration (The Router)
+
+Configure NGINX to handle all routing. Use the `auth_request` directive to verify every request with your Spring application before allowing access to the backend services.
+
+**nginx.conf**
+```nginx
+http {
+    # 1. Define the upstream for your Authentication Service (Spring Cloud Gateway App)
+    upstream auth_service {
+        server localhost:8080; # The port your Spring app runs on
+    }
+
+    # 2. Define upstreams for your actual backend services
+    upstream my_backend_service {
+        server localhost:8081;
+    }
+
+    server {
+        listen 80;
+        server_name example.com;
+
+        # 3. Protect your routes using auth_request
+        location /api/resource {
+            # Check auth with Spring app before proceeding
+            auth_request /auth;
+
+            # Optional: Pass user details from Spring to the backend
+            # These variables must be set in the /auth location first (see below)
+            auth_request_set $user $upstream_http_x_user_id;
+            proxy_set_header X-User-Id $user;
+            
+            # Forward valid requests to the actual service
+            proxy_pass http://my_backend_service; 
+        }
+
+        # 4. Define the internal authentication sub-request
+        location = /auth {
+            internal; # External users cannot access this directly
+            
+            # Forward the request to your Spring Boot App's auth check endpoint
+            proxy_pass http://auth_service/auth-check;
+
+            # Optimize the request: drop the body, we only need headers/cookies
+            proxy_pass_request_body off;
+            proxy_set_header Content-Length "";
+            proxy_set_header X-Original-URI $request_uri;
+        }
+    }
+}
+```
+
+### 2. Spring Cloud Gateway WebMVC Configuration (The Auth Provider)
+
+You must modify your Spring Boot application to stop acting as a gateway (remove routes) and start acting as an authorization service. It needs a specific endpoint that returns `200 OK` if authenticated and `401 Unauthorized` if not.
+
+**Controller Implementation:**
+Create a dedicated controller to handle the NGINX sub-request.
+
+```java
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class AuthCheckController {
+
+    @GetMapping("/auth-check")
+    public ResponseEntity<Void> checkAuth(@AuthenticationPrincipal UserDetails user) {
+        if (user != null) {
+            // User is authenticated. Return 200 OK.
+            // You can add headers here to pass user info back to Nginx
+            return ResponseEntity.ok()
+                    .header("X-User-Id", user.getUsername()) 
+                    .build();
+        }
+        // If not authenticated, Spring Security will likely intercept before this
+        // but explicitly returning 401 is safe fallback.
+        return ResponseEntity.status(401).build();
+    }
+}
+```
+
+**Security Configuration:**
+Ensure your security filter chain permits the `/auth-check` endpoint only to authenticated users and handles the session/token correctly.
+
+```java
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/auth-check").authenticated() // NGINX hits this
+            .requestMatchers("/login", "/error").permitAll() // Allow login
+            .anyRequest().authenticated()
+        )
+        // Configure your existing auth mechanism (OAuth2, JWT, Basic, etc.)
+        .formLogin(withDefaults()); 
+        
+    return http.build();
+}
+```
+
+### 3. Disable Gateway Routing
+Since you are switching to WebMVC and NGINX for routing, you should remove or disable the `spring-cloud-starter-gateway` dependency if you haven't already. If you are using **Spring Cloud Gateway Server WebMVC** (the newer servlet-based gateway), simply remove the routes configuration (`spring.cloud.gateway.routes`) from your `application.yml` so it doesn't attempt to proxy traffic itself.
+
+### Summary of Flow
+1. **Request:** Client sends request to NGINX (`/api/resource`).
+2. **Auth Check:** NGINX pauses the request and calls `/auth` (which proxies to Spring Boot's `/auth-check`).
+3. **Verification:**
+   *   **Spring App:** Validates the session/cookie/token.
+   *   **Success:** Returns `200 OK` (optionally with `X-User-Id` header).
+   *   **Failure:** Returns `401 Unauthorized`.
+4. **Routing:**
+   *   If **200**, NGINX forwards the original request to `my_backend_service`.
+   *   If **401**, NGINX denies access (or redirects to login).
+
