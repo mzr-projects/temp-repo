@@ -1,0 +1,146 @@
+
+
+## The key constraint
+If Nginx routes directly to your downstream services, your Spring Cloud Gateway (WebMVC) app will **not see those requests**, so it **cannot** authenticate/authorize them.
+
+To keep authentication “in Spring” while moving routing to Nginx, you need Nginx to **delegate the auth decision** to your Spring app.
+
+## Recommended pattern: Nginx routes, Spring authorizes (via `auth_request`)
+High-level flow:
+
+* Client → **Nginx**
+* Nginx does an internal subrequest → **Spring app** (auth check)
+* If 2xx: Nginx proxies to the target upstream (service)
+* If 401/403: Nginx blocks (or redirects to login)
+
+### 1) Spring (your existing app): add an auth-check endpoint
+You add a very small endpoint that is **protected by your existing Spring Security setup**. If the request is authenticated, return `200`. Otherwise Spring Security returns `401`.
+
+* Example controller (Servlet/WebMVC):
+
+    ```java
+    @RestController
+    public class NginxAuthController {
+
+        @GetMapping("/_auth")
+        public ResponseEntity<Void> auth(Authentication authentication) {
+            // If this method is reached, Spring Security already authenticated the request
+            String roles = authentication.getAuthorities().stream()
+                    .map(GrantedAuthority::getAuthority)
+                    .collect(Collectors.joining(","));
+
+            return ResponseEntity.ok()
+                    .header("X-Auth-User", authentication.getName())
+                    .header("X-Auth-Roles", roles)
+                    .build();
+        }
+    }
+    ```
+
+* Security rule: make sure `/_auth` is **`authenticated()`** and your login/token endpoints remain reachable. For example (conceptually):
+
+    * `/_auth` → authenticated
+    * `/login`, `/oauth2/**`, `/logout` (whatever you use) → permitAll
+    * anything else in this app → usually `denyAll()` (since it’s now “auth-only”)
+
+Also, if you’re behind Nginx and you do redirects (OAuth2 login), ensure Spring uses forwarded headers:
+
+* `server.forward-headers-strategy=native` (common in Spring Boot 3.x deployments behind a proxy)
+
+### 2) Nginx: call Spring for auth, then proxy to services
+Core idea: protect routes with `auth_request`, and define an internal location that proxies to your Spring `/_auth`.
+
+* Example Nginx config (simplified):
+
+    *Spring auth upstream + protected service routing:*
+
+    ```nginx
+    upstream spring_auth {
+        server 127.0.0.1:8080;   # your Spring app (auth)
+    }
+
+    upstream service_api {
+        server 10.0.0.11:8081;   # your backend service
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+
+        # ---- Public endpoints handled by Spring (login/callback/etc.) ----
+        location /login {
+            proxy_pass http://spring_auth;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location /oauth2/ {
+            proxy_pass http://spring_auth;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # ---- Protected API routed by Nginx to your service ----
+        location /api/ {
+            auth_request /_auth_check;
+
+            # pull identity from Spring auth response headers (optional)
+            auth_request_set $auth_user  $upstream_http_x_auth_user;
+            auth_request_set $auth_roles $upstream_http_x_auth_roles;
+
+            # prevent client spoofing by overwriting these on the way to services
+            proxy_set_header X-Auth-User  $auth_user;
+            proxy_set_header X-Auth-Roles $auth_roles;
+
+            proxy_pass http://service_api;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+            # if you want services to receive the original token too:
+            proxy_set_header Authorization $http_authorization;
+        }
+
+        # internal auth subrequest endpoint (never exposed to clients)
+        location = /_auth_check {
+            internal;
+
+            proxy_pass http://spring_auth/_auth;
+
+            proxy_pass_request_body off;
+            proxy_set_header Content-Length "";
+
+            # forward what Spring needs to authenticate the caller
+            proxy_set_header Authorization $http_authorization;
+            proxy_set_header Cookie $http_cookie;
+
+            # optional context headers
+            proxy_set_header X-Original-URI $request_uri;
+            proxy_set_header X-Original-Method $request_method;
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+    ```
+
+### 3) “Exclude routing” in the Spring Cloud Gateway app
+To stop Spring from acting as the router:
+
+* Remove/disable your Gateway route definitions (for MVC gateway this is typically whatever you configured under `spring.cloud.gateway...` or any route `@Bean` definitions).
+* Cleanest: remove the Gateway starter dependency if you truly don’t need it anymore, and keep:
+    * `spring-boot-starter-web`
+    * `spring-boot-starter-security` (+ oauth2 client/resource server/etc. as you already have)
+
+## Important gotchas (so this stays secure)
+* **Don’t let services be reachable directly from the internet.** Put them on a private network so only Nginx can reach them; otherwise attackers can bypass your centralized auth.
+* If you pass `X-Auth-User` / `X-Auth-Roles` headers, treat them as **trusted only from Nginx** (and ensure Nginx overwrites any incoming client-provided values).
+* If your Spring auth uses **sessions**, and you run multiple Spring instances:
+    * use sticky sessions **or** Spring Session (e.g., Redis), otherwise `/_auth` will randomly fail.
+* If you use OAuth2 login, forwarded headers (`X-Forwarded-Proto`, etc.) must be correct or redirects/callback URLs will break.
+
+This setup keeps your existing Spring authentication logic, while moving request routing to Nginx.
+
