@@ -434,4 +434,94 @@ If you paste the **route definition** for the problematic service (especially wh
 [^4]: https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway-proxy-exchange.html
 [^5]: https://docs.spring.io/spring-framework/reference/integration/rest-clients.html
 
+############################
+
+Your issue with **Spring Cloud Gateway Server WebMVC** (not WebFlux) experiencing a memory spike from 500MB to 4GB when routing requests with only 2MB responses, with VisualVM showing multiple 50MB byte arrays, is a **memory buffering problem**. Here's what's happening and how to fix it:
+
+## Root Cause
+
+Spring Cloud Gateway Server WebMVC buffers the entire response body in memory when processing requests. This is fundamentally different from the reactive WebFlux version. The multiple 50MB byte arrays you're seeing suggest that:
+
+1. **Multiple buffering layers** - The gateway may be creating multiple copies of the response at different stages (routing, filtering, etc.)
+2. **Inefficient memory management** - Unlike WebFlux which streams data reactively, the WebMVC version loads entire responses into heap memory
+3. **Filter chain multiplication** - Each filter in the chain may create its own buffer copy
+
+## Solutions
+
+### 1. **Limit Buffer Size Explicitly**
+
+Add these properties to your `application.yml`:
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      httpclient:
+        # Limit per-request buffer size
+        max-in-memory-size: 10485760  # 10MB (adjust based on your needs)
+      httpserver:
+        # Maximum initial line length
+        max-initial-line-length: 4096
+        # Maximum header size
+        max-header-size: 8192
+```
+
+### 2. **Configure JVM Memory Parameters**
+
+Control heap and direct memory:
+
+```bash
+-Xms512m -Xmx1g
+-XX:MaxMetaspaceSize=256m
+-XX:+UseG1GC
+```
+
+### 3. **Disable Response Body Caching (If Not Needed)**
+
+If your filters don't need to read/modify the response body, avoid caching it. Check your filter implementations for code like:
+
+```java
+// AVOID THIS in WebMVC gateway unless absolutely necessary
+ServerWebExchangeUtils.cacheRequestBody(...)
+DataBufferUtils.join(...)
+```
+
+### 4. **Check Custom Filters for Memory Leaks**
+
+If you have custom `GlobalFilter` or `GatewayFilterFactory` implementations that read request/response bodies, ensure you're properly releasing buffers:
+
+```java
+// Always release DataBuffers
+DataBufferUtils.release(dataBuffer);
+
+// Or use try-with-resources pattern
+```
+
+### 5. **Switch to Spring Cloud Gateway (WebFlux) if Possible**
+
+The WebMVC version is less memory-efficient. The reactive WebFlux version streams data without loading entire responses into memory. If your application can use reactive programming, migrate to the standard Spring Cloud Gateway (WebFlux).
+
+### 6. **Monitor and Profile**
+
+Use VisualVM/JProfiler to identify:
+- Which classes hold those 50MB byte arrays (check retention paths)
+- Whether they're from `byte[]`, `DataBuffer`, or HTTP client buffers
+- If garbage collection is releasing them eventually
+
+### 7. **Increase GC Frequency (Temporary)**
+
+Force more aggressive garbage collection to verify if buffers are being held unnecessarily:
+
+```bash
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:InitiatingHeapOccupancyPercent=45
+``` [^1] [^2] [^3] [^4] [^5]
+
+[^1]: https://github.com/spring-cloud/spring-cloud-gateway/issues/171
+[^2]: https://github.com/spring-cloud/spring-cloud-gateway/issues/3140
+[^3]: https://cloud.tencent.com/developer/article/1982613
+[^4]: https://liuxiaoshui.com/archives/spring-cloud-gateway-nei-cun-zhan-yong
+[^5]: https://blog.csdn.net/qq_43673087/article/details/110055205
+
 
