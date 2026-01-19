@@ -406,3 +406,32 @@ The 50MB byte arrays suggest you have a default buffer size configured somewhere
 
 Would you like me to help analyze your specific gateway routing code to identify the exact source of the buffering?
 
+
+
+
+
+Your symptom (idle ~500 MB, but one route spikes to ~4 GB, and heap shows many ~50 MB `byte[]`) is almost always **response buffering / repeated copying** inside the gateway (or a filter), not a “JVM leak”. In particular, Spring utilities like `FastByteArrayOutputStream` are explicitly designed to grow by adding internal `byte[]` buffers (so you can end up with multiple large `byte[]` chunks even if the final payload is much smaller than the peak during processing). [^1]
+
+* **If that route uses `modifyResponseBody(...)`:** this filter exists specifically to *modify* the body, which means the gateway must read the body before writing it back—so it’s inherently a “buffer the response body in memory” path and can create big transient `byte[]` allocations (and multiple copies if you convert to/from `String`, JSON, etc.). [^2]
+* **If that route (or your code) proxies as `byte[]` (or `String`)**—for example using `ProxyExchange<byte[]>` / `ResponseEntity<byte[]>` patterns—then the gateway will materialize the full body in heap instead of streaming it through. Even if the final response is ~2 MB, intermediate buffering/copying can be far larger (especially with transformations, decompression, charset conversion, etc.). [^3]
+* **If you’re using Spring’s `RestClient`/HTTP interfaces and you pick a streaming type, you can avoid the big `byte[]`**: Spring explicitly supports returning `InputStream` (or `ResponseEntity<InputStream>`) so you can stream the raw response body instead of buffering it into memory. That is the direction you want for a gateway route that should just pass bytes through. [^5]
+
+What to change to stop the spike (the “best fix”, not JVM flags):
+
+* **Remove/avoid any response-body filters** (especially `modifyResponseBody`) on that specific route; do header-only rewrites, status/header mapping, etc. instead of body rewrites. [^2]
+* **Make the route stream**: ensure the gateway handler/client path is not converting the origin response into `byte[]`/`String`, and instead uses a streaming body type (e.g., `InputStream`) end-to-end. [^5]
+* **If you must inspect/log the body**, do it with strict limits (log first \(N\) bytes, sample, or only log metadata). Full-body logging/modification is the classic reason gateways OOM under “small-looking” responses due to buffering and copies. [^2]
+
+JVM options that help you *prove* the root cause quickly (won’t prevent it, but will give you the artifact):
+
+* Add automatic heap dumps on OOM so you can see **what retains those 50 MB arrays** (the dominator tree / path-to-GC-root will usually point directly at the filter/handler doing buffering). [Source](https://docs.oracle.com/en/java/javase/21/troubleshoot/command-line-options1.html)
+
+If you paste the **route definition** for the problematic service (especially whether you use `after(modifyResponseBody(...))`, any custom response logging, or `ProxyExchange<byte[]>`-style code), I can tell you exactly which part is forcing the buffering and what to replace it with.
+
+[^1]: https://docs.spring.io/spring-framework/docs/5.1.3.RELEASE/javadoc-api/org/springframework/util/FastByteArrayOutputStream.html
+[^2]: https://docs.spring.io/spring-cloud-gateway/reference/5.0/spring-cloud-gateway-server-webmvc/filters/modifyresponsebody.html
+[^3]: https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway-proxy-exchange.html
+[^4]: https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway-proxy-exchange.html
+[^5]: https://docs.spring.io/spring-framework/reference/integration/rest-clients.html
+
+
