@@ -1,0 +1,568 @@
+Here's how to handle multiple parent and child indexes with SIREN pagination using PIT:
+
+## 1. Multiple Parent Indexes
+
+When you have multiple parent indexes, you can open a PIT across all of them using index patterns or comma-separated values:
+
+```java
+@Service
+@RequiredArgsConstructor
+public class MultiIndexSirenService {
+    
+    private final RestTemplate restTemplate = new RestTemplate();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private static final String ES_HOST = "http://localhost:9200";
+    
+    /**
+     * Open PIT for multiple parent indexes
+     */
+    public String openPitForMultipleIndexes(List<String> parentIndexes, String keepAlive) {
+        // Join multiple indexes with comma
+        String indexPattern = String.join(",", parentIndexes);
+        
+        String url = String.format("%s/siren/%s/_pit?keep_alive=%s", 
+            ES_HOST, indexPattern, keepAlive);
+        
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> entity = new HttpEntity<>(headers);
+        
+        try {
+            ResponseEntity<PitResponse> response = restTemplate.exchange(
+                url, HttpMethod.POST, entity, PitResponse.class
+            );
+            
+            String pitId = response.getBody().getId();
+            log.info("Opened PIT for indexes {} with ID: {}", indexPattern, pitId);
+            return pitId;
+            
+        } catch (Exception e) {
+            log.error("Error opening PIT for multiple indexes", e);
+            throw new RuntimeException("Failed to open PIT", e);
+        }
+    }
+}
+```
+
+### Usage Example:
+```java
+// Open PIT for multiple parent indexes
+List<String> parentIndexes = Arrays.asList("machine-*", "server-*", "device-*");
+String pitId = multiIndexService.openPitForMultipleIndexes(parentIndexes, "5m");
+```
+
+## 2. Multiple Child Indexes in Join
+
+You can specify multiple child indexes in the join query:
+
+```java
+/**
+ * Build join query with multiple child indexes
+ */
+private Map<String, Object> buildMultiChildJoinQuery(
+        PaginationRequest paginationRequest,
+        List<String> childIndexes,
+        String parentField,
+        String childField) {
+    
+    Map<String, Object> query = new HashMap<>();
+    
+    // Sort with tiebreaker
+    Map<String, String> sort = new HashMap<>();
+    sort.put("_shard_doc", "asc");
+    query.put("sort", sort);
+    
+    // PIT
+    if (paginationRequest.getPitId() != null) {
+        Map<String, String> pit = new HashMap<>();
+        pit.put("id", paginationRequest.getPitId());
+        query.put("pit", pit);
+    }
+    
+    // search_after
+    if (paginationRequest.getSearchAfter() != null && 
+        !paginationRequest.getSearchAfter().isEmpty()) {
+        query.put("search_after", paginationRequest.getSearchAfter());
+    }
+    
+    query.put("size", paginationRequest.getPageSize());
+    
+    // Build join with MULTIPLE child indexes
+    Map<String, Object> joinQuery = new HashMap<>();
+    joinQuery.put("indices", childIndexes);  // Multiple child indexes
+    joinQuery.put("on", Arrays.asList(parentField, childField));
+    
+    // Child request with filter (optional)
+    Map<String, Object> childRequest = new HashMap<>();
+    Map<String, Object> matchAll = new HashMap<>();
+    childRequest.put("query", Collections.singletonMap("match_all", matchAll));
+    joinQuery.put("request", childRequest);
+    
+    Map<String, Object> outerQuery = new HashMap<>();
+    outerQuery.put("join", joinQuery);
+    query.put("query", outerQuery);
+    
+    return query;
+}
+```
+
+## 3. Multiple Joins (Nested/Sequential)
+
+For complex scenarios with multiple parent-child relationships:
+
+```java
+/**
+ * Build query with multiple nested joins
+ * Example: parent -> child1 -> child2
+ */
+private Map<String, Object> buildMultipleNestedJoins(
+        PaginationRequest paginationRequest,
+        MultiJoinConfig config) {
+    
+    Map<String, Object> query = new HashMap<>();
+    
+    // Sort and PIT
+    Map<String, String> sort = new HashMap<>();
+    sort.put("_shard_doc", "asc");
+    query.put("sort", sort);
+    
+    if (paginationRequest.getPitId() != null) {
+        query.put("pit", Collections.singletonMap("id", paginationRequest.getPitId()));
+    }
+    
+    if (paginationRequest.getSearchAfter() != null) {
+        query.put("search_after", paginationRequest.getSearchAfter());
+    }
+    
+    query.put("size", paginationRequest.getPageSize());
+    
+    // Build nested join structure
+    Map<String, Object> rootJoin = buildJoinLevel(
+        config.getChild1Indexes(),
+        config.getParentField(),
+        config.getChild1Field(),
+        // Nested join as part of child1 request
+        buildJoinLevel(
+            config.getChild2Indexes(),
+            config.getChild1Field(),
+            config.getChild2Field(),
+            null  // No more nesting
+        )
+    );
+    
+    query.put("query", Collections.singletonMap("join", rootJoin));
+    
+    return query;
+}
+
+private Map<String, Object> buildJoinLevel(
+        List<String> childIndexes,
+        String parentField,
+        String childField,
+        Map<String, Object> nestedJoin) {
+    
+    Map<String, Object> joinQuery = new HashMap<>();
+    joinQuery.put("indices", childIndexes);
+    joinQuery.put("on", Arrays.asList(parentField, childField));
+    
+    Map<String, Object> childRequest = new HashMap<>();
+    
+    if (nestedJoin != null) {
+        // Add nested join to child request
+        childRequest.put("query", Collections.singletonMap("join", nestedJoin));
+    } else {
+        // Leaf level - just match all
+        childRequest.put("query", Collections.singletonMap("match_all", new HashMap<>()));
+    }
+    
+    joinQuery.put("request", childRequest);
+    
+    return joinQuery;
+}
+```
+
+## 4. Configuration DTOs
+
+```java
+@Data
+@Builder
+public class MultiJoinConfig {
+    // Parent indexes (already in PIT)
+    private List<String> parentIndexes;
+    
+    // First level join
+    private List<String> child1Indexes;
+    private String parentField;
+    private String child1Field;
+    
+    // Second level join (optional)
+    private List<String> child2Indexes;
+    private String child2Field;
+    
+    // Additional filters per level
+    private Map<String, Object> parentFilter;
+    private Map<String, Object> child1Filter;
+    private Map<String, Object> child2Filter;
+}
+
+@Data
+public class MultiIndexPaginationRequest {
+    private String pitId;
+    private int pageSize = 10;
+    private List<Object> searchAfter;
+    private MultiJoinConfig joinConfig;
+}
+```
+
+## 5. Complete Service Implementation
+
+```java
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class MultiIndexSirenPaginationService {
+    
+    private final RestTemplate restTemplate;
+    private final ObjectMapper objectMapper;
+    private static final String ES_HOST = "http://localhost:9200";
+    
+    /**
+     * Execute search with multiple parent and child indexes
+     */
+    public PaginationResponse<Map<String, Object>> searchMultiIndex(
+            MultiIndexPaginationRequest request) {
+        
+        String url = String.format("%s/siren/_search", ES_HOST);
+        
+        Map<String, Object> requestBody = buildCompleteMultiIndexQuery(request);
+        
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        
+        try {
+            String jsonBody = objectMapper.writeValueAsString(requestBody);
+            log.debug("Executing multi-index search: {}", jsonBody);
+            
+            HttpEntity<String> entity = new HttpEntity<>(jsonBody, headers);
+            
+            ResponseEntity<String> response = restTemplate.exchange(
+                url, HttpMethod.GET, entity, String.class
+            );
+            
+            return parseResponse(response.getBody());
+            
+        } catch (Exception e) {
+            log.error("Error executing multi-index search", e);
+            throw new RuntimeException("Failed to execute search", e);
+        }
+    }
+    
+    /**
+     * Build complete query for multiple indexes and joins
+     */
+    private Map<String, Object> buildCompleteMultiIndexQuery(
+            MultiIndexPaginationRequest request) {
+        
+        Map<String, Object> query = new HashMap<>();
+        MultiJoinConfig config = request.getJoinConfig();
+        
+        // Sort
+        query.put("sort", Collections.singletonMap("_shard_doc", "asc"));
+        
+        // PIT
+        if (request.getPitId() != null) {
+            query.put("pit", Collections.singletonMap("id", request.getPitId()));
+        }
+        
+        // search_after
+        if (request.getSearchAfter() != null && !request.getSearchAfter().isEmpty()) {
+            query.put("search_after", request.getSearchAfter());
+        }
+        
+        query.put("size", request.getPageSize());
+        
+        // Build the join query
+        Map<String, Object> rootQuery = new HashMap<>();
+        
+        // Check if we need a bool query to combine parent filter with join
+        if (config.getParentFilter() != null) {
+            Map<String, Object> boolQuery = new HashMap<>();
+            List<Map<String, Object>> mustClauses = new ArrayList<>();
+            
+            // Add parent filter
+            mustClauses.add(config.getParentFilter());
+            
+            // Add join
+            mustClauses.add(Collections.singletonMap("join", 
+                buildMultiLevelJoin(config)));
+            
+            boolQuery.put("must", mustClauses);
+            rootQuery.put("bool", boolQuery);
+        } else {
+            rootQuery.put("join", buildMultiLevelJoin(config));
+        }
+        
+        query.put("query", rootQuery);
+        
+        return query;
+    }
+    
+    /**
+     * Build multi-level join structure
+     */
+    private Map<String, Object> buildMultiLevelJoin(MultiJoinConfig config) {
+        Map<String, Object> joinQuery = new HashMap<>();
+        
+        // Child1 indexes
+        joinQuery.put("indices", config.getChild1Indexes());
+        joinQuery.put("on", Arrays.asList(config.getParentField(), config.getChild1Field()));
+        
+        // Build child1 request
+        Map<String, Object> child1Request = new HashMap<>();
+        
+        // If there's a second level join
+        if (config.getChild2Indexes() != null && !config.getChild2Indexes().isEmpty()) {
+            Map<String, Object> nestedJoin = new HashMap<>();
+            nestedJoin.put("indices", config.getChild2Indexes());
+            nestedJoin.put("on", Arrays.asList(config.getChild1Field(), config.getChild2Field()));
+            
+            // Child2 request
+            Map<String, Object> child2Request = new HashMap<>();
+            if (config.getChild2Filter() != null) {
+                child2Request.put("query", config.getChild2Filter());
+            } else {
+                child2Request.put("query", Collections.singletonMap("match_all", new HashMap<>()));
+            }
+            nestedJoin.put("request", child2Request);
+            
+            // Add to child1 query
+            if (config.getChild1Filter() != null) {
+                Map<String, Object> boolQuery = new HashMap<>();
+                boolQuery.put("must", Arrays.asList(
+                    config.getChild1Filter(),
+                    Collections.singletonMap("join", nestedJoin)
+                ));
+                child1Request.put("query", Collections.singletonMap("bool", boolQuery));
+            } else {
+                child1Request.put("query", Collections.singletonMap("join", nestedJoin));
+            }
+        } else {
+            // No nested join, just filter or match_all
+            if (config.getChild1Filter() != null) {
+                child1Request.put("query", config.getChild1Filter());
+            } else {
+                child1Request.put("query", Collections.singletonMap("match_all", new HashMap<>()));
+            }
+        }
+        
+        joinQuery.put("request", child1Request);
+        
+        return joinQuery;
+    }
+    
+    /**
+     * Parse response (same as before)
+     */
+    private PaginationResponse<Map<String, Object>> parseResponse(String responseBody) 
+            throws IOException {
+        
+        JsonNode root = objectMapper.readTree(responseBody);
+        PaginationResponse<Map<String, Object>> response = new PaginationResponse<>();
+        
+        if (root.has("pit_id")) {
+            response.setPitId(root.get("pit_id").asText());
+        }
+        
+        JsonNode hitsNode = root.path("hits").path("hits");
+        List<Map<String, Object>> results = new ArrayList<>();
+        List<Object> lastSort = null;
+        
+        for (JsonNode hit : hitsNode) {
+            Map<String, Object> document = new HashMap<>();
+            document.put("_id", hit.get("_id").asText());
+            document.put("_index", hit.get("_index").asText());
+            document.put("_source", objectMapper.convertValue(
+                hit.get("_source"), Map.class));
+            
+            if (hit.has("sort")) {
+                lastSort = objectMapper.convertValue(hit.get("sort"), List.class);
+                document.put("sort", lastSort);
+            }
+            
+            results.add(document);
+        }
+        
+        response.setResults(results);
+        response.setSearchAfter(lastSort);
+        response.setHasMore(results.size() >= root.path("size").asInt());
+        response.setTotalHits(root.path("hits").path("total").path("value").asLong());
+        
+        return response;
+    }
+}
+```
+
+## 6. Controller for Multi-Index
+
+```java
+@RestController
+@RequestMapping("/api/siren/multi")
+@RequiredArgsConstructor
+public class MultiIndexSirenController {
+    
+    private final MultiIndexSirenPaginationService sirenService;
+    
+    /**
+     * Initialize pagination for multiple parent indexes
+     */
+    @PostMapping("/pagination/init")
+    public ResponseEntity<Map<String, String>> initMultiIndexPagination(
+            @RequestBody List<String> parentIndexes,
+            @RequestParam(defaultValue = "5m") String keepAlive) {
+        
+        String pitId = sirenService.openPitForMultipleIndexes(parentIndexes, keepAlive);
+        return ResponseEntity.ok(Map.of("pitId", pitId));
+    }
+    
+    /**
+     * Search with multiple joins
+     */
+    @PostMapping("/pagination/search")
+    public ResponseEntity<PaginationResponse<Map<String, Object>>> searchMultiIndex(
+            @RequestBody MultiIndexPaginationRequest request) {
+        
+        PaginationResponse<Map<String, Object>> response = 
+            sirenService.searchMultiIndex(request);
+        
+        return ResponseEntity.ok(response);
+    }
+}
+```
+
+## 7. Usage Examples
+
+### Example 1: Multiple Parent Indexes, Single Child
+
+```java
+// Initialize
+List<String> parentIndexes = Arrays.asList("machine-*", "server-*", "device-*");
+String pitId = sirenService.openPitForMultipleIndexes(parentIndexes, "5m");
+
+// Build config
+MultiJoinConfig config = MultiJoinConfig.builder()
+    .parentIndexes(parentIndexes)
+    .child1Indexes(Arrays.asList("beat-*", "metric-*"))
+    .parentField("id")
+    .child1Field("machine_id")
+    .build();
+
+// Search
+MultiIndexPaginationRequest request = new MultiIndexPaginationRequest();
+request.setPitId(pitId);
+request.setPageSize(50);
+request.setJoinConfig(config);
+
+PaginationResponse<Map<String, Object>> response = 
+    sirenService.searchMultiIndex(request);
+```
+
+### Example 2: Nested Joins (Parent -> Child1 -> Child2)
+
+```java
+MultiJoinConfig config = MultiJoinConfig.builder()
+    // Parent: machines
+    .parentIndexes(Arrays.asList("machine-*"))
+    
+    // First join: machine -> logs
+    .child1Indexes(Arrays.asList("logs-*"))
+    .parentField("machine_id")
+    .child1Field("machine_id")
+    
+    // Second join: logs -> errors
+    .child2Indexes(Arrays.asList("errors-*"))
+    .child2Field("log_id")
+    
+    // Optional filters
+    .parentFilter(Map.of("range", Map.of("created_date", 
+        Map.of("gte", "2024-01-01"))))
+    .child1Filter(Map.of("term", Map.of("level", "ERROR")))
+    
+    .build();
+
+String pitId = sirenService.openPitForMultipleIndexes(
+    config.getParentIndexes(), "10m");
+
+MultiIndexPaginationRequest request = new MultiIndexPaginationRequest();
+request.setPitId(pitId);
+request.setPageSize(100);
+request.setJoinConfig(config);
+
+// Paginate through all results
+do {
+    PaginationResponse<Map<String, Object>> response = 
+        sirenService.searchMultiIndex(request);
+    
+    // Process results
+    processResults(response.getResults());
+    
+    // Update for next page
+    request.setPitId(response.getPitId());
+    request.setSearchAfter(response.getSearchAfter());
+    
+} while (response.isHasMore());
+```
+
+### Example 3: REST API Call
+
+```bash
+# 1. Initialize PIT for multiple parent indexes
+curl -X POST "http://localhost:8080/api/siren/multi/pagination/init?keepAlive=10m" \
+-H "Content-Type: application/json" \
+-d '["machine-*", "server-*", "device-*"]'
+
+# 2. Search with multiple child indexes
+curl -X POST "http://localhost:8080/api/siren/multi/pagination/search" \
+-H "Content-Type: application/json" \
+-d '{
+  "pitId": "AQ92aV82NzVhOTQ5YV80MWU=#...",
+  "pageSize": 50,
+  "joinConfig": {
+    "parentIndexes": ["machine-*", "server-*"],
+    "child1Indexes": ["beat-*", "metric-*", "log-*"],
+    "parentField": "id",
+    "child1Field": "machine_id"
+  }
+}'
+
+# 3. Next page with nested joins
+curl -X POST "http://localhost:8080/api/siren/multi/pagination/search" \
+-H "Content-Type: application/json" \
+-d '{
+  "pitId": "updated_pit_id",
+  "pageSize": 50,
+  "searchAfter": [12345],
+  "joinConfig": {
+    "parentIndexes": ["machine-*"],
+    "child1Indexes": ["logs-*"],
+    "parentField": "machine_id",
+    "child1Field": "machine_id",
+    "child2Indexes": ["errors-*"],
+    "child2Field": "log_id",
+    "child1Filter": {
+      "term": {"level": "ERROR"}
+    }
+  }
+}'
+```
+
+## Key Points for Multiple Indexes
+
+1. **PIT Opening**: Include all parent indexes when opening PIT (comma-separated or array)
+2. **Join Indices**: Child indexes can be arrays with multiple patterns
+3. **Nested Joins**: SIREN supports nested joins for complex parent-child-grandchild relationships
+4. **Performance**: More indexes = more overhead, consider keeping PIT alive longer
+5. **Consistency**: PIT ensures all indexes are queried at the same point in time
+6. **Index Patterns**: Use wildcards (e.g., `machine-*`) to match multiple indexes
+
+This approach handles complex multi-index scenarios while maintaining consistent pagination across all indexes using PIT.
+
