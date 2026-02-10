@@ -1,0 +1,719 @@
+
+
+## 1. High-Level Architecture
+
+* **Spring Boot application layers**
+    * **API layer (REST controllers)**  
+        * Accepts structured search payloads from the client (JSON).
+        * Returns normalized search results and optional aggregations.
+    * **Service layer**
+        * Validates and interprets the client request.
+        * Delegates to a **SirenQueryBuilder** to construct the Elasticsearch/Siren query.
+        * Calls Elasticsearch via the Java client and maps responses to DTOs.
+    * **Query builder layer**
+        * Pure logic to transform the request DTO into ES + Siren join + aggregations JSON.
+        * Unit-testable, no external dependencies except JSON building.
+    * **Elasticsearch client**
+        * `RestHighLevelClient` or the newer `ElasticsearchClient` (Java API client).
+        * Sends the JSON to the ES cluster where Siren plugin is installed.
+
+* **Key design principles**
+    * **Do NOT let the client send raw ES/Siren DSL.**  
+      They send a constrained, validated search model; you translate it.
+    * **Isolate all Siren-specific logic** in one place so you can modify it if plugin version/DSL changes.
+    * **Strong typing** of filters, joins, and aggregations to avoid runtime surprises.
+
+Below I’ll assume two indices:
+
+* `orders` (main index)
+* `customers` (joined index)
+
+Joined on `customerId`.
+
+## 2. Client-Facing Request Model
+
+### 2.1. JSON payload from client
+
+Example of a flexible but safe search contract:
+
+```json
+{
+    "mainIndex": "orders",
+    "filters": [
+        { "field": "status", "op": "EQ", "value": "PAID" },
+        { "field": "orderDate", "op": "RANGE", "from": "2024-01-01", "to": "2024-12-31" }
+    ],
+    "join": {
+        "rightIndex": "customers",
+        "leftField": "customerId",
+        "rightField": "id",
+        "rightFilters": [
+            { "field": "country", "op": "EQ", "value": "US" }
+        ]
+    },
+    "aggregations": [
+        {
+            "name": "orders_by_country",
+            "type": "TERMS",
+            "field": "customer.country",
+            "size": 10
+        },
+        {
+            "name": "avg_order_amount",
+            "type": "AVG",
+            "field": "amount"
+        }
+    ],
+    "pagination": {
+        "page": 0,
+        "size": 20
+    },
+    "sort": [
+        { "field": "orderDate", "direction": "DESC" }
+    ]
+}
+```
+
+### 2.2. Java DTOs
+
+```java
+public class SearchRequestDTO {
+    private String mainIndex;
+    private List<FilterDTO> filters;
+    private JoinDTO join;
+    private List<AggregationDTO> aggregations;
+    private PaginationDTO pagination;
+    private List<SortDTO> sort;
+    // getters/setters
+}
+
+public class FilterDTO {
+    private String field;
+    private FilterOperation op; // EQ, RANGE, TERMS, LIKE, GT, LT, GTE, LTE, EXISTS ...
+    private Object value;
+    private Object from;
+    private Object to;
+    private List<Object> values;
+    // getters/setters
+}
+
+public enum FilterOperation {
+    EQ, RANGE, TERMS, LIKE, GT, LT, GTE, LTE, EXISTS
+}
+
+public class JoinDTO {
+    private String rightIndex;
+    private String leftField;
+    private String rightField;
+    private List<FilterDTO> rightFilters;
+    // optionally joinType, joinAlgorithm, etc.
+    // getters/setters
+}
+
+public class AggregationDTO {
+    private String name;
+    private AggregationType type; // TERMS, SUM, AVG, MAX, MIN, DATE_HISTOGRAM ...
+    private String field;
+    private Integer size;     // for TERMS
+    private String interval;  // for DATE_HISTOGRAM
+    // getters/setters
+}
+
+public enum AggregationType {
+    TERMS, SUM, AVG, MAX, MIN, DATE_HISTOGRAM
+}
+
+public class PaginationDTO {
+    private int page;
+    private int size;
+    // getters/setters
+}
+
+public class SortDTO {
+    private String field;
+    private SortDirection direction; // ASC, DESC
+    // getters/setters
+}
+
+public enum SortDirection {
+    ASC, DESC
+}
+```
+
+This gives you a **structured, versionable contract** that you fully control.
+
+## 3. Building the Siren + Elasticsearch Query
+
+Because Siren is a plugin at the Elasticsearch layer, the safest and most flexible approach in Java is:
+
+* Build the **full query JSON** (including Siren join syntax) as a string or `JsonNode`.
+* Use `QueryBuilders.wrapperQuery(jsonString)` in the Java client so ES sees the raw DSL.
+
+### 3.1. Siren query structure (conceptual)
+
+A typical Siren join query (conceptual, adjust to your Siren version) looks like:
+
+```json
+{
+    "query": {
+        "join": {
+            "indices": ["customers"],
+            "on": ["customerId", "id"],
+            "request": {
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { "country": "US" } }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+You then also want to apply filters on the **main index** (`orders`) and optionally add `aggs`, `from`, `size`, `sort`.
+
+So your builder will create something along the lines of:
+
+* If no join → normal `bool` query with aggs.
+* If join → top-level `query` is the Siren `join`, and the “left side” filters are inside the join’s main query or in a parent `bool`, depending on your exact plugin version.  
+  For clarity, I’ll show a pattern where:
+
+* The **outer** `query` is `join`.
+* The `join.request.query` contains right-index filters.
+* The left-index filters are in an additional `filter`/`must` inside the join’s “primary query” if supported, or you `AND` them via Siren’s documented pattern.
+
+Because specific Siren DSL may vary, you will adapt field names but keep this **structuring approach**.
+
+### 3.2. SirenQueryBuilder skeleton
+
+Use Jackson to build JSON to avoid string concatenation errors.
+
+```java
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+public class SirenQueryBuilder {
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    public String build(SearchRequestDTO request) {
+        ObjectNode root = mapper.createObjectNode();
+
+        // pagination & sorting handled outside or here (you choose); here we'll add them
+        ObjectNode queryNode = buildQueryNode(request);
+        root.set("query", queryNode);
+
+        if (request.getAggregations() != null && !request.getAggregations().isEmpty()) {
+            ObjectNode aggsNode = buildAggregationsNode(request.getAggregations());
+            root.set("aggs", aggsNode);
+        }
+
+        PaginationDTO p = request.getPagination();
+        if (p != null) {
+            int from = p.getPage() * p.getSize();
+            root.put("from", from);
+            root.put("size", p.getSize());
+        }
+
+        if (request.getSort() != null && !request.getSort().isEmpty()) {
+            ArrayNode sortNode = mapper.createArrayNode();
+            for (SortDTO sort : request.getSort()) {
+                ObjectNode sortObj = mapper.createObjectNode();
+                ObjectNode fieldNode = mapper.createObjectNode();
+                fieldNode.put("order", sort.getDirection().name().toLowerCase());
+                sortObj.set(sort.getField(), fieldNode);
+                sortNode.add(sortObj);
+            }
+            root.set("sort", sortNode);
+        }
+
+        try {
+            return mapper.writeValueAsString(root);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to build Siren query JSON", e);
+        }
+    }
+
+    private ObjectNode buildQueryNode(SearchRequestDTO request) {
+        if (request.getJoin() == null) {
+            // plain bool query
+            ObjectNode boolNode = mapper.createObjectNode();
+            ArrayNode mustArray = mapper.createArrayNode();
+            buildFiltersArray(mustArray, request.getFilters());
+            if (mustArray.size() > 0) {
+                boolNode.set("must", mustArray);
+            }
+            ObjectNode queryNode = mapper.createObjectNode();
+            queryNode.set("bool", boolNode);
+            return queryNode;
+        } else {
+            // join query
+            JoinDTO join = request.getJoin();
+
+            ObjectNode joinNode = mapper.createObjectNode();
+            // Siren-specific fields - adjust to your Siren plugin documentation
+            ArrayNode indices = mapper.createArrayNode();
+            indices.add(join.getRightIndex());
+            joinNode.set("indices", indices);
+
+            ArrayNode on = mapper.createArrayNode();
+            on.add(join.getLeftField());
+            on.add(join.getRightField());
+            joinNode.set("on", on);
+
+            // right side query
+            ObjectNode rightRequest = mapper.createObjectNode();
+            ObjectNode rightBool = mapper.createObjectNode();
+            ArrayNode rightMust = mapper.createArrayNode();
+            buildFiltersArray(rightMust, join.getRightFilters());
+            if (rightMust.size() > 0) {
+                rightBool.set("must", rightMust);
+            }
+            ObjectNode rightQuery = mapper.createObjectNode();
+            rightQuery.set("bool", rightBool);
+            rightRequest.set("query", rightQuery);
+            joinNode.set("request", rightRequest);
+
+            // left side filters: depending on Siren version, may be combined inside join
+            if (request.getFilters() != null && !request.getFilters().isEmpty()) {
+                ObjectNode leftQuery = mapper.createObjectNode();
+                ObjectNode leftBool = mapper.createObjectNode();
+                ArrayNode leftMust = mapper.createArrayNode();
+                buildFiltersArray(leftMust, request.getFilters());
+                if (leftMust.size() > 0) {
+                    leftBool.set("must", leftMust);
+                }
+                leftQuery.set("bool", leftBool);
+                // Many Siren versions use "query" for left side
+                joinNode.set("query", leftQuery);
+            }
+
+            ObjectNode queryNode = mapper.createObjectNode();
+            queryNode.set("join", joinNode);
+            return queryNode;
+        }
+    }
+
+    private void buildFiltersArray(ArrayNode mustArray, List<FilterDTO> filters) {
+        if (filters == null) return;
+        for (FilterDTO f : filters) {
+            ObjectNode filterNode = buildSingleFilter(f);
+            if (filterNode != null) {
+                mustArray.add(filterNode);
+            }
+        }
+    }
+
+    private ObjectNode buildSingleFilter(FilterDTO f) {
+        if (f == null || f.getField() == null || f.getOp() == null) return null;
+
+        switch (f.getOp()) {
+            case EQ:
+                return termQuery(f.getField(), f.getValue());
+            case TERMS:
+                return termsQuery(f.getField(), f.getValues());
+            case RANGE:
+                return rangeQuery(f);
+            case LIKE:
+                return matchQuery(f.getField(), String.valueOf(f.getValue()));
+            case EXISTS:
+                return existsQuery(f.getField());
+            case GT:
+            case GTE:
+            case LT:
+            case LTE:
+                return rangeQueryFromSimpleOp(f);
+            default:
+                return null;
+        }
+    }
+
+    private ObjectNode termQuery(String field, Object value) {
+        ObjectNode term = mapper.createObjectNode();
+        term.set(field, mapper.valueToTree(value));
+        ObjectNode wrapper = mapper.createObjectNode();
+        wrapper.set("term", term);
+        return wrapper;
+    }
+
+    private ObjectNode termsQuery(String field, List<Object> values) {
+        ObjectNode terms = mapper.createObjectNode();
+        terms.set(field, mapper.valueToTree(values));
+        ObjectNode wrapper = mapper.createObjectNode();
+        wrapper.set("terms", terms);
+        return wrapper;
+    }
+
+    private ObjectNode rangeQuery(FilterDTO f) {
+        ObjectNode rangeBody = mapper.createObjectNode();
+        if (f.getFrom() != null) {
+            rangeBody.set("gte", mapper.valueToTree(f.getFrom()));
+        }
+        if (f.getTo() != null) {
+            rangeBody.set("lte", mapper.valueToTree(f.getTo()));
+        }
+        ObjectNode rangeField = mapper.createObjectNode();
+        rangeField.set(f.getField(), rangeBody);
+        ObjectNode wrapper = mapper.createObjectNode();
+        wrapper.set("range", rangeField);
+        return wrapper;
+    }
+
+    private ObjectNode rangeQueryFromSimpleOp(FilterDTO f) {
+        ObjectNode rangeBody = mapper.createObjectNode();
+        switch (f.getOp()) {
+            case GT:
+                rangeBody.set("gt", mapper.valueToTree(f.getValue()));
+                break;
+            case GTE:
+                rangeBody.set("gte", mapper.valueToTree(f.getValue()));
+                break;
+            case LT:
+                rangeBody.set("lt", mapper.valueToTree(f.getValue()));
+                break;
+            case LTE:
+                rangeBody.set("lte", mapper.valueToTree(f.getValue()));
+                break;
+            default:
+                break;
+        }
+        ObjectNode rangeField = mapper.createObjectNode();
+        rangeField.set(f.getField(), rangeBody);
+        ObjectNode wrapper = mapper.createObjectNode();
+        wrapper.set("range", rangeField);
+        return wrapper;
+    }
+
+    private ObjectNode matchQuery(String field, String value) {
+        ObjectNode match = mapper.createObjectNode();
+        match.put(field, value);
+        ObjectNode wrapper = mapper.createObjectNode();
+        wrapper.set("match", match);
+        return wrapper;
+    }
+
+    private ObjectNode existsQuery(String field) {
+        ObjectNode exists = mapper.createObjectNode();
+        exists.put("field", field);
+        ObjectNode wrapper = mapper.createObjectNode();
+        wrapper.set("exists", exists);
+        return wrapper;
+    }
+
+    private ObjectNode buildAggregationsNode(List<AggregationDTO> aggregations) {
+        ObjectNode aggs = mapper.createObjectNode();
+        for (AggregationDTO agg : aggregations) {
+            ObjectNode aggBody = mapper.createObjectNode();
+            switch (agg.getType()) {
+                case TERMS:
+                    ObjectNode terms = mapper.createObjectNode();
+                    terms.put("field", agg.getField());
+                    if (agg.getSize() != null) {
+                        terms.put("size", agg.getSize());
+                    }
+                    aggBody.set("terms", terms);
+                    break;
+                case SUM:
+                case AVG:
+                case MAX:
+                case MIN:
+                    ObjectNode metric = mapper.createObjectNode();
+                    metric.put("field", agg.getField());
+                    aggBody.set(agg.getType().name().toLowerCase(), metric);
+                    break;
+                case DATE_HISTOGRAM:
+                    ObjectNode dateHist = mapper.createObjectNode();
+                    dateHist.put("field", agg.getField());
+                    if (agg.getInterval() != null) {
+                        dateHist.put("calendar_interval", agg.getInterval());
+                    }
+                    aggBody.set("date_histogram", dateHist);
+                    break;
+                default:
+                    continue;
+            }
+            aggs.set(agg.getName(), aggBody);
+        }
+        return aggs;
+    }
+}
+```
+
+This is **plugin-agnostic Java**: if Siren’s exact JSON fields differ, you only touch this class.
+
+## 4. Spring Boot + Elasticsearch Integration
+
+### 4.1. Elasticsearch client configuration
+
+Using `RestHighLevelClient` (works up to ES 7.x; for ES 8.x use the new Java API client instead).
+
+```java
+import org.apache.http.HttpHost;
+import org.elasticsearch.client.RestClient;
+import org.elasticsearch.client.RestHighLevelClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class ElasticsearchConfig {
+
+    @Bean(destroyMethod = "close")
+    public RestHighLevelClient esClient() {
+        return new RestHighLevelClient(
+            RestClient.builder(
+                new HttpHost("localhost", 9200, "http")
+            )
+        );
+    }
+}
+```
+
+### 4.2. Service layer
+
+```java
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.RestHighLevelClient;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.springframework.stereotype.Service;
+
+@Service
+public class SearchService {
+
+    private final RestHighLevelClient esClient;
+    private final SirenQueryBuilder sirenQueryBuilder;
+
+    public SearchService(RestHighLevelClient esClient, SirenQueryBuilder sirenQueryBuilder) {
+        this.esClient = esClient;
+        this.sirenQueryBuilder = sirenQueryBuilder;
+    }
+
+    public SearchResultDTO search(SearchRequestDTO request) {
+        String sirenJson = sirenQueryBuilder.build(request);
+
+        SearchSourceBuilder sourceBuilder = new SearchSourceBuilder();
+        sourceBuilder.query(QueryBuilders.wrapperQuery(sirenJson));
+        // from/size/sort already in JSON, or you can put them here instead.
+        // If you've put them in the JSON, wrapperQuery covers only "query". 
+        // An alternative is building sourceBuilder fully instead of JSON; 
+        // keep it consistent.
+
+        SearchRequest esRequest = new SearchRequest(request.getMainIndex());
+        esRequest.source(sourceBuilder);
+
+        try {
+            SearchResponse response = esClient.search(esRequest, RequestOptions.DEFAULT);
+            return mapResponse(response);
+        } catch (Exception e) {
+            throw new RuntimeException("Elasticsearch search failed", e);
+        }
+    }
+
+    private SearchResultDTO mapResponse(SearchResponse response) {
+        // Map hits + aggs to your DTO
+        // ...
+        return new SearchResultDTO();
+    }
+}
+```
+
+Depending on how you choose to place `from/size/sort/aggs` (in JSON vs builder), you can:
+
+* Put everything in JSON and use a low-level client (or `RestClient`) with raw body.
+* Or:
+    * Use Siren JSON **only for the `query`** via `wrapperQuery`.
+    * Use normal `SearchSourceBuilder` for `from`, `size`, `sort`, and `aggs`.
+
+For maximal clarity and type safety, using `wrapperQuery` only for the join part is often nicer.
+
+### 4.3. REST controller
+
+```java
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/search")
+public class SearchController {
+
+    private final SearchService searchService;
+    private final SearchRequestValidator validator;
+
+    public SearchController(SearchService searchService,
+                            SearchRequestValidator validator) {
+        this.searchService = searchService;
+        this.validator = validator;
+    }
+
+    @PostMapping
+    public ResponseEntity<SearchResultDTO> search(@RequestBody SearchRequestDTO request) {
+        validator.validate(request); // field whitelists, limits, etc.
+        SearchResultDTO result = searchService.search(request);
+        return ResponseEntity.ok(result);
+    }
+}
+```
+
+You can return hits and aggregations in a single DTO:
+
+```java
+public class SearchResultDTO {
+    private long totalHits;
+    private List<Map<String, Object>> hits;
+    private Map<String, Object> aggregations;
+    // getters/setters
+}
+```
+
+## 5. Example End-to-End
+
+### 5.1. Example request
+
+Client sends:
+
+```json
+POST /api/search
+{
+    "mainIndex": "orders",
+    "filters": [
+        { "field": "status", "op": "EQ", "value": "PAID" }
+    ],
+    "join": {
+        "rightIndex": "customers",
+        "leftField": "customerId",
+        "rightField": "id",
+        "rightFilters": [
+            { "field": "country", "op": "EQ", "value": "US" }
+        ]
+    },
+    "aggregations": [
+        {
+            "name": "amount_by_country",
+            "type": "TERMS",
+            "field": "customer.country",
+            "size": 10
+        },
+        {
+            "name": "avg_amount",
+            "type": "AVG",
+            "field": "amount"
+        }
+    ],
+    "pagination": { "page": 0, "size": 20 },
+    "sort": [
+        { "field": "orderDate", "direction": "DESC" }
+    ]
+}
+```
+
+Your `SirenQueryBuilder` produces (conceptual) JSON like:
+
+```json
+{
+    "query": {
+        "join": {
+            "indices": ["customers"],
+            "on": ["customerId", "id"],
+            "query": {
+                "bool": {
+                    "must": [
+                        { "term": { "status": "PAID" } }
+                    ]
+                }
+            },
+            "request": {
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { "country": "US" } }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    "aggs": {
+        "amount_by_country": {
+            "terms": { "field": "customer.country", "size": 10 }
+        },
+        "avg_amount": {
+            "avg": { "field": "amount" }
+        }
+    },
+    "from": 0,
+    "size": 20,
+    "sort": [
+        { "orderDate": { "order": "desc" } }
+    ]
+}
+```
+
+This goes to Elasticsearch; Siren handles the join, ES handles query execution and aggregations.
+
+## 6. Making It Robust
+
+### 6.1. Validation and safety
+
+* **Whitelisting of fields**:
+    * Maintain an enum or configuration of allowed fields per index; reject unknown fields.
+* **Limit query complexity**:
+    * Max number of filters, joins (likely 1 in Siren use case), and aggregations.
+    * Max `size` and `page` (e.g., `size <= 1000`).
+* **Defend against heavy joins**:
+    * Default join constraints; limit `max_docs_per_partition` or similar Siren parameters if available.
+* **Request validator sample**
+
+```java
+import org.springframework.stereotype.Component;
+
+@Component
+public class SearchRequestValidator {
+
+    public void validate(SearchRequestDTO request) {
+        // 1. mainIndex must be set and allowed
+        // 2. field names must be valid for that index
+        // 3. join indices/fields must be allowed and indexed
+        // 4. pagination bounds (page >= 0, 1 <= size <= 1000)
+        // 5. aggregations well-formed
+        // Throw custom exceptions with clear messages
+    }
+}
+```
+
+### 6.2. Error handling
+
+* Wrap ES/Siren exceptions into domain-specific exceptions and return:
+    * 400 for invalid search.
+    * 500 for unexpected ES issues.
+* Log Siren JSON query when errors occur (with care for sensitive data).
+
+### 6.3. Testing
+
+* **Unit tests** on `SirenQueryBuilder`:
+    * Given specific `SearchRequestDTO` → assert generated JSON matches expected (use JSON comparison).
+* **Integration tests**:
+    * Run ES + Siren in Docker in your test profile.
+    * Index test documents in `orders` and `customers`.
+    * Call `SearchService.search()` and verify results + aggregations.
+
+### 6.4. Performance and scalability
+
+* Use **pagination** and avoid large `size`.
+* Consider **scroll** or **search_after** for deep pagination if needed.
+* Avoid expensive `LIKE`/`match` queries on un-analyzed fields.
+* Pre-aggregate where possible instead of super complex dynamic aggregations.
+
+---
+
+If you want, I can next:
+
+* Refine the Siren join JSON to the exact syntax of your Siren version.
+* Add concrete unit tests for `SirenQueryBuilder`.
+* Show how to migrate this to the newer Elasticsearch Java API client (ES 8.x).
+
