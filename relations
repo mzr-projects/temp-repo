@@ -1,276 +1,82 @@
-import java.util.*;
-import java.util.stream.Collectors;
+/**
+ * Represents a branch: its root and all relations reachable from it, in order.
+ */
+record BranchResult(
+        String         root,
+        List<Relation> relations,  // topologically ordered
+        int            depth,      // longest path from root
+        boolean        isMain      // true for the root with most descendants
+) {}
+
 
 /**
- * Relation represents a directed edge: source → target
+ * Detects all branches (one per root), ordered by descendant count descending.
+ * The first entry is always the "main" branch.
  */
-record Relation(String source, String target) {
-    public Relation {
-        Objects.requireNonNull(source, "source must not be null");
-        Objects.requireNonNull(target, "target must not be null");
-        if (source.isBlank() || target.isBlank())
-            throw new IllegalArgumentException("source and target must not be blank");
+public List<BranchResult> detectBranches(List<Relation> relations) {
+    if (relations == null || relations.isEmpty()) return List.of();
+
+    GraphData g = buildGraph(relations);
+
+    // bySource lookup for relation reconstruction
+    Map<String, List<Relation>> bySource = relations.stream()
+            .collect(Collectors.groupingBy(Relation::source));
+
+    List<String> roots = g.insertionOrder().stream()
+            .filter(n -> g.inDegree().get(n) == 0)
+            .collect(Collectors.toList());
+
+    // Build one BranchResult per root
+    List<BranchResult> branches = roots.stream()
+            .map(root -> buildBranch(root, g.adjacency(), bySource))
+            .sorted(Comparator.comparingInt(
+                    (BranchResult b) -> b.relations().size()).reversed())
+            .collect(Collectors.toList());
+
+    // Mark the first (largest) as main
+    if (!branches.isEmpty()) {
+        BranchResult first = branches.get(0);
+        branches.set(0, new BranchResult(
+                first.root(), first.relations(), first.depth(), true));
     }
 
-    @Override
-    public String toString() {
-        return source + " → " + target;
-    }
+    return branches;
 }
 
 /**
- * Result of a topological sort, carrying ordered nodes,
- * detected roots, and any cycle information.
+ * BFS from a single root — collects reachable relations in topological order.
  */
-record GraphOrderResult(
-        List<String>              orderedNodes,
-        List<String>              rootNodes,      // in discovery order
-        boolean                   hasCycle,
-        List<List<String>>        cycles          // each inner list is one cycle path
-) {}
+private BranchResult buildBranch(
+        String root,
+        Map<String, List<String>>  adjacency,
+        Map<String, List<Relation>> bySource
+) {
+    List<Relation>  ordered  = new ArrayList<>();
+    Set<String>     visited  = new LinkedHashSet<>();
+    Queue<String>   queue    = new LinkedList<>();
+    Map<String, Integer> depthMap = new HashMap<>();
 
-/**
- * GraphOrderingService builds a directed graph from a list of Relations
- * and provides:
- *   - multiple root node detection (nodes with in-degree 0), preserving order
- *   - Kahn's BFS-based topological sort
- *   - DFS-based cycle detection with full cycle path reporting
- */
-class GraphOrderingService {
+    queue.offer(root);
+    depthMap.put(root, 0);
 
-    // ------------------------------------------------------------------ build
+    while (!queue.isEmpty()) {
+        String node = queue.poll();
+        if (!visited.add(node)) continue;
 
-    /**
-     * Builds adjacency list and in-degree map from the relation list.
-     * Nodes that appear only as a source (never as a target) are roots.
-     */
-    private record GraphData(
-            Map<String, List<String>> adjacency,   // source → [targets]
-            Map<String, Integer>      inDegree,     // node  → in-degree count
-            List<String>              insertionOrder // all nodes in first-seen order
-    ) {}
-
-    private GraphData buildGraph(List<Relation> relations) {
-        // LinkedHashMap preserves first-seen insertion order
-        Map<String, List<String>> adjacency    = new LinkedHashMap<>();
-        Map<String, Integer>      inDegree     = new LinkedHashMap<>();
-        List<String>              insertionOrder = new ArrayList<>();
-
-        for (Relation rel : relations) {
-            // Register source
-            if (adjacency.putIfAbsent(rel.source(), new ArrayList<>()) == null) {
-                inDegree.put(rel.source(), 0);
-                insertionOrder.add(rel.source());
-            }
-            // Register target
-            if (adjacency.putIfAbsent(rel.target(), new ArrayList<>()) == null) {
-                inDegree.put(rel.target(), 0);
-                insertionOrder.add(rel.target());
-            }
-            // Add edge and bump target's in-degree
-            adjacency.get(rel.source()).add(rel.target());
-            inDegree.merge(rel.target(), 1, Integer::sum);
-        }
-        return new GraphData(adjacency, inDegree, insertionOrder);
-    }
-
-    // ------------------------------------------------------ root detection
-
-    /**
-     * Returns all root nodes (in-degree == 0) in insertion order.
-     * If every node has at least one incoming edge, the graph has no roots
-     * (only cycles); an empty list is returned in that case.
-     */
-    public List<String> detectRoots(List<Relation> relations) {
-        GraphData g = buildGraph(relations);
-        return g.insertionOrder().stream()
-                .filter(n -> g.inDegree().get(n) == 0)
-                .collect(Collectors.toList());
-    }
-
-    // -------------------------------------------------- topological sort (Kahn)
-
-    /**
-     * Kahn's algorithm: BFS from all roots.
-     * - If the result contains all nodes → no cycle.
-     * - If some nodes are missing        → those nodes are part of a cycle.
-     *
-     * Multiple roots are all seeded into the queue at the start,
-     * so they appear first in the output (in insertion order).
-     */
-    public GraphOrderResult orderRelations(List<Relation> relations) {
-        if (relations == null || relations.isEmpty()) {
-            return new GraphOrderResult(List.of(), List.of(), false, List.of());
-        }
-
-        GraphData g = buildGraph(relations);
-
-        // Mutable copy of in-degrees for Kahn's
-        Map<String, Integer> inDeg = new LinkedHashMap<>(g.inDegree());
-
-        // Seed queue with all roots, in insertion order
-        List<String>       roots = new ArrayList<>();
-        Queue<String>      queue = new LinkedList<>();
-
-        for (String node : g.insertionOrder()) {
-            if (inDeg.get(node) == 0) {
-                roots.add(node);
-                queue.offer(node);
-            }
-        }
-
-        List<String> ordered = new ArrayList<>();
-
-        while (!queue.isEmpty()) {
-            String node = queue.poll();
-            ordered.add(node);
-
-            // Sort neighbors for deterministic output (optional — remove if
-            // you prefer pure insertion order for tie-breaking)
-            List<String> neighbors = new ArrayList<>(g.adjacency().get(node));
-            Collections.sort(neighbors);
-
-            for (String neighbor : neighbors) {
-                int newDeg = inDeg.merge(neighbor, -1, Integer::sum);
-                if (newDeg == 0) {
-                    queue.offer(neighbor);
-                }
-            }
-        }
-
-        boolean        hasCycle = ordered.size() < g.insertionOrder().size();
-        List<List<String>> cycles  = hasCycle ? detectCycles(g.adjacency()) : List.of();
-
-        return new GraphOrderResult(ordered, roots, hasCycle, cycles);
-    }
-
-    // ------------------------------------------------------- cycle detection
-
-    /**
-     * DFS-based cycle detection. Returns every cycle found as a list
-     * of node names forming a closed path (last element == first element).
-     */
-    private List<List<String>> detectCycles(Map<String, List<String>> adjacency) {
-        List<List<String>> allCycles  = new ArrayList<>();
-        Set<String>        visited    = new HashSet<>();
-        Set<String>        inStack    = new LinkedHashSet<>(); // ordered for path reconstruction
-
-        for (String node : adjacency.keySet()) {
-            if (!visited.contains(node)) {
-                dfs(node, adjacency, visited, inStack, allCycles);
-            }
-        }
-        return allCycles;
-    }
-
-    private void dfs(
-            String node,
-            Map<String, List<String>> adjacency,
-            Set<String>               visited,
-            Set<String>               inStack,         // LinkedHashSet = ordered
-            List<List<String>>        allCycles
-    ) {
-        visited.add(node);
-        inStack.add(node);
+        ordered.addAll(bySource.getOrDefault(node, List.of()));
 
         for (String neighbor : adjacency.getOrDefault(node, List.of())) {
             if (!visited.contains(neighbor)) {
-                dfs(neighbor, adjacency, visited, inStack, allCycles);
-            } else if (inStack.contains(neighbor)) {
-                // Found a back-edge → extract cycle path
-                List<String> cyclePath = extractCycle(inStack, neighbor);
-                allCycles.add(cyclePath);
+                queue.offer(neighbor);
+                depthMap.merge(neighbor,
+                        depthMap.getOrDefault(node, 0) + 1, Math::max);
             }
         }
-        inStack.remove(node);
     }
 
-    /** Extracts the cycle sub-path from the current DFS stack. */
-    private List<String> extractCycle(Set<String> inStack, String cycleStart) {
-        List<String> path      = new ArrayList<>(inStack); // insertion-ordered
-        int          startIdx  = path.indexOf(cycleStart);
-        List<String> cycle     = new ArrayList<>(path.subList(startIdx, path.size()));
-        cycle.add(cycleStart); // close the loop
-        return cycle;
-    }
+    int maxDepth = depthMap.values().stream()
+            .mapToInt(Integer::intValue).max().orElse(0);
+
+    return new BranchResult(root, ordered, maxDepth, false);
 }
 
-// ------------------------------------------------------------------ demo
-
-public class GraphOrdering {
-
-    public static void main(String[] args) {
-        GraphOrderingService service = new GraphOrderingService();
-
-        System.out.println("=".repeat(60));
-        System.out.println("  SCENARIO 1 — Single root, linear chain");
-        System.out.println("=".repeat(60));
-        runScenario(service, List.of(
-                new Relation("A", "B"),
-                new Relation("B", "C"),
-                new Relation("C", "D")
-        ));
-
-        System.out.println("\n" + "=".repeat(60));
-        System.out.println("  SCENARIO 2 — Multiple roots, diamond dependency");
-        System.out.println("=".repeat(60));
-        // Root1 → C, Root2 → C, C → D  (two independent roots feeding same node)
-        runScenario(service, List.of(
-                new Relation("Root1", "C"),
-                new Relation("Root2", "C"),
-                new Relation("C",     "D"),
-                new Relation("Root3", "E")   // third isolated root
-        ));
-
-        System.out.println("\n" + "=".repeat(60));
-        System.out.println("  SCENARIO 3 — Cycle present (B→C→D→B)");
-        System.out.println("=".repeat(60));
-        runScenario(service, List.of(
-                new Relation("A", "B"),
-                new Relation("B", "C"),
-                new Relation("C", "D"),
-                new Relation("D", "B")   // cycle: B→C→D→B
-        ));
-
-        System.out.println("\n" + "=".repeat(60));
-        System.out.println("  SCENARIO 4 — No roots at all (pure cycle)");
-        System.out.println("=".repeat(60));
-        runScenario(service, List.of(
-                new Relation("X", "Y"),
-                new Relation("Y", "Z"),
-                new Relation("Z", "X")
-        ));
-
-        System.out.println("\n" + "=".repeat(60));
-        System.out.println("  SCENARIO 5 — Complex: multiple roots + cycle + fan-out");
-        System.out.println("=".repeat(60));
-        runScenario(service, List.of(
-                new Relation("R1", "M"),
-                new Relation("R2", "M"),
-                new Relation("M",  "N"),
-                new Relation("M",  "O"),
-                new Relation("N",  "P"),
-                new Relation("O",  "P"),
-                new Relation("P",  "N")   // cycle: N→P→N
-        ));
-    }
-
-    private static void runScenario(GraphOrderingService service, List<Relation> relations) {
-        System.out.println("\nRelations:");
-        relations.forEach(r -> System.out.println("  " + r));
-
-        GraphOrderResult result = service.orderRelations(relations);
-
-        System.out.println("\nRoot nodes (" + result.rootNodes().size() + " detected): "
-                + result.rootNodes());
-
-        System.out.println("Topological order: " + result.orderedNodes());
-
-        if (result.hasCycle()) {
-            System.out.println("⚠ CYCLE(S) DETECTED — nodes excluded from order:");
-            result.cycles().forEach(c -> System.out.println("  Cycle: " + c));
-        } else {
-            System.out.println("✓ No cycles detected.");
-        }
-    }
-}
