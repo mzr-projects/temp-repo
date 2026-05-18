@@ -1,0 +1,172 @@
+import java.util.*;
+import java.util.stream.Collectors;
+
+enum StepType { SIREN, NEBULA }
+
+record Relation(String source, String target) {}
+
+class PipelineStep {
+    StepType stepType;
+    List<Relation> relations;
+    PipelineStep(StepType stepType, List<Relation> relations) {
+        this.stepType = stepType;
+        this.relations = relations;
+    }
+}
+
+enum EdgeKind { MAIN, CHILD }
+
+record Classified(Relation relation, EdgeKind kind, int branchId) {}
+
+public class BranchDetector {
+
+    public static List<Classified> orderAndClassify(PipelineStep step) {
+        // Build graph
+        Map<String, List<String>> out = new HashMap<>();
+        Map<String, Integer> inDeg = new HashMap<>();
+        Set<String> nodes = new HashSet<>();
+
+        for (Relation r : step.relations) {
+            nodes.add(r.source());
+            nodes.add(r.target());
+            out.computeIfAbsent(r.source(), k -> new ArrayList<>()).add(r.target());
+            inDeg.put(r.target(), inDeg.getOrDefault(r.target(), 0) + 1);
+            inDeg.putIfAbsent(r.source(), inDeg.getOrDefault(r.source(), 0));
+        }
+        for (var e : out.entrySet()) e.getValue().sort(Comparator.naturalOrder());
+
+        List<String> roots = nodes.stream()
+                .filter(n -> inDeg.getOrDefault(n, 0) == 0)
+                .sorted()
+                .collect(Collectors.toList());
+        if (roots.isEmpty() && !nodes.isEmpty()) {
+            // Cycle-only graph: pick a deterministic start
+            roots = List.of(nodes.stream().sorted().findFirst().orElseThrow());
+        }
+
+        // Choose main path (longest from any root; tie-break by out-degree then lexicographic)
+        List<String> mainPath = chooseLongestPath(roots, out);
+
+        Set<String> onMain = new HashSet<>(mainPath);
+        Set<String> mainEdges = new HashSet<>();
+        for (int i = 0; i + 1 < mainPath.size(); i++) {
+            mainEdges.add(mainPath.get(i) + "->" + mainPath.get(i + 1));
+        }
+
+        // Order + classify
+        List<Classified> result = new ArrayList<>();
+        Map<String, Relation> edgeToRel = new HashMap<>();
+        for (Relation r : step.relations) edgeToRel.put(r.source() + "->" + r.target(), r);
+
+        // 1) Main edges in order
+        for (int i = 0; i + 1 < mainPath.size(); i++) {
+            String a = mainPath.get(i), b = mainPath.get(i + 1);
+            Relation rel = edgeToRel.get(a + "->" + b);
+            if (rel != null) result.add(new Classified(rel, EdgeKind.MAIN, 0));
+        }
+
+        // 2) Child branches: DFS from each divergence, numbered in encounter order
+        int branchId = 1;
+        Set<String> visitedEdges = new HashSet<>(mainEdges);
+
+        for (int i = 0; i < mainPath.size(); i++) {
+            String u = mainPath.get(i);
+            for (String v : out.getOrDefault(u, List.of())) {
+                String key = u + "->" + v;
+                if (visitedEdges.contains(key)) continue;
+
+                // Start a new child branch
+                dfsEdge(u, v, out, edgeToRel, visitedEdges, result, branchId, onMain);
+                branchId++;
+            }
+        }
+
+        // 3) Any remaining disconnected components (not reachable from main roots)
+        for (Relation r : step.relations) {
+            String key = r.source() + "->" + r.target();
+            if (!visitedEdges.contains(key)) {
+                dfsEdge(r.source(), r.target(), out, edgeToRel, visitedEdges, result, branchId, onMain);
+                branchId++;
+            }
+        }
+
+        return result;
+    }
+
+    private static void dfsEdge(
+            String u, String v,
+            Map<String, List<String>> out,
+            Map<String, Relation> edgeToRel,
+            Set<String> visitedEdges,
+            List<Classified> result,
+            int branchId,
+            Set<String> onMain
+    ) {
+        Deque<String[]> stack = new ArrayDeque<>();
+        stack.push(new String[]{u, v});
+
+        while (!stack.isEmpty()) {
+            String[] e = stack.pop();
+            String a = e[0], b = e[1];
+            String key = a + "->" + b;
+            if (!visitedEdges.add(key)) continue;
+
+            Relation rel = edgeToRel.get(key);
+            if (rel != null) result.add(new Classified(rel, EdgeKind.CHILD, branchId));
+
+            // If it rejoins main, stop (optional; remove this if you want full traversal)
+            if (onMain.contains(b)) continue;
+
+            List<String> next = out.getOrDefault(b, List.of());
+            // push in reverse for natural-order DFS output
+            for (int i = next.size() - 1; i >= 0; i--) {
+                stack.push(new String[]{b, next.get(i)});
+            }
+        }
+    }
+
+    // Longest path in a general graph is hard; this heuristic works well for DAG-ish pipelines.
+    // It does DFS with memoization assuming few/no cycles; cycles are cut deterministically.
+    private static List<String> chooseLongestPath(List<String> roots, Map<String, List<String>> out) {
+        Map<String, List<String>> memo = new HashMap<>();
+        Set<String> inStack = new HashSet<>();
+
+        Comparator<List<String>> better = (p1, p2) -> {
+            if (p1.size() != p2.size()) return Integer.compare(p2.size(), p1.size());
+            int d1 = out.getOrDefault(p1.get(0), List.of()).size();
+            int d2 = out.getOrDefault(p2.get(0), List.of()).size();
+            if (d1 != d2) return Integer.compare(d2, d1);
+            return String.join("\u0000", p1).compareTo(String.join("\u0000", p2));
+        };
+
+        List<String> best = List.of();
+        for (String r : roots) {
+            List<String> cand = longestFrom(r, out, memo, inStack);
+            if (best.isEmpty() || better.compare(cand, best) < 0) best = cand;
+        }
+        return best.isEmpty() ? roots : best;
+    }
+
+    private static List<String> longestFrom(
+            String u,
+            Map<String, List<String>> out,
+            Map<String, List<String>> memo,
+            Set<String> inStack
+    ) {
+        if (memo.containsKey(u)) return memo.get(u);
+        if (!inStack.add(u)) return List.of(u); // cycle cut
+
+        List<String> best = List.of(u);
+        for (String v : out.getOrDefault(u, List.of())) {
+            List<String> tail = longestFrom(v, out, memo, inStack);
+            List<String> cand = new ArrayList<>();
+            cand.add(u);
+            cand.addAll(tail);
+            if (cand.size() > best.size()) best = cand;
+        }
+
+        inStack.remove(u);
+        memo.put(u, best);
+        return best;
+    }
+}
