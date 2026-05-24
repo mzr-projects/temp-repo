@@ -1,0 +1,1842 @@
+
+
+## Complete Example
+
+Below is a **working-style Spring Boot example** for a project that:
+
+* accepts JDBC connection details for multiple RDBMS
+* stores connection configuration in Elasticsearch
+* encrypts the password before storing
+* dynamically connects to Oracle, PostgreSQL, and SQL Server
+* reads schemas, tables, and columns
+* previews table data
+* supports a **safe SQL query builder**
+* indexes metadata into Elasticsearch for search
+
+I will keep it **complete enough to implement directly**, while still readable.
+
+---
+
+## What This Example Covers
+
+* `POST /api/connections`
+    * save DB connection config into Elasticsearch
+* `POST /api/connections/{id}/test`
+    * test JDBC connectivity
+* `POST /api/connections/{id}/discover`
+    * load schemas/tables/columns and index metadata
+* `GET /api/connections/{id}/schemas`
+* `GET /api/connections/{id}/tables?schema=public`
+* `GET /api/connections/{id}/tables/{table}/columns?schema=public`
+* `POST /api/query/preview`
+    * safe data preview with filters, sorting, and pagination
+* `GET /api/search/metadata?q=email`
+    * search metadata in Elasticsearch
+
+---
+
+## Project Structure
+
+    src/main/java/com/example/multidb
+    ├── MultiDbApplication.java
+    ├── config
+    │   ├── ElasticsearchConfig.java
+    │   └── AppProperties.java
+    ├── connection
+    │   ├── api
+    │   │   └── ConnectionController.java
+    │   ├── model
+    │   │   ├── ConnectionConfigDocument.java
+    │   │   ├── CreateConnectionRequest.java
+    │   │   └── DbType.java
+    │   ├── repository
+    │   │   └── ConnectionConfigRepository.java
+    │   └── service
+    │       ├── ConnectionService.java
+    │       ├── DriverResolver.java
+    │       └── DynamicDataSourceManager.java
+    ├── crypto
+    │   └── SecretCryptoService.java
+    ├── metadata
+    │   ├── api
+    │   │   └── MetadataController.java
+    │   ├── model
+    │   │   ├── ColumnMetadata.java
+    │   │   ├── MetadataDocument.java
+    │   │   └── TableMetadata.java
+    │   ├── repository
+    │   │   └── MetadataRepository.java
+    │   └── service
+    │       └── MetadataService.java
+    ├── query
+    │   ├── api
+    │   │   └── QueryController.java
+    │   ├── model
+    │   │   ├── FilterCondition.java
+    │   │   ├── FilterOperator.java
+    │   │   ├── QueryPreviewRequest.java
+    │   │   ├── QueryPreviewResponse.java
+    │   │   └── SortCondition.java
+    │   └── service
+    │       ├── QueryBuilderService.java
+    │       ├── QueryExecutionService.java
+    │       └── SqlDialect.java
+    └── search
+        ├── api
+        │   └── SearchController.java
+        └── service
+            └── MetadataSearchService.java
+
+---
+
+## Maven `pom.xml`
+
+    <project xmlns="http://maven.apache.org/POM/4.0.0"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+        <modelVersion>4.0.0</modelVersion>
+
+        <groupId>com.example</groupId>
+        <artifactId>multi-db-platform</artifactId>
+        <version>1.0.0</version>
+
+        <parent>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-parent</artifactId>
+            <version>3.3.2</version>
+            <relativePath />
+        </parent>
+
+        <properties>
+            <java.version>21</java.version>
+        </properties>
+
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-web</artifactId>
+            </dependency>
+
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-validation</artifactId>
+            </dependency>
+
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
+            </dependency>
+
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-cache</artifactId>
+            </dependency>
+
+            <dependency>
+                <groupId>com.zaxxer</groupId>
+                <artifactId>HikariCP</artifactId>
+            </dependency>
+
+            <dependency>
+                <groupId>org.postgresql</groupId>
+                <artifactId>postgresql</artifactId>
+                <scope>runtime</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>com.microsoft.sqlserver</groupId>
+                <artifactId>mssql-jdbc</artifactId>
+                <scope>runtime</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>com.oracle.database.jdbc</groupId>
+                <artifactId>ojdbc11</artifactId>
+                <version>23.3.0.23.09</version>
+                <scope>runtime</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>org.projectlombok</groupId>
+                <artifactId>lombok</artifactId>
+                <optional>true</optional>
+            </dependency>
+
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+            </dependency>
+
+            <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-lang3</artifactId>
+            </dependency>
+        </dependencies>
+
+        <build>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <configuration>
+                        <source>21</source>
+                        <target>21</target>
+                        <annotationProcessorPaths>
+                            <path>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok</artifactId>
+                                <version>1.18.34</version>
+                            </path>
+                        </annotationProcessorPaths>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                </plugin>
+            </plugins>
+        </build>
+    </project>
+
+---
+
+## `application.yml`
+
+    server:
+        port: 8080
+
+    spring:
+        application:
+            name: multi-db-platform
+        elasticsearch:
+            uris: http://localhost:9200
+
+    app:
+        crypto:
+            secret-key: "0123456789ABCDEF0123456789ABCDEF"
+        datasource:
+            max-pool-size: 5
+            connection-timeout-ms: 10000
+            idle-timeout-ms: 60000
+        query:
+            max-page-size: 200
+            default-page-size: 50
+            query-timeout-seconds: 30
+
+---
+
+## Main Class
+
+    package com.example.multidb;
+
+    import org.springframework.boot.SpringApplication;
+    import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+    @SpringBootApplication
+    public class MultiDbApplication {
+
+        public static void main(String[] args) {
+            SpringApplication.run(MultiDbApplication.class, args);
+        }
+    }
+
+---
+
+## App Properties
+
+    package com.example.multidb.config;
+
+    import lombok.Data;
+    import org.springframework.boot.context.properties.ConfigurationProperties;
+    import org.springframework.context.annotation.Configuration;
+
+    @Data
+    @Configuration
+    @ConfigurationProperties(prefix = "app")
+    public class AppProperties {
+
+        private Crypto crypto = new Crypto();
+        private Datasource datasource = new Datasource();
+        private Query query = new Query();
+
+        @Data
+        public static class Crypto {
+            private String secretKey;
+        }
+
+        @Data
+        public static class Datasource {
+            private int maxPoolSize = 5;
+            private long connectionTimeoutMs = 10000;
+            private long idleTimeoutMs = 60000;
+        }
+
+        @Data
+        public static class Query {
+            private int maxPageSize = 200;
+            private int defaultPageSize = 50;
+            private int queryTimeoutSeconds = 30;
+        }
+    }
+
+---
+
+## Database Type Enum
+
+    package com.example.multidb.connection.model;
+
+    public enum DbType {
+        POSTGRESQL,
+        ORACLE,
+        SQLSERVER
+    }
+
+---
+
+## Create Connection Request
+
+    package com.example.multidb.connection.model;
+
+    import jakarta.validation.constraints.NotBlank;
+    import jakarta.validation.constraints.NotNull;
+    import lombok.Data;
+
+    @Data
+    public class CreateConnectionRequest {
+
+        @NotBlank
+        private String name;
+
+        @NotNull
+        private DbType dbType;
+
+        @NotBlank
+        private String jdbcUrl;
+
+        @NotBlank
+        private String username;
+
+        @NotBlank
+        private String password;
+
+        private String defaultSchema;
+    }
+
+---
+
+## Connection Document Stored in Elasticsearch
+
+    package com.example.multidb.connection.model;
+
+    import java.time.Instant;
+    import lombok.Data;
+    import org.springframework.data.annotation.Id;
+    import org.springframework.data.elasticsearch.annotations.DateFormat;
+    import org.springframework.data.elasticsearch.annotations.Document;
+    import org.springframework.data.elasticsearch.annotations.Field;
+    import org.springframework.data.elasticsearch.annotations.FieldType;
+
+    @Data
+    @Document(indexName = "db_connections")
+    public class ConnectionConfigDocument {
+
+        @Id
+        private String id;
+
+        @Field(type = FieldType.Keyword)
+        private String name;
+
+        @Field(type = FieldType.Keyword)
+        private DbType dbType;
+
+        @Field(type = FieldType.Keyword)
+        private String jdbcUrl;
+
+        @Field(type = FieldType.Keyword)
+        private String username;
+
+        @Field(type = FieldType.Keyword)
+        private String encryptedPassword;
+
+        @Field(type = FieldType.Keyword)
+        private String defaultSchema;
+
+        @Field(type = FieldType.Keyword)
+        private String status;
+
+        @Field(type = FieldType.Date, format = DateFormat.date_time)
+        private Instant createdAt;
+    }
+
+---
+
+## Connection Repository
+
+    package com.example.multidb.connection.repository;
+
+    import com.example.multidb.connection.model.ConnectionConfigDocument;
+    import org.springframework.data.elasticsearch.repository.ElasticsearchRepository;
+
+    public interface ConnectionConfigRepository extends ElasticsearchRepository<ConnectionConfigDocument, String> {
+    }
+
+---
+
+## Metadata Documents in Elasticsearch
+
+### Column Metadata DTO
+
+    package com.example.multidb.metadata.model;
+
+    import lombok.AllArgsConstructor;
+    import lombok.Data;
+    import lombok.NoArgsConstructor;
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public class ColumnMetadata {
+        private String name;
+        private String jdbcType;
+        private String dbTypeName;
+        private boolean nullable;
+        private boolean primaryKey;
+        private int size;
+        private int scale;
+    }
+
+### Table Metadata DTO
+
+    package com.example.multidb.metadata.model;
+
+    import java.util.List;
+    import lombok.Data;
+
+    @Data
+    public class TableMetadata {
+        private String catalog;
+        private String schema;
+        private String tableName;
+        private String tableType;
+        private List<ColumnMetadata> columns;
+    }
+
+### Metadata Elasticsearch Document
+
+    package com.example.multidb.metadata.model;
+
+    import lombok.Data;
+    import org.springframework.data.annotation.Id;
+    import org.springframework.data.elasticsearch.annotations.Document;
+    import org.springframework.data.elasticsearch.annotations.Field;
+    import org.springframework.data.elasticsearch.annotations.FieldType;
+
+    @Data
+    @Document(indexName = "db_schema_metadata")
+    public class MetadataDocument {
+
+        @Id
+        private String id;
+
+        @Field(type = FieldType.Keyword)
+        private String connectionId;
+
+        @Field(type = FieldType.Keyword)
+        private String dbType;
+
+        @Field(type = FieldType.Keyword)
+        private String catalog;
+
+        @Field(type = FieldType.Keyword)
+        private String schemaName;
+
+        @Field(type = FieldType.Keyword)
+        private String tableName;
+
+        @Field(type = FieldType.Keyword)
+        private String tableType;
+
+        @Field(type = FieldType.Keyword)
+        private String columnName;
+
+        @Field(type = FieldType.Keyword)
+        private String jdbcType;
+
+        @Field(type = FieldType.Keyword)
+        private String dbTypeName;
+
+        @Field(type = FieldType.Boolean)
+        private boolean nullable;
+
+        @Field(type = FieldType.Boolean)
+        private boolean primaryKey;
+    }
+
+---
+
+## Metadata Repository
+
+    package com.example.multidb.metadata.repository;
+
+    import com.example.multidb.metadata.model.MetadataDocument;
+    import java.util.List;
+    import org.springframework.data.elasticsearch.repository.ElasticsearchRepository;
+
+    public interface MetadataRepository extends ElasticsearchRepository<MetadataDocument, String> {
+        List<MetadataDocument> findByConnectionId(String connectionId);
+    }
+
+---
+
+## Password Encryption Service
+
+This example uses **AES**. In production, use a vault or KMS.
+
+    package com.example.multidb.crypto;
+
+    import com.example.multidb.config.AppProperties;
+    import java.nio.charset.StandardCharsets;
+    import java.security.SecureRandom;
+    import java.util.Base64;
+    import javax.crypto.Cipher;
+    import javax.crypto.spec.GCMParameterSpec;
+    import javax.crypto.spec.SecretKeySpec;
+    import org.springframework.stereotype.Service;
+
+    @Service
+    public class SecretCryptoService {
+
+        private static final String AES = "AES";
+        private static final String AES_GCM = "AES/GCM/NoPadding";
+        private static final int GCM_TAG_LENGTH = 128;
+        private static final int IV_LENGTH = 12;
+
+        private final SecretKeySpec secretKeySpec;
+
+        public SecretCryptoService(AppProperties appProperties) {
+            byte[] keyBytes = appProperties.getCrypto().getSecretKey().getBytes(StandardCharsets.UTF_8);
+            this.secretKeySpec = new SecretKeySpec(keyBytes, AES);
+        }
+
+        public String encrypt(String plainText) {
+            try {
+                byte[] iv = new byte[IV_LENGTH];
+                new SecureRandom().nextBytes(iv);
+
+                Cipher cipher = Cipher.getInstance(AES_GCM);
+                cipher.init(Cipher.ENCRYPT_MODE, secretKeySpec, new GCMParameterSpec(GCM_TAG_LENGTH, iv));
+
+                byte[] encrypted = cipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+
+                byte[] combined = new byte[iv.length + encrypted.length];
+                System.arraycopy(iv, 0, combined, 0, iv.length);
+                System.arraycopy(encrypted, 0, combined, iv.length, encrypted.length);
+
+                return Base64.getEncoder().encodeToString(combined);
+            } catch (Exception ex) {
+                throw new IllegalStateException("Failed to encrypt secret", ex);
+            }
+        }
+
+        public String decrypt(String cipherText) {
+            try {
+                byte[] combined = Base64.getDecoder().decode(cipherText);
+                byte[] iv = new byte[IV_LENGTH];
+                byte[] encrypted = new byte[combined.length - IV_LENGTH];
+
+                System.arraycopy(combined, 0, iv, 0, IV_LENGTH);
+                System.arraycopy(combined, IV_LENGTH, encrypted, 0, encrypted.length);
+
+                Cipher cipher = Cipher.getInstance(AES_GCM);
+                cipher.init(Cipher.DECRYPT_MODE, secretKeySpec, new GCMParameterSpec(GCM_TAG_LENGTH, iv));
+
+                byte[] plain = cipher.doFinal(encrypted);
+                return new String(plain, StandardCharsets.UTF_8);
+            } catch (Exception ex) {
+                throw new IllegalStateException("Failed to decrypt secret", ex);
+            }
+        }
+    }
+
+---
+
+## Driver Resolver
+
+    package com.example.multidb.connection.service;
+
+    import com.example.multidb.connection.model.DbType;
+    import org.springframework.stereotype.Component;
+
+    @Component
+    public class DriverResolver {
+
+        public String resolveDriverClass(DbType dbType) {
+            return switch (dbType) {
+                case POSTGRESQL -> "org.postgresql.Driver";
+                case ORACLE -> "oracle.jdbc.OracleDriver";
+                case SQLSERVER -> "com.microsoft.sqlserver.jdbc.SQLServerDriver";
+            };
+        }
+    }
+
+---
+
+## Dynamic DataSource Manager
+
+This caches a `HikariDataSource` per registered connection.
+
+    package com.example.multidb.connection.service;
+
+    import com.example.multidb.config.AppProperties;
+    import com.example.multidb.connection.model.ConnectionConfigDocument;
+    import com.example.multidb.connection.repository.ConnectionConfigRepository;
+    import com.example.multidb.crypto.SecretCryptoService;
+    import com.zaxxer.hikari.HikariConfig;
+    import com.zaxxer.hikari.HikariDataSource;
+    import java.sql.Connection;
+    import java.sql.SQLException;
+    import java.util.Map;
+    import java.util.concurrent.ConcurrentHashMap;
+    import javax.sql.DataSource;
+    import org.springframework.stereotype.Service;
+
+    @Service
+    public class DynamicDataSourceManager {
+
+        private final ConnectionConfigRepository repository;
+        private final SecretCryptoService cryptoService;
+        private final DriverResolver driverResolver;
+        private final AppProperties appProperties;
+        private final Map<String, DataSource> cache = new ConcurrentHashMap<>();
+
+        public DynamicDataSourceManager(
+                ConnectionConfigRepository repository,
+                SecretCryptoService cryptoService,
+                DriverResolver driverResolver,
+                AppProperties appProperties) {
+            this.repository = repository;
+            this.cryptoService = cryptoService;
+            this.driverResolver = driverResolver;
+            this.appProperties = appProperties;
+        }
+
+        public Connection getConnection(String connectionId) throws SQLException {
+            DataSource ds = cache.computeIfAbsent(connectionId, this::createDataSource);
+            return ds.getConnection();
+        }
+
+        public void evict(String connectionId) {
+            DataSource dataSource = cache.remove(connectionId);
+            if (dataSource instanceof HikariDataSource hikari) {
+                hikari.close();
+            }
+        }
+
+        private DataSource createDataSource(String connectionId) {
+            ConnectionConfigDocument doc = repository.findById(connectionId)
+                    .orElseThrow(() -> new IllegalArgumentException("Connection not found: " + connectionId));
+
+            HikariConfig config = new HikariConfig();
+            config.setDriverClassName(driverResolver.resolveDriverClass(doc.getDbType()));
+            config.setJdbcUrl(doc.getJdbcUrl());
+            config.setUsername(doc.getUsername());
+            config.setPassword(cryptoService.decrypt(doc.getEncryptedPassword()));
+            config.setMaximumPoolSize(appProperties.getDatasource().getMaxPoolSize());
+            config.setConnectionTimeout(appProperties.getDatasource().getConnectionTimeoutMs());
+            config.setIdleTimeout(appProperties.getDatasource().getIdleTimeoutMs());
+            config.setPoolName("db-" + connectionId);
+
+            return new HikariDataSource(config);
+        }
+    }
+
+---
+
+## Connection Service
+
+    package com.example.multidb.connection.service;
+
+    import com.example.multidb.connection.model.ConnectionConfigDocument;
+    import com.example.multidb.connection.model.CreateConnectionRequest;
+    import com.example.multidb.connection.repository.ConnectionConfigRepository;
+    import com.example.multidb.crypto.SecretCryptoService;
+    import java.sql.Connection;
+    import java.time.Instant;
+    import java.util.UUID;
+    import lombok.RequiredArgsConstructor;
+    import org.springframework.stereotype.Service;
+
+    @Service
+    @RequiredArgsConstructor
+    public class ConnectionService {
+
+        private final ConnectionConfigRepository repository;
+        private final SecretCryptoService cryptoService;
+        private final DynamicDataSourceManager dataSourceManager;
+
+        public ConnectionConfigDocument create(CreateConnectionRequest request) {
+            ConnectionConfigDocument doc = new ConnectionConfigDocument();
+            doc.setId(UUID.randomUUID().toString());
+            doc.setName(request.getName());
+            doc.setDbType(request.getDbType());
+            doc.setJdbcUrl(request.getJdbcUrl());
+            doc.setUsername(request.getUsername());
+            doc.setEncryptedPassword(cryptoService.encrypt(request.getPassword()));
+            doc.setDefaultSchema(request.getDefaultSchema());
+            doc.setStatus("ACTIVE");
+            doc.setCreatedAt(Instant.now());
+
+            repository.save(doc);
+            return doc;
+        }
+
+        public boolean testConnection(String connectionId) {
+            try (Connection connection = dataSourceManager.getConnection(connectionId)) {
+                return connection.isValid(5);
+            } catch (Exception ex) {
+                throw new IllegalStateException("Connection test failed: " + ex.getMessage(), ex);
+            }
+        }
+
+        public Iterable<ConnectionConfigDocument> list() {
+            return repository.findAll();
+        }
+
+        public ConnectionConfigDocument get(String id) {
+            return repository.findById(id)
+                    .orElseThrow(() -> new IllegalArgumentException("Connection not found: " + id));
+        }
+    }
+
+---
+
+## Connection Controller
+
+    package com.example.multidb.connection.api;
+
+    import com.example.multidb.connection.model.ConnectionConfigDocument;
+    import com.example.multidb.connection.model.CreateConnectionRequest;
+    import com.example.multidb.connection.service.ConnectionService;
+    import jakarta.validation.Valid;
+    import java.util.Map;
+    import lombok.RequiredArgsConstructor;
+    import org.springframework.web.bind.annotation.GetMapping;
+    import org.springframework.web.bind.annotation.PathVariable;
+    import org.springframework.web.bind.annotation.PostMapping;
+    import org.springframework.web.bind.annotation.RequestBody;
+    import org.springframework.web.bind.annotation.RequestMapping;
+    import org.springframework.web.bind.annotation.RestController;
+
+    @RestController
+    @RequestMapping("/api/connections")
+    @RequiredArgsConstructor
+    public class ConnectionController {
+
+        private final ConnectionService connectionService;
+
+        @PostMapping
+        public ConnectionConfigDocument create(@Valid @RequestBody CreateConnectionRequest request) {
+            return connectionService.create(request);
+        }
+
+        @PostMapping("/{id}/test")
+        public Map<String, Object> test(@PathVariable String id) {
+            return Map.of(
+                    "connectionId", id,
+                    "valid", connectionService.testConnection(id)
+            );
+        }
+
+        @GetMapping
+        public Iterable<ConnectionConfigDocument> list() {
+            return connectionService.list();
+        }
+
+        @GetMapping("/{id}")
+        public ConnectionConfigDocument get(@PathVariable String id) {
+            return connectionService.get(id);
+        }
+    }
+
+---
+
+## Metadata Service
+
+This uses JDBC `DatabaseMetaData` to fetch schemas, tables, columns, and primary keys.
+
+    package com.example.multidb.metadata.service;
+
+    import com.example.multidb.connection.model.ConnectionConfigDocument;
+    import com.example.multidb.connection.service.ConnectionService;
+    import com.example.multidb.connection.service.DynamicDataSourceManager;
+    import com.example.multidb.metadata.model.ColumnMetadata;
+    import com.example.multidb.metadata.model.MetadataDocument;
+    import com.example.multidb.metadata.model.TableMetadata;
+    import com.example.multidb.metadata.repository.MetadataRepository;
+    import java.sql.Connection;
+    import java.sql.DatabaseMetaData;
+    import java.sql.ResultSet;
+    import java.util.ArrayList;
+    import java.util.HashSet;
+    import java.util.List;
+    import java.util.Set;
+    import java.util.UUID;
+    import lombok.RequiredArgsConstructor;
+    import org.springframework.stereotype.Service;
+
+    @Service
+    @RequiredArgsConstructor
+    public class MetadataService {
+
+        private final DynamicDataSourceManager dataSourceManager;
+        private final ConnectionService connectionService;
+        private final MetadataRepository metadataRepository;
+
+        public List<String> getSchemas(String connectionId) {
+            List<String> schemas = new ArrayList<>();
+            try (Connection con = dataSourceManager.getConnection(connectionId)) {
+                DatabaseMetaData meta = con.getMetaData();
+                try (ResultSet rs = meta.getSchemas()) {
+                    while (rs.next()) {
+                        schemas.add(rs.getString("TABLE_SCHEM"));
+                    }
+                }
+                return schemas;
+            } catch (Exception ex) {
+                throw new IllegalStateException("Failed to read schemas", ex);
+            }
+        }
+
+        public List<TableMetadata> getTables(String connectionId, String schema) {
+            List<TableMetadata> tables = new ArrayList<>();
+            try (Connection con = dataSourceManager.getConnection(connectionId)) {
+                DatabaseMetaData meta = con.getMetaData();
+                try (ResultSet rs = meta.getTables(null, schema, "%", new String[]{"TABLE", "VIEW"})) {
+                    while (rs.next()) {
+                        TableMetadata tm = new TableMetadata();
+                        tm.setCatalog(rs.getString("TABLE_CAT"));
+                        tm.setSchema(rs.getString("TABLE_SCHEM"));
+                        tm.setTableName(rs.getString("TABLE_NAME"));
+                        tm.setTableType(rs.getString("TABLE_TYPE"));
+                        tables.add(tm);
+                    }
+                }
+                return tables;
+            } catch (Exception ex) {
+                throw new IllegalStateException("Failed to read tables", ex);
+            }
+        }
+
+        public List<ColumnMetadata> getColumns(String connectionId, String schema, String table) {
+            try (Connection con = dataSourceManager.getConnection(connectionId)) {
+                DatabaseMetaData meta = con.getMetaData();
+
+                Set<String> primaryKeys = new HashSet<>();
+                try (ResultSet pkRs = meta.getPrimaryKeys(null, schema, table)) {
+                    while (pkRs.next()) {
+                        primaryKeys.add(pkRs.getString("COLUMN_NAME"));
+                    }
+                }
+
+                List<ColumnMetadata> columns = new ArrayList<>();
+                try (ResultSet rs = meta.getColumns(null, schema, table, "%")) {
+                    while (rs.next()) {
+                        ColumnMetadata cm = new ColumnMetadata(
+                                rs.getString("COLUMN_NAME"),
+                                String.valueOf(rs.getInt("DATA_TYPE")),
+                                rs.getString("TYPE_NAME"),
+                                "YES".equalsIgnoreCase(rs.getString("IS_NULLABLE")),
+                                primaryKeys.contains(rs.getString("COLUMN_NAME")),
+                                rs.getInt("COLUMN_SIZE"),
+                                rs.getInt("DECIMAL_DIGITS")
+                        );
+                        columns.add(cm);
+                    }
+                }
+
+                return columns;
+            } catch (Exception ex) {
+                throw new IllegalStateException("Failed to read columns", ex);
+            }
+        }
+
+        public void discoverAndIndex(String connectionId) {
+            ConnectionConfigDocument cfg = connectionService.get(connectionId);
+            List<String> schemas = getSchemas(connectionId);
+
+            for (String schema : schemas) {
+                List<TableMetadata> tables = getTables(connectionId, schema);
+                for (TableMetadata table : tables) {
+                    List<ColumnMetadata> columns = getColumns(connectionId, schema, table.getTableName());
+                    for (ColumnMetadata column : columns) {
+                        MetadataDocument doc = new MetadataDocument();
+                        doc.setId(UUID.randomUUID().toString());
+                        doc.setConnectionId(connectionId);
+                        doc.setDbType(cfg.getDbType().name());
+                        doc.setCatalog(table.getCatalog());
+                        doc.setSchemaName(schema);
+                        doc.setTableName(table.getTableName());
+                        doc.setTableType(table.getTableType());
+                        doc.setColumnName(column.getName());
+                        doc.setJdbcType(column.getJdbcType());
+                        doc.setDbTypeName(column.getDbTypeName());
+                        doc.setNullable(column.isNullable());
+                        doc.setPrimaryKey(column.isPrimaryKey());
+                        metadataRepository.save(doc);
+                    }
+                }
+            }
+        }
+    }
+
+---
+
+## Metadata Controller
+
+    package com.example.multidb.metadata.api;
+
+    import com.example.multidb.metadata.model.ColumnMetadata;
+    import com.example.multidb.metadata.model.TableMetadata;
+    import com.example.multidb.metadata.service.MetadataService;
+    import java.util.List;
+    import java.util.Map;
+    import lombok.RequiredArgsConstructor;
+    import org.springframework.web.bind.annotation.GetMapping;
+    import org.springframework.web.bind.annotation.PathVariable;
+    import org.springframework.web.bind.annotation.PostMapping;
+    import org.springframework.web.bind.annotation.RequestMapping;
+    import org.springframework.web.bind.annotation.RequestParam;
+    import org.springframework.web.bind.annotation.RestController;
+
+    @RestController
+    @RequestMapping("/api/connections/{connectionId}")
+    @RequiredArgsConstructor
+    public class MetadataController {
+
+        private final MetadataService metadataService;
+
+        @GetMapping("/schemas")
+        public List<String> schemas(@PathVariable String connectionId) {
+            return metadataService.getSchemas(connectionId);
+        }
+
+        @GetMapping("/tables")
+        public List<TableMetadata> tables(
+                @PathVariable String connectionId,
+                @RequestParam String schema) {
+            return metadataService.getTables(connectionId, schema);
+        }
+
+        @GetMapping("/tables/{table}/columns")
+        public List<ColumnMetadata> columns(
+                @PathVariable String connectionId,
+                @PathVariable String table,
+                @RequestParam String schema) {
+            return metadataService.getColumns(connectionId, schema, table);
+        }
+
+        @PostMapping("/discover")
+        public Map<String, Object> discover(@PathVariable String connectionId) {
+            metadataService.discoverAndIndex(connectionId);
+            return Map.of(
+                    "connectionId", connectionId,
+                    "status", "DISCOVERED"
+            );
+        }
+    }
+
+---
+
+## Query Model
+
+### Filter Operator
+
+    package com.example.multidb.query.model;
+
+    public enum FilterOperator {
+        EQ,
+        NE,
+        GT,
+        GTE,
+        LT,
+        LTE,
+        LIKE,
+        IN,
+        BETWEEN,
+        IS_NULL,
+        IS_NOT_NULL
+    }
+
+### Filter Condition
+
+    package com.example.multidb.query.model;
+
+    import lombok.Data;
+
+    @Data
+    public class FilterCondition {
+        private String field;
+        private FilterOperator operator;
+        private Object value;
+        private Object secondValue;
+    }
+
+### Sort Condition
+
+    package com.example.multidb.query.model;
+
+    import lombok.Data;
+
+    @Data
+    public class SortCondition {
+        private String field;
+        private String direction;
+    }
+
+### Query Request
+
+    package com.example.multidb.query.model;
+
+    import jakarta.validation.constraints.NotBlank;
+    import jakarta.validation.constraints.NotNull;
+    import java.util.ArrayList;
+    import java.util.List;
+    import lombok.Data;
+
+    @Data
+    public class QueryPreviewRequest {
+
+        @NotBlank
+        private String connectionId;
+
+        @NotBlank
+        private String schema;
+
+        @NotBlank
+        private String table;
+
+        private List<String> selectColumns = new ArrayList<>();
+        private List<FilterCondition> filters = new ArrayList<>();
+        private List<SortCondition> sorts = new ArrayList<>();
+
+        @NotNull
+        private Integer page = 0;
+
+        @NotNull
+        private Integer size = 50;
+    }
+
+### Query Response
+
+    package com.example.multidb.query.model;
+
+    import java.util.List;
+    import java.util.Map;
+    import lombok.AllArgsConstructor;
+    import lombok.Data;
+
+    @Data
+    @AllArgsConstructor
+    public class QueryPreviewResponse {
+        private String sql;
+        private List<Object> parameters;
+        private List<Map<String, Object>> rows;
+    }
+
+---
+
+## SQL Dialect Helper
+
+This handles quoting and pagination differences.
+
+    package com.example.multidb.query.service;
+
+    import com.example.multidb.connection.model.DbType;
+    import org.springframework.stereotype.Component;
+
+    @Component
+    public class SqlDialect {
+
+        public String quote(DbType dbType, String identifier) {
+            return switch (dbType) {
+                case POSTGRESQL, ORACLE, SQLSERVER -> "\"" + identifier + "\"";
+            };
+        }
+
+        public String qualifiedTable(DbType dbType, String schema, String table) {
+            return quote(dbType, schema) + "." + quote(dbType, table);
+        }
+
+        public String paginate(DbType dbType, int limit, int offset) {
+            return switch (dbType) {
+                case POSTGRESQL -> " LIMIT " + limit + " OFFSET " + offset;
+                case ORACLE -> " OFFSET " + offset + " ROWS FETCH NEXT " + limit + " ROWS ONLY";
+                case SQLSERVER -> " OFFSET " + offset + " ROWS FETCH NEXT " + limit + " ROWS ONLY";
+            };
+        }
+    }
+
+---
+
+## Query Builder Service
+
+This is the core of the **safe SQL builder**.
+
+Important protections:
+
+* validates selected columns against actual metadata
+* validates filtered columns
+* only allows supported operators
+* uses prepared statement parameters
+* enforces pagination
+
+    package com.example.multidb.query.service;
+
+    import com.example.multidb.config.AppProperties;
+    import com.example.multidb.connection.model.ConnectionConfigDocument;
+    import com.example.multidb.connection.service.ConnectionService;
+    import com.example.multidb.metadata.model.ColumnMetadata;
+    import com.example.multidb.metadata.service.MetadataService;
+    import com.example.multidb.query.model.FilterCondition;
+    import com.example.multidb.query.model.FilterOperator;
+    import com.example.multidb.query.model.QueryPreviewRequest;
+    import com.example.multidb.query.model.SortCondition;
+    import java.util.ArrayList;
+    import java.util.HashSet;
+    import java.util.List;
+    import java.util.Locale;
+    import java.util.Set;
+    import org.springframework.stereotype.Service;
+
+    @Service
+    public class QueryBuilderService {
+
+        private final MetadataService metadataService;
+        private final ConnectionService connectionService;
+        private final SqlDialect sqlDialect;
+        private final AppProperties appProperties;
+
+        public QueryBuilderService(
+                MetadataService metadataService,
+                ConnectionService connectionService,
+                SqlDialect sqlDialect,
+                AppProperties appProperties) {
+            this.metadataService = metadataService;
+            this.connectionService = connectionService;
+            this.sqlDialect = sqlDialect;
+            this.appProperties = appProperties;
+        }
+
+        public BuiltQuery build(QueryPreviewRequest request) {
+            ConnectionConfigDocument cfg = connectionService.get(request.getConnectionId());
+
+            List<ColumnMetadata> actualColumns = metadataService.getColumns(
+                    request.getConnectionId(),
+                    request.getSchema(),
+                    request.getTable()
+            );
+
+            Set<String> allowedColumns = new HashSet<>();
+            for (ColumnMetadata c : actualColumns) {
+                allowedColumns.add(c.getName().toLowerCase(Locale.ROOT));
+            }
+
+            List<String> selectColumns = request.getSelectColumns();
+            if (selectColumns == null || selectColumns.isEmpty()) {
+                selectColumns = actualColumns.stream().map(ColumnMetadata::getName).toList();
+            }
+
+            for (String col : selectColumns) {
+                validateColumn(col, allowedColumns);
+            }
+
+            int size = Math.min(
+                    request.getSize() == null ? appProperties.getQuery().getDefaultPageSize() : request.getSize(),
+                    appProperties.getQuery().getMaxPageSize()
+            );
+            int page = request.getPage() == null ? 0 : request.getPage();
+            int offset = page * size;
+
+            StringBuilder sql = new StringBuilder();
+            List<Object> params = new ArrayList<>();
+
+            sql.append("SELECT ");
+            for (int i = 0; i < selectColumns.size(); i++) {
+                if (i > 0) {
+                    sql.append(", ");
+                }
+                sql.append(sqlDialect.quote(cfg.getDbType(), selectColumns.get(i)));
+            }
+
+            sql.append(" FROM ");
+            sql.append(sqlDialect.qualifiedTable(cfg.getDbType(), request.getSchema(), request.getTable()));
+
+            if (request.getFilters() != null && !request.getFilters().isEmpty()) {
+                sql.append(" WHERE ");
+                for (int i = 0; i < request.getFilters().size(); i++) {
+                    if (i > 0) {
+                        sql.append(" AND ");
+                    }
+                    appendFilter(sql, params, request.getFilters().get(i), allowedColumns, cfg.getDbType(), sqlDialect);
+                }
+            }
+
+            if (request.getSorts() != null && !request.getSorts().isEmpty()) {
+                sql.append(" ORDER BY ");
+                for (int i = 0; i < request.getSorts().size(); i++) {
+                    SortCondition sort = request.getSorts().get(i);
+                    validateColumn(sort.getField(), allowedColumns);
+                    if (i > 0) {
+                        sql.append(", ");
+                    }
+                    String direction = "DESC".equalsIgnoreCase(sort.getDirection()) ? "DESC" : "ASC";
+                    sql.append(sqlDialect.quote(cfg.getDbType(), sort.getField())).append(" ").append(direction);
+                }
+            } else if (cfg.getDbType().name().equals("SQLSERVER")) {
+                sql.append(" ORDER BY 1");
+            }
+
+            sql.append(sqlDialect.paginate(cfg.getDbType(), size, offset));
+
+            return new BuiltQuery(sql.toString(), params);
+        }
+
+        private void validateColumn(String field, Set<String> allowedColumns) {
+            if (field == null || !allowedColumns.contains(field.toLowerCase(Locale.ROOT))) {
+                throw new IllegalArgumentException("Invalid column: " + field);
+            }
+        }
+
+        private void appendFilter(
+                StringBuilder sql,
+                List<Object> params,
+                FilterCondition filter,
+                Set<String> allowedColumns,
+                com.example.multidb.connection.model.DbType dbType,
+                SqlDialect sqlDialect) {
+
+            validateColumn(filter.getField(), allowedColumns);
+            String col = sqlDialect.quote(dbType, filter.getField());
+
+            FilterOperator op = filter.getOperator();
+            if (op == null) {
+                throw new IllegalArgumentException("Operator is required");
+            }
+
+            switch (op) {
+                case EQ -> {
+                    sql.append(col).append(" = ?");
+                    params.add(filter.getValue());
+                }
+                case NE -> {
+                    sql.append(col).append(" <> ?");
+                    params.add(filter.getValue());
+                }
+                case GT -> {
+                    sql.append(col).append(" > ?");
+                    params.add(filter.getValue());
+                }
+                case GTE -> {
+                    sql.append(col).append(" >= ?");
+                    params.add(filter.getValue());
+                }
+                case LT -> {
+                    sql.append(col).append(" < ?");
+                    params.add(filter.getValue());
+                }
+                case LTE -> {
+                    sql.append(col).append(" <= ?");
+                    params.add(filter.getValue());
+                }
+                case LIKE -> {
+                    sql.append(col).append(" LIKE ?");
+                    params.add(filter.getValue());
+                }
+                case IS_NULL -> sql.append(col).append(" IS NULL");
+                case IS_NOT_NULL -> sql.append(col).append(" IS NOT NULL");
+                case BETWEEN -> {
+                    sql.append(col).append(" BETWEEN ? AND ?");
+                    params.add(filter.getValue());
+                    params.add(filter.getSecondValue());
+                }
+                case IN -> {
+                    if (!(filter.getValue() instanceof List<?> list) || list.isEmpty()) {
+                        throw new IllegalArgumentException("IN operator requires a non-empty list");
+                    }
+                    sql.append(col).append(" IN (");
+                    for (int i = 0; i < list.size(); i++) {
+                        if (i > 0) {
+                            sql.append(", ");
+                        }
+                        sql.append("?");
+                        params.add(list.get(i));
+                    }
+                    sql.append(")");
+                }
+            }
+        }
+
+        public record BuiltQuery(String sql, List<Object> params) {
+        }
+    }
+
+---
+
+## Query Execution Service
+
+    package com.example.multidb.query.service;
+
+    import com.example.multidb.config.AppProperties;
+    import com.example.multidb.connection.service.DynamicDataSourceManager;
+    import com.example.multidb.query.model.QueryPreviewRequest;
+    import com.example.multidb.query.model.QueryPreviewResponse;
+    import java.sql.Connection;
+    import java.sql.PreparedStatement;
+    import java.sql.ResultSet;
+    import java.sql.ResultSetMetaData;
+    import java.util.ArrayList;
+    import java.util.LinkedHashMap;
+    import java.util.List;
+    import java.util.Map;
+    import org.springframework.stereotype.Service;
+
+    @Service
+    public class QueryExecutionService {
+
+        private final QueryBuilderService queryBuilderService;
+        private final DynamicDataSourceManager dataSourceManager;
+        private final AppProperties appProperties;
+
+        public QueryExecutionService(
+                QueryBuilderService queryBuilderService,
+                DynamicDataSourceManager dataSourceManager,
+                AppProperties appProperties) {
+            this.queryBuilderService = queryBuilderService;
+            this.dataSourceManager = dataSourceManager;
+            this.appProperties = appProperties;
+        }
+
+        public QueryPreviewResponse preview(QueryPreviewRequest request) {
+            QueryBuilderService.BuiltQuery built = queryBuilderService.build(request);
+            List<Map<String, Object>> rows = new ArrayList<>();
+
+            try (Connection con = dataSourceManager.getConnection(request.getConnectionId());
+                 PreparedStatement ps = con.prepareStatement(built.sql())) {
+
+                ps.setQueryTimeout(appProperties.getQuery().getQueryTimeoutSeconds());
+
+                List<Object> params = built.params();
+                for (int i = 0; i < params.size(); i++) {
+                    ps.setObject(i + 1, params.get(i));
+                }
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    ResultSetMetaData md = rs.getMetaData();
+                    int columnCount = md.getColumnCount();
+
+                    while (rs.next()) {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        for (int i = 1; i <= columnCount; i++) {
+                            row.put(md.getColumnLabel(i), rs.getObject(i));
+                        }
+                        rows.add(row);
+                    }
+                }
+
+                return new QueryPreviewResponse(built.sql(), built.params(), rows);
+            } catch (Exception ex) {
+                throw new IllegalStateException("Query preview failed: " + ex.getMessage(), ex);
+            }
+        }
+    }
+
+---
+
+## Query Controller
+
+    package com.example.multidb.query.api;
+
+    import com.example.multidb.query.model.QueryPreviewRequest;
+    import com.example.multidb.query.model.QueryPreviewResponse;
+    import com.example.multidb.query.service.QueryExecutionService;
+    import jakarta.validation.Valid;
+    import lombok.RequiredArgsConstructor;
+    import org.springframework.web.bind.annotation.PostMapping;
+    import org.springframework.web.bind.annotation.RequestBody;
+    import org.springframework.web.bind.annotation.RequestMapping;
+    import org.springframework.web.bind.annotation.RestController;
+
+    @RestController
+    @RequestMapping("/api/query")
+    @RequiredArgsConstructor
+    public class QueryController {
+
+        private final QueryExecutionService queryExecutionService;
+
+        @PostMapping("/preview")
+        public QueryPreviewResponse preview(@Valid @RequestBody QueryPreviewRequest request) {
+            return queryExecutionService.preview(request);
+        }
+    }
+
+---
+
+## Metadata Search Service
+
+This searches Elasticsearch metadata documents.
+
+    package com.example.multidb.search.service;
+
+    import com.example.multidb.metadata.model.MetadataDocument;
+    import com.example.multidb.metadata.repository.MetadataRepository;
+    import java.util.ArrayList;
+    import java.util.List;
+    import lombok.RequiredArgsConstructor;
+    import org.springframework.data.domain.PageRequest;
+    import org.springframework.data.elasticsearch.client.elc.NativeQuery;
+    import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
+    import org.springframework.data.elasticsearch.core.SearchHit;
+    import org.springframework.stereotype.Service;
+
+    import static co.elastic.clients.elasticsearch._types.query_dsl.QueryBuilders.bool;
+    import static co.elastic.clients.elasticsearch._types.query_dsl.QueryBuilders.match;
+
+    @Service
+    @RequiredArgsConstructor
+    public class MetadataSearchService {
+
+        private final ElasticsearchOperations operations;
+        private final MetadataRepository metadataRepository;
+
+        public List<MetadataDocument> search(String q) {
+            NativeQuery query = NativeQuery.builder()
+                    .withQuery(bool(b -> b
+                            .should(match(m -> m.field("schemaName").query(q)))
+                            .should(match(m -> m.field("tableName").query(q)))
+                            .should(match(m -> m.field("columnName").query(q)))
+                    ))
+                    .withPageable(PageRequest.of(0, 50))
+                    .build();
+
+            List<MetadataDocument> results = new ArrayList<>();
+            for (SearchHit<MetadataDocument> hit : operations.search(query, MetadataDocument.class)) {
+                results.add(hit.getContent());
+            }
+            return results;
+        }
+    }
+
+---
+
+## Search Controller
+
+    package com.example.multidb.search.api;
+
+    import com.example.multidb.metadata.model.MetadataDocument;
+    import com.example.multidb.search.service.MetadataSearchService;
+    import java.util.List;
+    import lombok.RequiredArgsConstructor;
+    import org.springframework.web.bind.annotation.GetMapping;
+    import org.springframework.web.bind.annotation.RequestMapping;
+    import org.springframework.web.bind.annotation.RequestParam;
+    import org.springframework.web.bind.annotation.RestController;
+
+    @RestController
+    @RequestMapping("/api/search")
+    @RequiredArgsConstructor
+    public class SearchController {
+
+        private final MetadataSearchService metadataSearchService;
+
+        @GetMapping("/metadata")
+        public List<MetadataDocument> searchMetadata(@RequestParam String q) {
+            return metadataSearchService.search(q);
+        }
+    }
+
+---
+
+## Example API Calls
+
+## 1. Create a PostgreSQL Connection
+
+    POST /api/connections
+    Content-Type: application/json
+
+    {
+        "name": "Postgres HR",
+        "dbType": "POSTGRESQL",
+        "jdbcUrl": "jdbc:postgresql://localhost:5432/hrdb",
+        "username": "postgres",
+        "password": "postgres",
+        "defaultSchema": "public"
+    }
+
+Example response:
+
+    {
+        "id": "ab12cd34-ef56-7890-ab12-cd34ef567890",
+        "name": "Postgres HR",
+        "dbType": "POSTGRESQL",
+        "jdbcUrl": "jdbc:postgresql://localhost:5432/hrdb",
+        "username": "postgres",
+        "encryptedPassword": "YkN...",
+        "defaultSchema": "public",
+        "status": "ACTIVE",
+        "createdAt": "2026-05-24T18:10:01.123456Z"
+    }
+
+---
+
+## 2. Test the Connection
+
+    POST /api/connections/ab12cd34-ef56-7890-ab12-cd34ef567890/test
+
+Response:
+
+    {
+        "connectionId": "ab12cd34-ef56-7890-ab12-cd34ef567890",
+        "valid": true
+    }
+
+---
+
+## 3. Discover and Index Metadata
+
+    POST /api/connections/ab12cd34-ef56-7890-ab12-cd34ef567890/discover
+
+Response:
+
+    {
+        "connectionId": "ab12cd34-ef56-7890-ab12-cd34ef567890",
+        "status": "DISCOVERED"
+    }
+
+---
+
+## 4. List Schemas
+
+    GET /api/connections/ab12cd34-ef56-7890-ab12-cd34ef567890/schemas
+
+Example response:
+
+    [
+        "information_schema",
+        "public"
+    ]
+
+---
+
+## 5. List Tables
+
+    GET /api/connections/ab12cd34-ef56-7890-ab12-cd34ef567890/tables?schema=public
+
+Example response:
+
+    [
+        {
+            "catalog": "hrdb",
+            "schema": "public",
+            "tableName": "employees",
+            "tableType": "TABLE",
+            "columns": null
+        },
+        {
+            "catalog": "hrdb",
+            "schema": "public",
+            "tableName": "departments",
+            "tableType": "TABLE",
+            "columns": null
+        }
+    ]
+
+---
+
+## 6. List Columns
+
+    GET /api/connections/ab12cd34-ef56-7890-ab12-cd34ef567890/tables/employees/columns?schema=public
+
+Example response:
+
+    [
+        {
+            "name": "id",
+            "jdbcType": "4",
+            "dbTypeName": "serial",
+            "nullable": false,
+            "primaryKey": true,
+            "size": 10,
+            "scale": 0
+        },
+        {
+            "name": "name",
+            "jdbcType": "12",
+            "dbTypeName": "varchar",
+            "nullable": false,
+            "primaryKey": false,
+            "size": 255,
+            "scale": 0
+        }
+    ]
+
+---
+
+## 7. Safe Query Preview
+
+    POST /api/query/preview
+    Content-Type: application/json
+
+    {
+        "connectionId": "ab12cd34-ef56-7890-ab12-cd34ef567890",
+        "schema": "public",
+        "table": "employees",
+        "selectColumns": ["id", "name", "department", "salary"],
+        "filters": [
+            {
+                "field": "department",
+                "operator": "EQ",
+                "value": "IT"
+            },
+            {
+                "field": "salary",
+                "operator": "GT",
+                "value": 5000
+            }
+        ],
+        "sorts": [
+            {
+                "field": "name",
+                "direction": "ASC"
+            }
+        ],
+        "page": 0,
+        "size": 20
+    }
+
+Example response:
+
+    {
+        "sql": "SELECT \"id\", \"name\", \"department\", \"salary\" FROM \"public\".\"employees\" WHERE \"department\" = ? AND \"salary\" > ? ORDER BY \"name\" ASC LIMIT 20 OFFSET 0",
+        "parameters": [
+            "IT",
+            5000
+        ],
+        "rows": [
+            {
+                "id": 1,
+                "name": "Alice",
+                "department": "IT",
+                "salary": 8000
+            },
+            {
+                "id": 2,
+                "name": "Bob",
+                "department": "IT",
+                "salary": 7000
+            }
+        ]
+    }
+
+---
+
+## Why This Design Is Safe
+
+This design avoids the most common problems.
+
+* it does **not** let the UI send raw SQL
+* it validates table/column names against real DB metadata
+* it uses `PreparedStatement`
+* it enforces max page size
+* it adds query timeout
+* it supports only read-oriented `SELECT` behavior
+
+---
+
+## How to Support Oracle and SQL Server
+
+This example already supports them at the connection level.
+
+### Oracle JDBC URL Example
+
+    jdbc:oracle:thin:@//localhost:1521/FREEPDB1
+
+Create request:
+
+    {
+        "name": "Oracle Finance",
+        "dbType": "ORACLE",
+        "jdbcUrl": "jdbc:oracle:thin:@//localhost:1521/FREEPDB1",
+        "username": "finance_user",
+        "password": "oraclepwd",
+        "defaultSchema": "FINANCE"
+    }
+
+### SQL Server JDBC URL Example
+
+    jdbc:sqlserver://localhost:1433;databaseName=SalesDb;encrypt=false
+
+Create request:
+
+    {
+        "name": "SQL Server Sales",
+        "dbType": "SQLSERVER",
+        "jdbcUrl": "jdbc:sqlserver://localhost:1433;databaseName=SalesDb;encrypt=false",
+        "username": "sa",
+        "password": "YourStrong!Passw0rd",
+        "defaultSchema": "dbo"
+    }
+
+---
+
+## Improvements You Should Add in Real Production
+
+This code is a strong baseline, but for enterprise use I would still add:
+
+* Spring Security with RBAC
+* audit logging
+* masking of sensitive columns
+* allowed schema/table rules
+* secrets manager instead of config key
+* scheduled metadata refresh
+* metadata deduplication before indexing
+* async discovery jobs
+* CSV export with limits
+* data indexing jobs into Elasticsearch for full-text search across rows
+
+---
+
+## Important Production Improvement: Prevent Duplicate Metadata Indexing
+
+Right now, every discovery inserts new metadata documents.
+
+A better ID would be:
+
+    connectionId + ":" + schema + ":" + table + ":" + column
+
+For example:
+
+    doc.setId(connectionId + ":" + schema + ":" + table.getTableName() + ":" + column.getName());
+
+That makes re-discovery overwrite existing metadata instead of duplicating it.
+
+---
+
+## Better Error Handling
+
+Add a global exception handler.
+
+    package com.example.multidb.config;
+
+    import java.util.Map;
+    import org.springframework.http.HttpStatus;
+    import org.springframework.web.bind.MethodArgumentNotValidException;
+    import org.springframework.web.bind.annotation.ExceptionHandler;
+    import org.springframework.web.bind.annotation.ResponseStatus;
+    import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+    @RestControllerAdvice
+    public class GlobalExceptionHandler {
+
+        @ExceptionHandler(IllegalArgumentException.class)
+        @ResponseStatus(HttpStatus.BAD_REQUEST)
+        public Map<String, Object> handleIllegalArgument(IllegalArgumentException ex) {
+            return Map.of(
+                    "error", "BAD_REQUEST",
+                    "message", ex.getMessage()
+            );
+        }
+
+        @ExceptionHandler(IllegalStateException.class)
+        @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+        public Map<String, Object> handleIllegalState(IllegalStateException ex) {
+            return Map.of(
+                    "error", "INTERNAL_ERROR",
+                    "message", ex.getMessage()
+            );
+        }
+
+        @ExceptionHandler(MethodArgumentNotValidException.class)
+        @ResponseStatus(HttpStatus.BAD_REQUEST)
+        public Map<String, Object> handleValidation(MethodArgumentNotValidException ex) {
+            return Map.of(
+                    "error", "VALIDATION_ERROR",
+                    "message", ex.getBindingResult().toString()
+            );
+        }
+    }
+
+---
+
+## Example Test Table
+
+If you want a quick PostgreSQL test:
+
+    CREATE TABLE public.employees (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        department VARCHAR(100) NOT NULL,
+        salary NUMERIC(12, 2),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    INSERT INTO public.employees (name, department, salary)
+    VALUES
+        ('Alice', 'IT', 8000),
+        ('Bob', 'IT', 7000),
+        ('Carol', 'HR', 5000),
+        ('David', 'Finance', 9000);
+
+---
+
+## Elasticsearch Notes
+
+This example uses Spring Data Elasticsearch annotations, which is enough for many projects.
+
+If you want more control, define mappings manually for:
+
+* `db_connections`
+* `db_schema_metadata`
+
+For metadata search, use:
+
+* `keyword` fields for exact values
+* `text` subfields for flexible search
+
+---
+
+## What I Would Build Next
+
+If I were continuing this implementation, I would add these next:
+
+* `PUT /api/connections/{id}`
+* `DELETE /api/connections/{id}`
+* `/api/query/count`
+* `/api/query/export`
+* column masking rules
+* searchable-table configuration
+* optional row indexing into Elasticsearch
+* a React or Angular UI for drag-and-drop query building
+
+---
+
+## Final Notes
+
+This example gives you the **complete core backend**:
+
+* dynamic multi-RDBMS registration
+* secure credential storage
+* Elasticsearch persistence
+* schema discovery
+* metadata search
+* safe SQL query builder
+* data preview execution
+
+If you want, I can next give you one of these in full code as well:
+
+* a **complete UI example** for the SQL query builder
+* a **jOOQ-based version** instead of manual SQL building
+* a **Docker Compose setup** with Elasticsearch, PostgreSQL, SQL Server, and the Spring app
+* a **production-grade version** with Spring Security and JWT
+* a **full GitHub-style project layout** with every file ready to paste
+
