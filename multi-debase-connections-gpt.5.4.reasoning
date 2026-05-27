@@ -1,0 +1,2024 @@
+
+
+## Production-ready solution
+
+Below is a **complete, production-oriented Java project design** for a **Universal Data Connection Registry and Query Service**.
+
+It does all of this:
+
+* Accepts connection details for multiple source types:
+    * **RDBMS**: PostgreSQL, MySQL, SQL Server, Oracle, etc. via JDBC
+    * **Document DB**: MongoDB
+    * **Key/Value**: Redis
+* Stores the connection metadata in an **Elasticsearch index**
+* Encrypts sensitive credentials before storage
+* Lets users:
+    * register a connection
+    * test a connection
+    * list saved connections
+    * fetch schema/collections/keys metadata
+    * run queries against the registered source
+* Uses a **connector/adapter pattern** so more databases can be added later
+* Includes production concerns:
+    * validation
+    * secret encryption
+    * health checks
+    * observability
+    * Docker deployment
+    * extensibility
+    * security hooks
+
+---
+
+## Recommended stack
+
+| Layer | Technology |
+|---|---|
+| Language | Java 21 |
+| Framework | Spring Boot 3.3+ |
+| Search / Metadata storage | Elasticsearch 8.x |
+| Cache / optional rate limiting | Redis |
+| RDBMS connectivity | JDBC + HikariCP |
+| Mongo connectivity | Mongo Java Driver / Spring Data Mongo core driver usage |
+| Redis connectivity | Lettuce |
+| Validation | Jakarta Validation |
+| Security | Spring Security + JWT/OAuth2 resource server |
+| Build | Maven |
+| Containerization | Docker / Docker Compose |
+| Observability | Micrometer + Prometheus |
+| Docs | springdoc-openapi |
+
+---
+
+## Core architecture
+
+## High-level components
+
+| Component | Responsibility |
+|---|---|
+| `ConnectionController` | REST endpoints |
+| `ConnectionService` | business logic for create/list/test/get |
+| `ElasticsearchConnectionRepository` | persists connection metadata in Elasticsearch |
+| `SecretCryptoService` | encrypt/decrypt passwords, tokens, keys |
+| `ConnectorFactory` | resolves correct connector by source type |
+| `SourceConnector` | common interface for all data-source adapters |
+| `JdbcSourceConnector` | relational DB execution |
+| `MongoSourceConnector` | MongoDB execution |
+| `RedisSourceConnector` | Redis commands / browsing |
+| `QueryService` | delegates query execution to proper connector |
+| `SchemaDiscoveryService` | fetches tables, collections, key patterns |
+| `AuditService` | optional audit trail for access/query events |
+
+---
+
+## Project structure
+
+```text
+universal-data-hub/
+├── pom.xml
+├── docker-compose.yml
+├── Dockerfile
+├── README.md
+└── src
+    ├── main
+    │   ├── java/com/example/datahub
+    │   │   ├── DataHubApplication.java
+    │   │   ├── config
+    │   │   │   ├── ElasticsearchConfig.java
+    │   │   │   ├── OpenApiConfig.java
+    │   │   │   ├── SecurityConfig.java
+    │   │   │   └── JacksonConfig.java
+    │   │   ├── controller
+    │   │   │   ├── ConnectionController.java
+    │   │   │   └── QueryController.java
+    │   │   ├── dto
+    │   │   │   ├── ConnectionCreateRequest.java
+    │   │   │   ├── ConnectionResponse.java
+    │   │   │   ├── QueryRequest.java
+    │   │   │   ├── QueryResponse.java
+    │   │   │   ├── TestConnectionResponse.java
+    │   │   │   └── SchemaResponse.java
+    │   │   ├── model
+    │   │   │   ├── ConnectionDocument.java
+    │   │   │   ├── ConnectionStatus.java
+    │   │   │   ├── SourceCategory.java
+    │   │   │   ├── SourceType.java
+    │   │   │   └── QueryLanguage.java
+    │   │   ├── repository
+    │   │   │   └── ConnectionSearchRepository.java
+    │   │   ├── service
+    │   │   │   ├── ConnectionService.java
+    │   │   │   ├── QueryService.java
+    │   │   │   ├── SchemaDiscoveryService.java
+    │   │   │   └── AuditService.java
+    │   │   ├── connector
+    │   │   │   ├── SourceConnector.java
+    │   │   │   ├── ConnectorFactory.java
+    │   │   │   ├── jdbc
+    │   │   │   │   └── JdbcSourceConnector.java
+    │   │   │   ├── mongo
+    │   │   │   │   └── MongoSourceConnector.java
+    │   │   │   └── redis
+    │   │   │       └── RedisSourceConnector.java
+    │   │   ├── security
+    │   │   │   ├── SecretCryptoService.java
+    │   │   │   └── AesGcmSecretCryptoService.java
+    │   │   ├── exception
+    │   │   │   ├── GlobalExceptionHandler.java
+    │   │   │   ├── ConnectorException.java
+    │   │   │   ├── NotFoundException.java
+    │   │   │   └── ValidationException.java
+    │   │   └── util
+    │   │       └── JsonUtils.java
+    │   └── resources
+    │       ├── application.yml
+    │       └── logback-spring.xml
+    └── test
+        └── java/com/example/datahub
+            ├── ConnectionControllerIT.java
+            ├── ConnectionServiceTest.java
+            └── connector
+                ├── JdbcSourceConnectorTest.java
+                ├── MongoSourceConnectorTest.java
+                └── RedisSourceConnectorTest.java
+```
+
+---
+
+## Maven `pom.xml`
+
+```xml
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>universal-data-hub</artifactId>
+    <version>1.0.0</version>
+    <name>universal-data-hub</name>
+    <description>Universal connection registry and query service</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <spring.boot.version>3.3.2</spring.boot.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring.boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.data</groupId>
+            <artifactId>spring-data-elasticsearch</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>co.elastic.clients</groupId>
+            <artifactId>elasticsearch-java</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.microsoft.sqlserver</groupId>
+            <artifactId>mssql-jdbc</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.oracle.database.jdbc</groupId>
+            <artifactId>ojdbc11</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.mongodb</groupId>
+            <artifactId>mongodb-driver-sync</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.lettuce</groupId>
+            <artifactId>lettuce-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.6.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>elasticsearch</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>mongodb</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>redis</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <source>21</source>
+                    <target>21</target>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+---
+
+## Domain model
+
+## Source types
+
+```java
+package com.example.datahub.model;
+
+public enum SourceCategory {
+    RDBMS,
+    DOCUMENT,
+    KEY_VALUE
+}
+```
+
+```java
+package com.example.datahub.model;
+
+public enum SourceType {
+    POSTGRESQL(SourceCategory.RDBMS),
+    MYSQL(SourceCategory.RDBMS),
+    SQLSERVER(SourceCategory.RDBMS),
+    ORACLE(SourceCategory.RDBMS),
+    MONGODB(SourceCategory.DOCUMENT),
+    REDIS(SourceCategory.KEY_VALUE);
+
+    private final SourceCategory category;
+
+    SourceType(SourceCategory category) {
+        this.category = category;
+    }
+
+    public SourceCategory getCategory() {
+        return category;
+    }
+}
+```
+
+```java
+package com.example.datahub.model;
+
+public enum QueryLanguage {
+    SQL,
+    MONGO_JSON,
+    REDIS_COMMAND
+}
+```
+
+---
+
+## Elasticsearch document
+
+This is the metadata stored in Elasticsearch.
+
+```java
+package com.example.datahub.model;
+
+import org.springframework.data.annotation.Id;
+import org.springframework.data.elasticsearch.annotations.DateFormat;
+import org.springframework.data.elasticsearch.annotations.Document;
+import org.springframework.data.elasticsearch.annotations.Field;
+import org.springframework.data.elasticsearch.annotations.FieldType;
+
+import java.time.Instant;
+import java.util.Map;
+
+@Document(indexName = "connection-registry")
+public class ConnectionDocument {
+
+    @Id
+    private String id;
+
+    @Field(type = FieldType.Keyword)
+    private String name;
+
+    @Field(type = FieldType.Keyword)
+    private SourceType sourceType;
+
+    @Field(type = FieldType.Keyword)
+    private SourceCategory category;
+
+    @Field(type = FieldType.Keyword)
+    private String host;
+
+    @Field(type = FieldType.Integer)
+    private Integer port;
+
+    @Field(type = FieldType.Keyword)
+    private String databaseName;
+
+    @Field(type = FieldType.Keyword)
+    private String username;
+
+    @Field(type = FieldType.Text, index = false)
+    private String encryptedSecret;
+
+    @Field(type = FieldType.Keyword)
+    private boolean sslEnabled;
+
+    @Field(type = FieldType.Object)
+    private Map<String, Object> properties;
+
+    @Field(type = FieldType.Date, format = DateFormat.date_time)
+    private Instant createdAt;
+
+    @Field(type = FieldType.Date, format = DateFormat.date_time)
+    private Instant updatedAt;
+
+    @Field(type = FieldType.Keyword)
+    private String createdBy;
+
+    @Field(type = FieldType.Keyword)
+    private String lastConnectionStatus;
+
+    @Field(type = FieldType.Text, index = false)
+    private String lastConnectionMessage;
+
+    public ConnectionDocument() {
+    }
+
+    public String buildJdbcUrl() {
+        return switch (sourceType) {
+            case POSTGRESQL -> "jdbc:postgresql://%s:%d/%s".formatted(host, port, databaseName);
+            case MYSQL -> "jdbc:mysql://%s:%d/%s".formatted(host, port, databaseName);
+            case SQLSERVER -> "jdbc:sqlserver://%s:%d;databaseName=%s".formatted(host, port, databaseName);
+            case ORACLE -> "jdbc:oracle:thin:@%s:%d/%s".formatted(host, port, databaseName);
+            default -> throw new IllegalStateException("Not a JDBC source type: " + sourceType);
+        };
+    }
+
+    public String buildMongoUri(String password) {
+        return "mongodb://%s:%s@%s:%d/%s".formatted(username, password, host, port, databaseName);
+    }
+
+    public String buildRedisUri(String password) {
+        return "redis://:%s@%s:%d".formatted(password, host, port);
+    }
+
+    // getters and setters omitted for brevity
+}
+```
+
+---
+
+## DTOs
+
+```java
+package com.example.datahub.dto;
+
+import com.example.datahub.model.SourceType;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+
+import java.util.Map;
+
+public class ConnectionCreateRequest {
+
+    @NotBlank
+    private String name;
+
+    @NotNull
+    private SourceType sourceType;
+
+    @NotBlank
+    private String host;
+
+    @NotNull
+    private Integer port;
+
+    private String databaseName;
+
+    @NotBlank
+    private String username;
+
+    @NotBlank
+    private String secret;
+
+    private boolean sslEnabled;
+
+    private Map<String, Object> properties;
+
+    // getters and setters
+}
+```
+
+```java
+package com.example.datahub.dto;
+
+import java.time.Instant;
+import java.util.Map;
+
+public class ConnectionResponse {
+
+    private String id;
+    private String name;
+    private String sourceType;
+    private String category;
+    private String host;
+    private Integer port;
+    private String databaseName;
+    private String username;
+    private boolean sslEnabled;
+    private Map<String, Object> properties;
+    private Instant createdAt;
+    private Instant updatedAt;
+    private String lastConnectionStatus;
+    private String lastConnectionMessage;
+
+    // getters and setters
+}
+```
+
+```java
+package com.example.datahub.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+
+import java.util.Map;
+
+public class QueryRequest {
+
+    @NotBlank
+    private String connectionId;
+
+    @NotBlank
+    private String query;
+
+    @NotNull
+    private Integer limit;
+
+    private Map<String, Object> parameters;
+
+    // getters and setters
+}
+```
+
+```java
+package com.example.datahub.dto;
+
+import java.util.List;
+import java.util.Map;
+
+public class QueryResponse {
+
+    private String connectionId;
+    private String sourceType;
+    private List<Map<String, Object>> rows;
+    private long count;
+    private long executionTimeMs;
+
+    // getters and setters
+}
+```
+
+---
+
+## Elasticsearch repository
+
+```java
+package com.example.datahub.repository;
+
+import com.example.datahub.model.ConnectionDocument;
+import org.springframework.data.elasticsearch.repository.ElasticsearchRepository;
+
+import java.util.List;
+
+public interface ConnectionSearchRepository extends ElasticsearchRepository<ConnectionDocument, String> {
+    List<ConnectionDocument> findByNameContainingIgnoreCase(String name);
+}
+```
+
+---
+
+## Secret encryption service
+
+For production, use **AWS KMS**, **HashiCorp Vault**, or **Azure Key Vault**.  
+For local and baseline production support, here is AES-GCM encryption.
+
+```java
+package com.example.datahub.security;
+
+public interface SecretCryptoService {
+    String encrypt(String raw);
+    String decrypt(String encrypted);
+}
+```
+
+```java
+package com.example.datahub.security;
+
+import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.ByteBuffer;
+import java.security.SecureRandom;
+import java.util.Base64;
+
+@Service
+public class AesGcmSecretCryptoService implements SecretCryptoService {
+
+    private static final String ALGO = "AES";
+    private static final String TRANSFORMATION = "AES/GCM/NoPadding";
+    private static final int TAG_LENGTH = 128;
+    private static final int IV_LENGTH = 12;
+
+    private final String base64Key;
+    private SecretKey secretKey;
+
+    public AesGcmSecretCryptoService(@Value("${app.security.encryption-key}") String base64Key) {
+        this.base64Key = base64Key;
+    }
+
+    @PostConstruct
+    void init() {
+        byte[] decoded = Base64.getDecoder().decode(base64Key);
+        this.secretKey = new SecretKeySpec(decoded, ALGO);
+    }
+
+    @Override
+    public String encrypt(String raw) {
+        try {
+            byte[] iv = new byte[IV_LENGTH];
+            new SecureRandom().nextBytes(iv);
+
+            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, new GCMParameterSpec(TAG_LENGTH, iv));
+            byte[] encrypted = cipher.doFinal(raw.getBytes());
+
+            ByteBuffer buffer = ByteBuffer.allocate(iv.length + encrypted.length);
+            buffer.put(iv);
+            buffer.put(encrypted);
+            return Base64.getEncoder().encodeToString(buffer.array());
+        } catch (Exception e) {
+            throw new IllegalStateException("Unable to encrypt secret", e);
+        }
+    }
+
+    @Override
+    public String decrypt(String encrypted) {
+        try {
+            byte[] decoded = Base64.getDecoder().decode(encrypted);
+            ByteBuffer buffer = ByteBuffer.wrap(decoded);
+
+            byte[] iv = new byte[IV_LENGTH];
+            buffer.get(iv);
+
+            byte[] cipherText = new byte[buffer.remaining()];
+            buffer.get(cipherText);
+
+            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, new GCMParameterSpec(TAG_LENGTH, iv));
+            return new String(cipher.doFinal(cipherText));
+        } catch (Exception e) {
+            throw new IllegalStateException("Unable to decrypt secret", e);
+        }
+    }
+
+    public static String generateBase64Key() {
+        try {
+            KeyGenerator keyGenerator = KeyGenerator.getInstance(ALGO);
+            keyGenerator.init(256);
+            return Base64.getEncoder().encodeToString(keyGenerator.generateKey().getEncoded());
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+```
+
+---
+
+## Connector abstraction
+
+This is the key extensibility point.
+
+```java
+package com.example.datahub.connector;
+
+import com.example.datahub.dto.QueryRequest;
+import com.example.datahub.dto.QueryResponse;
+import com.example.datahub.dto.SchemaResponse;
+import com.example.datahub.model.ConnectionDocument;
+import com.example.datahub.model.SourceType;
+
+public interface SourceConnector {
+
+    SourceType supports();
+
+    void testConnection(ConnectionDocument connection, String decryptedSecret);
+
+    SchemaResponse discoverSchema(ConnectionDocument connection, String decryptedSecret);
+
+    QueryResponse executeQuery(ConnectionDocument connection, String decryptedSecret, QueryRequest request);
+}
+```
+
+---
+
+## Connector factory
+
+```java
+package com.example.datahub.connector;
+
+import com.example.datahub.model.SourceType;
+import org.springframework.stereotype.Component;
+
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+
+@Component
+public class ConnectorFactory {
+
+    private final Map<SourceType, SourceConnector> connectors = new EnumMap<>(SourceType.class);
+
+    public ConnectorFactory(List<SourceConnector> connectorList) {
+        for (SourceConnector connector : connectorList) {
+            connectors.put(connector.supports(), connector);
+        }
+    }
+
+    public SourceConnector get(SourceType sourceType) {
+        SourceConnector connector = connectors.get(sourceType);
+        if (connector == null) {
+            throw new IllegalArgumentException("No connector registered for " + sourceType);
+        }
+        return connector;
+    }
+}
+```
+
+---
+
+## JDBC connector
+
+Supports PostgreSQL, MySQL, SQL Server, Oracle through the same implementation.
+
+```java
+package com.example.datahub.connector.jdbc;
+
+import com.example.datahub.connector.SourceConnector;
+import com.example.datahub.dto.QueryRequest;
+import com.example.datahub.dto.QueryResponse;
+import com.example.datahub.dto.SchemaResponse;
+import com.example.datahub.model.ConnectionDocument;
+import com.example.datahub.model.SourceType;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.stereotype.Component;
+
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.time.Duration;
+import java.util.*;
+
+@Component
+public class JdbcSourceConnector implements SourceConnector {
+
+    @Override
+    public SourceType supports() {
+        throw new UnsupportedOperationException(
+            "Use database-specific wrapper beans or register multiple JdbcSourceConnector instances"
+        );
+    }
+
+    public void test(ConnectionDocument connectionDoc, String password) {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(connectionDoc.buildJdbcUrl());
+        config.setUsername(connectionDoc.getUsername());
+        config.setPassword(password);
+        config.setMaximumPoolSize(2);
+        config.setMinimumIdle(0);
+        config.setConnectionTimeout(Duration.ofSeconds(5).toMillis());
+
+        try (HikariDataSource ds = new HikariDataSource(config);
+             Connection ignored = ds.getConnection()) {
+        } catch (Exception e) {
+            throw new IllegalStateException("JDBC connection failed: " + e.getMessage(), e);
+        }
+    }
+
+    public SchemaResponse schema(ConnectionDocument connectionDoc, String password) {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(connectionDoc.buildJdbcUrl());
+        config.setUsername(connectionDoc.getUsername());
+        config.setPassword(password);
+
+        List<String> tables = new ArrayList<>();
+
+        try (HikariDataSource ds = new HikariDataSource(config);
+             Connection conn = ds.getConnection()) {
+
+            DatabaseMetaData metaData = conn.getMetaData();
+            try (ResultSet rs = metaData.getTables(connectionDoc.getDatabaseName(), null, "%", new String[]{"TABLE"})) {
+                while (rs.next()) {
+                    tables.add(rs.getString("TABLE_NAME"));
+                }
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Schema discovery failed: " + e.getMessage(), e);
+        }
+
+        SchemaResponse response = new SchemaResponse();
+        response.setConnectionType(connectionDoc.getSourceType().name());
+        response.setObjects(tables);
+        return response;
+    }
+
+    public QueryResponse query(ConnectionDocument connectionDoc, String password, QueryRequest request) {
+        long start = System.currentTimeMillis();
+
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(connectionDoc.buildJdbcUrl());
+        config.setUsername(connectionDoc.getUsername());
+        config.setPassword(password);
+
+        List<Map<String, Object>> rows = new ArrayList<>();
+        String sql = request.getQuery().trim();
+
+        if (!sql.toLowerCase(Locale.ROOT).startsWith("select")) {
+            throw new IllegalArgumentException("Only SELECT queries are allowed");
+        }
+
+        try (HikariDataSource ds = new HikariDataSource(config);
+             Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setMaxRows(request.getLimit());
+
+            try (ResultSet rs = ps.executeQuery()) {
+                int columnCount = rs.getMetaData().getColumnCount();
+
+                while (rs.next()) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    for (int i = 1; i <= columnCount; i++) {
+                        row.put(rs.getMetaData().getColumnLabel(i), rs.getObject(i));
+                    }
+                    rows.add(row);
+                }
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Query execution failed: " + e.getMessage(), e);
+        }
+
+        QueryResponse response = new QueryResponse();
+        response.setConnectionId(connectionDoc.getId());
+        response.setSourceType(connectionDoc.getSourceType().name());
+        response.setRows(rows);
+        response.setCount(rows.size());
+        response.setExecutionTimeMs(System.currentTimeMillis() - start);
+        return response;
+    }
+
+    @Override
+    public void testConnection(ConnectionDocument connection, String decryptedSecret) {
+        test(connection, decryptedSecret);
+    }
+
+    @Override
+    public SchemaResponse discoverSchema(ConnectionDocument connection, String decryptedSecret) {
+        return schema(connection, decryptedSecret);
+    }
+
+    @Override
+    public QueryResponse executeQuery(ConnectionDocument connection, String decryptedSecret, QueryRequest request) {
+        return query(connection, decryptedSecret, request);
+    }
+}
+```
+
+### Better production approach for JDBC registration
+
+Because one connector supports multiple JDBC source types, register wrappers:
+
+```java
+package com.example.datahub.connector.jdbc;
+
+import com.example.datahub.connector.SourceConnector;
+import com.example.datahub.dto.QueryRequest;
+import com.example.datahub.dto.QueryResponse;
+import com.example.datahub.dto.SchemaResponse;
+import com.example.datahub.model.ConnectionDocument;
+import com.example.datahub.model.SourceType;
+import org.springframework.stereotype.Component;
+
+@Component
+public class PostgresConnector implements SourceConnector {
+
+    private final JdbcSourceConnector delegate = new JdbcSourceConnector();
+
+    @Override
+    public SourceType supports() {
+        return SourceType.POSTGRESQL;
+    }
+
+    @Override
+    public void testConnection(ConnectionDocument connection, String decryptedSecret) {
+        delegate.testConnection(connection, decryptedSecret);
+    }
+
+    @Override
+    public SchemaResponse discoverSchema(ConnectionDocument connection, String decryptedSecret) {
+        return delegate.discoverSchema(connection, decryptedSecret);
+    }
+
+    @Override
+    public QueryResponse executeQuery(ConnectionDocument connection, String decryptedSecret, QueryRequest request) {
+        return delegate.executeQuery(connection, decryptedSecret, request);
+    }
+}
+```
+
+Create the same wrapper for `MYSQL`, `SQLSERVER`, and `ORACLE`.
+
+---
+
+## MongoDB connector
+
+```java
+package com.example.datahub.connector.mongo;
+
+import com.example.datahub.connector.SourceConnector;
+import com.example.datahub.dto.QueryRequest;
+import com.example.datahub.dto.QueryResponse;
+import com.example.datahub.dto.SchemaResponse;
+import com.example.datahub.model.ConnectionDocument;
+import com.example.datahub.model.SourceType;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mongodb.client.*;
+import org.bson.Document;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+
+@Component
+public class MongoSourceConnector implements SourceConnector {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public SourceType supports() {
+        return SourceType.MONGODB;
+    }
+
+    @Override
+    public void testConnection(ConnectionDocument connection, String decryptedSecret) {
+        try (MongoClient client = MongoClients.create(connection.buildMongoUri(decryptedSecret))) {
+            client.listDatabaseNames().first();
+        } catch (Exception e) {
+            throw new IllegalStateException("Mongo connection failed: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public SchemaResponse discoverSchema(ConnectionDocument connection, String decryptedSecret) {
+        try (MongoClient client = MongoClients.create(connection.buildMongoUri(decryptedSecret))) {
+            MongoDatabase db = client.getDatabase(connection.getDatabaseName());
+            List<String> collections = db.listCollectionNames().into(new ArrayList<>());
+
+            SchemaResponse response = new SchemaResponse();
+            response.setConnectionType(connection.getSourceType().name());
+            response.setObjects(collections);
+            return response;
+        } catch (Exception e) {
+            throw new IllegalStateException("Mongo schema discovery failed: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public QueryResponse executeQuery(ConnectionDocument connection, String decryptedSecret, QueryRequest request) {
+        long start = System.currentTimeMillis();
+
+        try (MongoClient client = MongoClients.create(connection.buildMongoUri(decryptedSecret))) {
+            MongoDatabase db = client.getDatabase(connection.getDatabaseName());
+
+            Map<String, Object> payload = objectMapper.readValue(
+                request.getQuery(), new TypeReference<>() {}
+            );
+
+            String collectionName = Objects.toString(payload.get("collection"));
+            Map<String, Object> filterMap = (Map<String, Object>) payload.getOrDefault("filter", Map.of());
+
+            MongoCollection<Document> collection = db.getCollection(collectionName);
+            FindIterable<Document> docs = collection.find(new Document(filterMap)).limit(request.getLimit());
+
+            List<Map<String, Object>> rows = new ArrayList<>();
+            for (Document doc : docs) {
+                rows.add(doc);
+            }
+
+            QueryResponse response = new QueryResponse();
+            response.setConnectionId(connection.getId());
+            response.setSourceType(connection.getSourceType().name());
+            response.setRows(rows);
+            response.setCount(rows.size());
+            response.setExecutionTimeMs(System.currentTimeMillis() - start);
+            return response;
+        } catch (Exception e) {
+            throw new IllegalStateException("Mongo query failed: " + e.getMessage(), e);
+        }
+    }
+}
+```
+
+### Example Mongo query payload
+
+```json
+{
+    "collection": "customers",
+    "filter": {
+        "country": "US"
+    }
+}
+```
+
+---
+
+## Redis connector
+
+Redis is key/value, so the query model is different.  
+A safe production strategy is to allow only a **whitelist** of read commands.
+
+```java
+package com.example.datahub.connector.redis;
+
+import com.example.datahub.connector.SourceConnector;
+import com.example.datahub.dto.QueryRequest;
+import com.example.datahub.dto.QueryResponse;
+import com.example.datahub.dto.SchemaResponse;
+import com.example.datahub.model.ConnectionDocument;
+import com.example.datahub.model.SourceType;
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.api.sync.RedisCommands;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+
+@Component
+public class RedisSourceConnector implements SourceConnector {
+
+    private static final Set<String> ALLOWED_COMMANDS = Set.of("GET", "MGET", "HGETALL", "LRANGE", "SMEMBERS", "KEYS");
+
+    @Override
+    public SourceType supports() {
+        return SourceType.REDIS;
+    }
+
+    @Override
+    public void testConnection(ConnectionDocument connection, String decryptedSecret) {
+        try (RedisClient client = RedisClient.create(connection.buildRedisUri(decryptedSecret))) {
+            client.connect().sync().ping();
+        } catch (Exception e) {
+            throw new IllegalStateException("Redis connection failed: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public SchemaResponse discoverSchema(ConnectionDocument connection, String decryptedSecret) {
+        try (RedisClient client = RedisClient.create(connection.buildRedisUri(decryptedSecret))) {
+            RedisCommands<String, String> commands = client.connect().sync();
+            List<String> keys = commands.keys("*");
+
+            SchemaResponse response = new SchemaResponse();
+            response.setConnectionType(connection.getSourceType().name());
+            response.setObjects(keys.stream().limit(100).toList());
+            return response;
+        } catch (Exception e) {
+            throw new IllegalStateException("Redis schema discovery failed: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public QueryResponse executeQuery(ConnectionDocument connection, String decryptedSecret, QueryRequest request) {
+        long start = System.currentTimeMillis();
+
+        try (RedisClient client = RedisClient.create(connection.buildRedisUri(decryptedSecret))) {
+            RedisCommands<String, String> commands = client.connect().sync();
+
+            String[] tokens = request.getQuery().trim().split("\\s+");
+            String cmd = tokens[0].toUpperCase(Locale.ROOT);
+
+            if (!ALLOWED_COMMANDS.contains(cmd)) {
+                throw new IllegalArgumentException("Unsupported Redis command: " + cmd);
+            }
+
+            List<Map<String, Object>> rows = new ArrayList<>();
+
+            switch (cmd) {
+                case "GET" -> {
+                    String value = commands.get(tokens[1]);
+                    rows.add(Map.of("key", tokens[1], "value", value));
+                }
+                case "KEYS" -> {
+                    List<String> keys = commands.keys(tokens.length > 1 ? tokens[1] : "*");
+                    for (String key : keys.stream().limit(request.getLimit()).toList()) {
+                        rows.add(Map.of("key", key));
+                    }
+                }
+                case "HGETALL" -> {
+                    Map<String, String> map = commands.hgetall(tokens[1]);
+                    rows.add(new LinkedHashMap<>(map));
+                }
+                default -> throw new IllegalArgumentException("Command not yet implemented: " + cmd);
+            }
+
+            QueryResponse response = new QueryResponse();
+            response.setConnectionId(connection.getId());
+            response.setSourceType(connection.getSourceType().name());
+            response.setRows(rows);
+            response.setCount(rows.size());
+            response.setExecutionTimeMs(System.currentTimeMillis() - start);
+            return response;
+        } catch (Exception e) {
+            throw new IllegalStateException("Redis query failed: " + e.getMessage(), e);
+        }
+    }
+}
+```
+
+---
+
+## Schema response DTO
+
+```java
+package com.example.datahub.dto;
+
+import java.util.List;
+
+public class SchemaResponse {
+
+    private String connectionType;
+    private List<String> objects;
+
+    public String getConnectionType() {
+        return connectionType;
+    }
+
+    public void setConnectionType(String connectionType) {
+        this.connectionType = connectionType;
+    }
+
+    public List<String> getObjects() {
+        return objects;
+    }
+
+    public void setObjects(List<String> objects) {
+        this.objects = objects;
+    }
+}
+```
+
+---
+
+## Service layer
+
+```java
+package com.example.datahub.service;
+
+import com.example.datahub.connector.ConnectorFactory;
+import com.example.datahub.dto.ConnectionCreateRequest;
+import com.example.datahub.dto.ConnectionResponse;
+import com.example.datahub.model.ConnectionDocument;
+import com.example.datahub.repository.ConnectionSearchRepository;
+import com.example.datahub.security.SecretCryptoService;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.List;
+
+@Service
+public class ConnectionService {
+
+    private final ConnectionSearchRepository repository;
+    private final SecretCryptoService cryptoService;
+    private final ConnectorFactory connectorFactory;
+
+    public ConnectionService(ConnectionSearchRepository repository,
+                             SecretCryptoService cryptoService,
+                             ConnectorFactory connectorFactory) {
+        this.repository = repository;
+        this.cryptoService = cryptoService;
+        this.connectorFactory = connectorFactory;
+    }
+
+    public ConnectionResponse create(ConnectionCreateRequest request, String createdBy) {
+        ConnectionDocument doc = new ConnectionDocument();
+        doc.setName(request.getName());
+        doc.setSourceType(request.getSourceType());
+        doc.setCategory(request.getSourceType().getCategory());
+        doc.setHost(request.getHost());
+        doc.setPort(request.getPort());
+        doc.setDatabaseName(request.getDatabaseName());
+        doc.setUsername(request.getUsername());
+        doc.setEncryptedSecret(cryptoService.encrypt(request.getSecret()));
+        doc.setSslEnabled(request.isSslEnabled());
+        doc.setProperties(request.getProperties());
+        doc.setCreatedAt(Instant.now());
+        doc.setUpdatedAt(Instant.now());
+        doc.setCreatedBy(createdBy);
+        doc.setLastConnectionStatus("UNKNOWN");
+
+        ConnectionDocument saved = repository.save(doc);
+        return map(saved);
+    }
+
+    public List<ConnectionResponse> list() {
+        return ((List<ConnectionDocument>) repository.findAll()).stream().map(this::map).toList();
+    }
+
+    public ConnectionDocument getDocument(String id) {
+        return repository.findById(id).orElseThrow(() -> new IllegalArgumentException("Connection not found: " + id));
+    }
+
+    public void testConnection(String id) {
+        ConnectionDocument doc = getDocument(id);
+        String secret = cryptoService.decrypt(doc.getEncryptedSecret());
+
+        try {
+            connectorFactory.get(doc.getSourceType()).testConnection(doc, secret);
+            doc.setLastConnectionStatus("SUCCESS");
+            doc.setLastConnectionMessage("Connection successful");
+        } catch (Exception e) {
+            doc.setLastConnectionStatus("FAILED");
+            doc.setLastConnectionMessage(e.getMessage());
+            repository.save(doc);
+            throw e;
+        }
+
+        doc.setUpdatedAt(Instant.now());
+        repository.save(doc);
+    }
+
+    private ConnectionResponse map(ConnectionDocument doc) {
+        ConnectionResponse response = new ConnectionResponse();
+        response.setId(doc.getId());
+        response.setName(doc.getName());
+        response.setSourceType(doc.getSourceType().name());
+        response.setCategory(doc.getCategory().name());
+        response.setHost(doc.getHost());
+        response.setPort(doc.getPort());
+        response.setDatabaseName(doc.getDatabaseName());
+        response.setUsername(doc.getUsername());
+        response.setSslEnabled(doc.isSslEnabled());
+        response.setProperties(doc.getProperties());
+        response.setCreatedAt(doc.getCreatedAt());
+        response.setUpdatedAt(doc.getUpdatedAt());
+        response.setLastConnectionStatus(doc.getLastConnectionStatus());
+        response.setLastConnectionMessage(doc.getLastConnectionMessage());
+        return response;
+    }
+}
+```
+
+---
+
+## Query service
+
+```java
+package com.example.datahub.service;
+
+import com.example.datahub.connector.ConnectorFactory;
+import com.example.datahub.dto.QueryRequest;
+import com.example.datahub.dto.QueryResponse;
+import com.example.datahub.dto.SchemaResponse;
+import com.example.datahub.model.ConnectionDocument;
+import com.example.datahub.security.SecretCryptoService;
+import org.springframework.stereotype.Service;
+
+@Service
+public class QueryService {
+
+    private final ConnectionService connectionService;
+    private final SecretCryptoService cryptoService;
+    private final ConnectorFactory connectorFactory;
+
+    public QueryService(ConnectionService connectionService,
+                        SecretCryptoService cryptoService,
+                        ConnectorFactory connectorFactory) {
+        this.connectionService = connectionService;
+        this.cryptoService = cryptoService;
+        this.connectorFactory = connectorFactory;
+    }
+
+    public QueryResponse execute(QueryRequest request) {
+        ConnectionDocument doc = connectionService.getDocument(request.getConnectionId());
+        String secret = cryptoService.decrypt(doc.getEncryptedSecret());
+        return connectorFactory.get(doc.getSourceType()).executeQuery(doc, secret, request);
+    }
+
+    public SchemaResponse schema(String connectionId) {
+        ConnectionDocument doc = connectionService.getDocument(connectionId);
+        String secret = cryptoService.decrypt(doc.getEncryptedSecret());
+        return connectorFactory.get(doc.getSourceType()).discoverSchema(doc, secret);
+    }
+}
+```
+
+---
+
+## REST controllers
+
+```java
+package com.example.datahub.controller;
+
+import com.example.datahub.dto.ConnectionCreateRequest;
+import com.example.datahub.dto.ConnectionResponse;
+import com.example.datahub.service.ConnectionService;
+import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/v1/connections")
+public class ConnectionController {
+
+    private final ConnectionService connectionService;
+
+    public ConnectionController(ConnectionService connectionService) {
+        this.connectionService = connectionService;
+    }
+
+    @PostMapping
+    public ResponseEntity<ConnectionResponse> create(@Valid @RequestBody ConnectionCreateRequest request) {
+        return ResponseEntity.ok(connectionService.create(request, "system-user"));
+    }
+
+    @GetMapping
+    public ResponseEntity<List<ConnectionResponse>> list() {
+        return ResponseEntity.ok(connectionService.list());
+    }
+
+    @PostMapping("/{id}/test")
+    public ResponseEntity<Void> test(@PathVariable String id) {
+        connectionService.testConnection(id);
+        return ResponseEntity.ok().build();
+    }
+}
+```
+
+```java
+package com.example.datahub.controller;
+
+import com.example.datahub.dto.QueryRequest;
+import com.example.datahub.dto.QueryResponse;
+import com.example.datahub.dto.SchemaResponse;
+import com.example.datahub.service.QueryService;
+import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/query")
+public class QueryController {
+
+    private final QueryService queryService;
+
+    public QueryController(QueryService queryService) {
+        this.queryService = queryService;
+    }
+
+    @PostMapping
+    public ResponseEntity<QueryResponse> query(@Valid @RequestBody QueryRequest request) {
+        return ResponseEntity.ok(queryService.execute(request));
+    }
+
+    @GetMapping("/{connectionId}/schema")
+    public ResponseEntity<SchemaResponse> schema(@PathVariable String connectionId) {
+        return ResponseEntity.ok(queryService.schema(connectionId));
+    }
+}
+```
+
+---
+
+## Exception handling
+
+```java
+package com.example.datahub.exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.time.Instant;
+import java.util.Map;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<?> validation(MethodArgumentNotValidException ex) {
+        return ResponseEntity.badRequest().body(Map.of(
+            "timestamp", Instant.now(),
+            "error", "VALIDATION_ERROR",
+            "message", ex.getMessage()
+        ));
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<?> illegalArgument(IllegalArgumentException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+            "timestamp", Instant.now(),
+            "error", "BAD_REQUEST",
+            "message", ex.getMessage()
+        ));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<?> generic(Exception ex) {
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+            "timestamp", Instant.now(),
+            "error", "INTERNAL_SERVER_ERROR",
+            "message", ex.getMessage()
+        ));
+    }
+}
+```
+
+---
+
+## Security configuration
+
+For a real production deployment:
+
+* protect APIs with JWT
+* authorize by roles
+* scope access per tenant/team
+* never expose secrets in responses
+* preferably store credentials in Vault, not directly in ES
+
+Example baseline security:
+
+```java
+package com.example.datahub.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers(
+                    "/actuator/health",
+                    "/v3/api-docs/**",
+                    "/swagger-ui/**",
+                    "/swagger-ui.html"
+                ).permitAll()
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer(oauth -> oauth.jwt(Customizer.withDefaults()));
+
+        return http.build();
+    }
+}
+```
+
+---
+
+## `application.yml`
+
+```yaml
+server:
+    port: 8080
+
+spring:
+    application:
+        name: universal-data-hub
+    elasticsearch:
+        uris: http://localhost:9200
+
+management:
+    endpoints:
+        web:
+            exposure:
+                include: health,info,prometheus
+    endpoint:
+        health:
+            show-details: always
+
+app:
+    security:
+        encryption-key: ${APP_ENCRYPTION_KEY:REPLACE_WITH_BASE64_AES_KEY}
+
+logging:
+    level:
+        root: INFO
+        com.example.datahub: INFO
+```
+
+---
+
+## Docker Compose
+
+```yaml
+version: "3.9"
+
+services:
+    elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.14.1
+        container_name: elasticsearch
+        environment:
+            - discovery.type=single-node
+            - xpack.security.enabled=false
+            - ES_JAVA_OPTS=-Xms1g -Xmx1g
+        ports:
+            - "9200:9200"
+        healthcheck:
+            test: ["CMD-SHELL", "curl -f http://localhost:9200 || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 20
+
+    universal-data-hub:
+        build: .
+        container_name: universal-data-hub
+        depends_on:
+            elasticsearch:
+                condition: service_healthy
+        environment:
+            SPRING_ELASTICSEARCH_URIS: http://elasticsearch:9200
+            APP_ENCRYPTION_KEY: REPLACE_WITH_BASE64_AES_KEY
+        ports:
+            - "8080:8080"
+```
+
+---
+
+## Dockerfile
+
+```dockerfile
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY target/universal-data-hub-1.0.0.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+```
+
+---
+
+## Elasticsearch index mapping recommendation
+
+Spring Data will create a usable mapping, but for production I recommend explicitly creating it:
+
+```json
+PUT connection-registry
+{
+    "mappings": {
+        "properties": {
+            "name": { "type": "keyword" },
+            "sourceType": { "type": "keyword" },
+            "category": { "type": "keyword" },
+            "host": { "type": "keyword" },
+            "port": { "type": "integer" },
+            "databaseName": { "type": "keyword" },
+            "username": { "type": "keyword" },
+            "encryptedSecret": { "type": "binary" },
+            "sslEnabled": { "type": "boolean" },
+            "properties": { "type": "object", "enabled": true },
+            "createdAt": { "type": "date" },
+            "updatedAt": { "type": "date" },
+            "createdBy": { "type": "keyword" },
+            "lastConnectionStatus": { "type": "keyword" },
+            "lastConnectionMessage": { "type": "text", "index": false }
+        }
+    }
+}
+```
+
+---
+
+## API examples
+
+## 1. Register PostgreSQL connection
+
+`POST /api/v1/connections`
+
+```json
+{
+    "name": "billing-postgres",
+    "sourceType": "POSTGRESQL",
+    "host": "postgres.internal",
+    "port": 5432,
+    "databaseName": "billing",
+    "username": "app_user",
+    "secret": "super-secret-password",
+    "sslEnabled": true,
+    "properties": {
+        "schema": "public"
+    }
+}
+```
+
+## 2. Register MongoDB connection
+
+```json
+{
+    "name": "customer-mongo",
+    "sourceType": "MONGODB",
+    "host": "mongo.internal",
+    "port": 27017,
+    "databaseName": "customers",
+    "username": "mongo_user",
+    "secret": "mongo-password",
+    "sslEnabled": false,
+    "properties": {
+        "authSource": "admin"
+    }
+}
+```
+
+## 3. Register Redis connection
+
+```json
+{
+    "name": "session-redis",
+    "sourceType": "REDIS",
+    "host": "redis.internal",
+    "port": 6379,
+    "databaseName": "0",
+    "username": "default",
+    "secret": "redis-password",
+    "sslEnabled": false,
+    "properties": {}
+}
+```
+
+## 4. Test connection
+
+`POST /api/v1/connections/{id}/test`
+
+## 5. Query PostgreSQL
+
+`POST /api/v1/query`
+
+```json
+{
+    "connectionId": "abc123",
+    "query": "SELECT id, email, created_at FROM users LIMIT 10",
+    "limit": 10
+}
+```
+
+## 6. Query MongoDB
+
+```json
+{
+    "connectionId": "mongo123",
+    "query": "{\"collection\":\"customers\",\"filter\":{\"country\":\"US\"}}",
+    "limit": 20
+}
+```
+
+## 7. Query Redis
+
+```json
+{
+    "connectionId": "redis123",
+    "query": "GET session:123",
+    "limit": 1
+}
+```
+
+---
+
+## Important production improvements
+
+The code above is strong as a foundation, but for a **real enterprise-grade production system**, add these:
+
+## 1. Store secrets outside Elasticsearch
+
+Best practice:
+
+* store only metadata in Elasticsearch
+* keep credentials in:
+    * HashiCorp Vault
+    * AWS Secrets Manager
+    * Azure Key Vault
+    * GCP Secret Manager
+
+Recommended pattern:
+
+* ES stores `secretRef`
+* secret manager stores actual password/token
+
+Example:
+
+| Field | Value |
+|---|---|
+| `id` | `conn_001` |
+| `name` | `billing-postgres` |
+| `secretRef` | `vault://connections/conn_001` |
+
+---
+
+## 2. Add tenant isolation
+
+If multiple users or teams will use this:
+
+* add `tenantId`
+* add `ownerId`
+* filter every search/query by tenant
+* enforce RBAC:
+    * `CONNECTION_ADMIN`
+    * `CONNECTION_READ`
+    * `QUERY_EXECUTE`
+
+---
+
+## 3. Add query safety rules
+
+For security, do **not** allow raw unrestricted queries in production.
+
+Recommended controls:
+
+* only allow read-only access
+* parse and validate SQL
+* block:
+    * `INSERT`
+    * `UPDATE`
+    * `DELETE`
+    * `DROP`
+    * `ALTER`
+    * `TRUNCATE`
+* enforce query timeout
+* enforce result size limits
+* enforce per-user rate limits
+
+For SQL, use a parser like **JSqlParser**.
+
+---
+
+## 4. Connection pooling strategy
+
+Current sample creates pools on demand. Better production approach:
+
+* cache pools by connection ID
+* rotate or evict on config change
+* max idle TTL
+* close old pools cleanly
+
+A `ConnectionPoolManager` would help.
+
+---
+
+## 5. Observability
+
+Add:
+
+* query latency metrics
+* success/failure counters
+* audit logs
+* distributed tracing
+* masked logging
+
+Metrics examples:
+
+* `connection_test_total`
+* `query_execution_total`
+* `query_execution_duration_ms`
+* `connector_failures_total`
+
+---
+
+## 6. Audit trail
+
+Record:
+
+* who created connection
+* who tested it
+* who executed query
+* which connection was used
+* when
+* status
+* duration
+
+Never log raw credentials.
+
+---
+
+## 7. Support more databases
+
+The adapter model makes it easy to add:
+
+* Cassandra
+* Couchbase
+* Elasticsearch remote cluster
+* DynamoDB
+* Neo4j
+* OpenSearch
+* MariaDB
+* Snowflake
+* BigQuery
+
+Just implement `SourceConnector`.
+
+---
+
+## Recommended enhanced data model
+
+For a mature version, use this `ConnectionDocument` shape:
+
+```java
+private String id;
+private String tenantId;
+private String name;
+private SourceType sourceType;
+private SourceCategory category;
+private String host;
+private Integer port;
+private String databaseName;
+private String username;
+private String secretRef;
+private boolean sslEnabled;
+private Map<String, Object> properties;
+private Set<String> tags;
+private String createdBy;
+private Instant createdAt;
+private Instant updatedAt;
+private String lastConnectionStatus;
+private String lastConnectionMessage;
+private Instant lastTestedAt;
+private boolean active;
+```
+
+---
+
+## Best design decision: separate metadata from runtime access
+
+Use this split:
+
+## Metadata layer
+
+Stored in Elasticsearch:
+
+* connection name
+* type
+* host
+* port
+* database name
+* options
+* secret reference
+* status
+* tags
+
+## Secret layer
+
+Stored in secret manager:
+
+* password
+* token
+* client secret
+* certificate material
+
+## Runtime layer
+
+Connector execution:
+
+* connection testing
+* schema introspection
+* query execution
+* pooling
+* timeout enforcement
+
+This separation is the correct production architecture.
+
+---
+
+## Suggested REST API contract
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/connections` | Create connection |
+| `GET` | `/api/v1/connections` | List connections |
+| `GET` | `/api/v1/connections/{id}` | Get connection |
+| `PUT` | `/api/v1/connections/{id}` | Update connection |
+| `DELETE` | `/api/v1/connections/{id}` | Delete connection |
+| `POST` | `/api/v1/connections/{id}/test` | Test connection |
+| `GET` | `/api/v1/query/{connectionId}/schema` | Discover schema |
+| `POST` | `/api/v1/query` | Execute query |
+| `GET` | `/api/v1/audit` | Fetch audit logs |
+
+---
+
+## What this project supports well
+
+* Central registry of heterogeneous data sources
+* Elasticsearch-based searchable metadata catalog
+* Dynamic connector resolution
+* Runtime query execution across different database families
+* Easy extension for more source types
+* Baseline production readiness
+
+---
+
+## What needs special care
+
+There is one very important truth:
+
+**There is no single universal query language across RDBMS, document DB, and key/value stores.**
+
+So the service must support **source-specific query payloads**:
+
+* RDBMS: SQL
+* MongoDB: JSON filter / pipeline
+* Redis: safe read-only command subset
+
+That is the correct enterprise design.
+
+---
+
+## My recommendation for final production version
+
+If I were building this for a real company, I would implement it in **three modules**:
+
+## 1. `connection-registry-service`
+
+* CRUD for connections
+* stores metadata in Elasticsearch
+* stores secret references only
+
+## 2. `connector-runtime-service`
+
+* resolves secrets from Vault
+* tests connections
+* executes read-only queries
+* pools connections
+* rate limits usage
+
+## 3. `audit-observability-service`
+
+* audit trail
+* metrics
+* dashboards
+* alerts
+
+This split improves security and scale.
+
+---
+
+## If you want the most practical deliverable
+
+I can provide the **next step** as a full runnable codebase in one of these formats:
+
+* **single Spring Boot app** with all files
+* **multi-module Maven project**
+* **enterprise version with Vault + JWT + Testcontainers**
+* **GitHub-ready project structure with every class filled in**
+
+## Recommended next version
+
+The best next deliverable is:
+
+* **Java 21**
+* **Spring Boot 3**
+* **Elasticsearch**
+* **PostgreSQL + MongoDB + Redis connectors**
+* **JWT security**
+* **Vault secret integration**
+* **Testcontainers integration tests**
+* **Docker Compose**
+
+If you want, I can generate that as a **full file-by-file project** starting with:
+
+* `pom.xml`
+* `application.yml`
+* all entities
+* all controllers
+* all services
+* all connectors
+* all tests
+* Docker files
+
+in a copy-paste ready format.
+
