@@ -1,0 +1,285 @@
+# Converting Spring Security WebMVC Config to WebFlux
+
+The migration is **not a 1:1 rename**. Reactive Spring Security uses a parallel set of classes — most are prefixed with `Server...` and return `Mono<Void>`. The foundational swaps are:
+
+```
+HttpSecurity              → ServerHttpSecurity
+SecurityFilterChain       → SecurityWebFilterChain
+@EnableWebSecurity        → @EnableWebFluxSecurity
+AuthenticationSuccessHandler → ServerAuthenticationSuccessHandler
+AuthenticationFailureHandler → ServerAuthenticationFailureHandler
+LogoutHandler             → ServerLogoutHandler
+HttpSession               → WebSession
+```
+
+Below is each configurer you listed, mapped to its reactive form.
+
+---
+
+## 1. `OAuth2LoginConfigurer<HttpSecurity>` → `oauth2Login` on `ServerHttpSecurity`
+
+The reactive `OAuth2LoginSpec` is flatter than the servlet version. There is **no `tokenEndpoint()` block** and **no `defaultSuccessUrl()`** — those collapse into a single success-handler slot and a bean, respectively.
+
+| WebMVC method | WebFlux equivalent |
+|---|---|
+| `redirectionEndpoint().baseUri(...)` | `.authenticationMatcher(ServerWebExchangeMatcher)` |
+| `failureHandler(...)` | `.authenticationFailureHandler(ServerAuthenticationFailureHandler)` |
+| `defaultSuccessUrl("/home")` | `new RedirectServerAuthenticationSuccessHandler("/home")` |
+| `successHandler(...)` | `.authenticationSuccessHandler(ServerAuthenticationSuccessHandler)` |
+| `tokenEndpoint().accessTokenResponseClient(...)` | Register a `ReactiveOAuth2AccessTokenResponseClient` **bean** |
+
+```java
+RedirectServerAuthenticationSuccessHandler successHandler =
+    new RedirectServerAuthenticationSuccessHandler("/home");
+
+// Optional: mimic defaultSuccessUrl("/home", true) — always redirect, ignore saved request
+successHandler.setRequestCache(NoOpServerRequestCache.getInstance());
+
+http.oauth2Login(oauth2 -> oauth2
+    // redirectionEndpoint().baseUri("/login/oauth2/code/*")
+    .authenticationMatcher(new PathPatternParserServerWebExchangeMatcher(
+            "/login/oauth2/code/{registrationId}"))
+    // failureHandler(...)
+    .authenticationFailureHandler(
+            new RedirectServerAuthenticationFailureHandler("/login?error"))
+    // defaultSuccessUrl(...) / successHandler(...)  — these merge into ONE slot
+    .authenticationSuccessHandler(successHandler)
+);
+```
+
+**Important:** `defaultSuccessUrl` and `successHandler` both map to `authenticationSuccessHandler` — you can only set one, so combine the behavior you need into a single handler.
+
+For the **token endpoint**, expose a bean instead of configuring it inline:
+
+```java
+@Bean
+ReactiveOAuth2AccessTokenResponseClient<OAuth2AuthorizationCodeGrantRequest>
+authorizationCodeAccessTokenResponseClient() {
+    WebClientReactiveAuthorizationCodeTokenResponseClient client =
+        new WebClientReactiveAuthorizationCodeTokenResponseClient();
+    // client.addParametersConverter(...);  // customize request
+    // client.setWebClient(...);            // customize WebClient
+    return client;
+}
+```
+
+The default reactive authorization-response endpoint is `/login/oauth2/code/{registrationId}`; if you change the matcher, your `ClientRegistration.redirectUri` must match it too.
+
+---
+
+## 2. `LogoutConfigurer<HttpSecurity>` → `logout` on `ServerHttpSecurity`
+
+The reactive `LogoutSpec` is small: it has `logoutUrl`, `requiresLogout`, `logoutHandler`, and `logoutSuccessHandler` — but **no** `invalidateHttpSession`, `clearAuthentication`, or `deleteCookies`. You reconstruct those by composing `ServerLogoutHandler`s with `DelegatingServerLogoutHandler`.
+
+| WebMVC method | WebFlux equivalent |
+|---|---|
+| `logoutUrl("/logout")` | `.logoutUrl("/logout")` |
+| `clearAuthentication(true)` | `SecurityContextServerLogoutHandler` (this is the default) |
+| `invalidateHttpSession(true)` | `WebSessionServerLogoutHandler` |
+| `deleteCookies(...)` | Custom `ServerLogoutHandler` that adds expired cookies |
+| `addLogoutHandler(h)` | `.logoutHandler(h)` — but it **replaces**, so wrap multiples in `DelegatingServerLogoutHandler` |
+
+```java
+ServerLogoutHandler logoutHandler = new DelegatingServerLogoutHandler(
+    new SecurityContextServerLogoutHandler(),   // clearAuthentication(true)
+    new WebSessionServerLogoutHandler(),         // invalidateHttpSession(true)
+    clearCookies("SESSION", "XSRF-TOKEN"),       // deleteCookies(...)
+    customServerLogoutHandler()                  // addLogoutHandler(...)
+);
+
+http.logout(logout -> logout
+    .logoutUrl("/logout")
+    .logoutHandler(logoutHandler)
+);
+```
+
+```java
+private ServerLogoutHandler clearCookies(String... cookieNames) {
+    return (exchange, authentication) -> {
+        ServerHttpResponse response = exchange.getExchange().getResponse();
+        for (String name : cookieNames) {
+            response.addCookie(ResponseCookie.from(name, "")
+                .path("/")
+                .maxAge(Duration.ZERO)
+                .build());
+        }
+        return Mono.empty();
+    };
+}
+```
+
+> Note: WebFlux uses `WebSession` (default cookie name **`SESSION`**), not the servlet `JSESSIONID` — adjust your cookie name accordingly.
+
+---
+
+## 3. `SessionManagementConfigurer<HttpSecurity>` → mostly redesign
+
+This is the **biggest gap**. WebFlux has no full session-management configurer; session-context behavior is governed by the `ServerSecurityContextRepository`.
+
+| WebMVC method | WebFlux equivalent |
+|---|---|
+| `sessionCreationPolicy(STATELESS)` | `http.securityContextRepository(NoOpServerSecurityContextRepository.getInstance())` |
+| `sessionCreationPolicy(IF_REQUIRED)` (default) | default `WebSessionServerSecurityContextRepository` |
+| `sessionCreationPolicy(ALWAYS)` | no direct equivalent |
+| `invalidateSessionStrategy(...)` | **no equivalent** — invalidate manually |
+| `sessionFixation(...)` | **no setting** — handled implicitly (session id changes when the context is saved) |
+| `sessionConcurrency(...)` | `sessionManagement(...).concurrentSessions(...)` (recent versions only) |
+
+**Creation policy / stateless:**
+
+```java
+// sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+http.securityContextRepository(NoOpServerSecurityContextRepository.getInstance());
+```
+
+> Caveat: `oauth2Login()` is inherently **stateful** (the authorization request/state and the authenticated user are stored in the `WebSession`). If you actually need a stateless API, use `oauth2ResourceServer().jwt()` rather than `oauth2Login()` with a NoOp repository.
+
+**Session fixation:** there is no toggle — the reactive `WebSessionServerSecurityContextRepository` rotates the session id when it persists the `SecurityContext`, which is the reactive analogue of fixation protection.
+
+**Invalidate session:** no `invalidateSessionStrategy`. Use `WebSessionServerLogoutHandler` during logout, or invalidate explicitly:
+
+```java
+exchange.getSession().flatMap(WebSession::invalidate);
+```
+
+**Concurrency** (requires a recent Spring Security version — reactive concurrent-session control is relatively new, ~6.3+):
+
+```java
+@Bean
+ReactiveSessionRegistry reactiveSessionRegistry() {
+    return new InMemoryReactiveSessionRegistry();
+}
+
+http.sessionManagement(session -> session
+    .concurrentSessions(concurrency -> concurrency
+        .maximumSessions(SessionLimit.of(1))
+        .sessionRegistry(reactiveSessionRegistry)
+    )
+);
+```
+
+> One subtlety: if you **replace** the `oauth2Login` `authenticationSuccessHandler` (as in section 1), you may bypass the success handler that concurrent-session control wires in automatically. If your version supports the `Consumer<List<ServerAuthenticationSuccessHandler>>` overload, customize the existing handler list instead of replacing it outright.
+
+---
+
+## 4. `OAuth2ClientConfigurer.authorizationCodeGrant()` → `oauth2Client` on `ServerHttpSecurity`
+
+The reactive `OAuth2ClientSpec` is **flat** — there is **no nested `authorizationCodeGrant()` builder**. The methods sit directly on the spec.
+
+| WebMVC | WebFlux |
+|---|---|
+| `oauth2Client().authorizationCodeGrant().authorizationRequestResolver(...)` | `oauth2Client(o -> o.authorizationRequestResolver(...))` |
+| `...authorizationCodeGrant().authorizationRequestRepository(...)` | `...authorizationRequestRepository(...)` |
+| `...authorizationCodeGrant().accessTokenResponseClient(...)` | `ReactiveOAuth2AccessTokenResponseClient` **bean** (same as §1) |
+
+```java
+http.oauth2Client(oauth2 -> oauth2
+    .authorizationRequestResolver(serverAuthorizationRequestResolver())
+    .authorizationRequestRepository(serverAuthorizationRequestRepository())
+    // .authenticationManager(...)   // if you need a custom code-exchange manager
+);
+```
+
+The default reactive authorization-request path is `/oauth2/authorization/{registrationId}`, handled by `DefaultServerOAuth2AuthorizationRequestResolver`. The actual token exchange and authorized-client management live in `ReactiveOAuth2AuthorizedClientManager` / `ReactiveOAuth2AuthorizedClientProvider` beans rather than inline config.
+
+---
+
+## Complete combined example
+
+```java
+@Configuration
+@EnableWebFluxSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityWebFilterChain securityWebFilterChain(
+            ServerHttpSecurity http,
+            ReactiveSessionRegistry reactiveSessionRegistry) {
+
+        RedirectServerAuthenticationSuccessHandler successHandler =
+            new RedirectServerAuthenticationSuccessHandler("/home");
+        successHandler.setRequestCache(NoOpServerRequestCache.getInstance());
+
+        ServerLogoutHandler logoutHandler = new DelegatingServerLogoutHandler(
+            new SecurityContextServerLogoutHandler(),
+            new WebSessionServerLogoutHandler(),
+            clearCookies("SESSION", "XSRF-TOKEN"),
+            customServerLogoutHandler()
+        );
+
+        http
+            .authorizeExchange(ex -> ex.anyExchange().authenticated())
+
+            .oauth2Login(oauth2 -> oauth2
+                .authenticationMatcher(new PathPatternParserServerWebExchangeMatcher(
+                        "/login/oauth2/code/{registrationId}"))
+                .authenticationFailureHandler(
+                        new RedirectServerAuthenticationFailureHandler("/login?error"))
+                .authenticationSuccessHandler(successHandler))
+
+            .oauth2Client(oauth2 -> oauth2
+                .authorizationRequestResolver(serverAuthorizationRequestResolver())
+                .authorizationRequestRepository(serverAuthorizationRequestRepository()))
+
+            .logout(logout -> logout
+                .logoutUrl("/logout")
+                .logoutHandler(logoutHandler))
+
+            // STATELESS would instead be:
+            // .securityContextRepository(NoOpServerSecurityContextRepository.getInstance())
+            .sessionManagement(session -> session
+                .concurrentSessions(c -> c
+                    .maximumSessions(SessionLimit.of(1))
+                    .sessionRegistry(reactiveSessionRegistry)));
+
+        return http.build();
+    }
+
+    @Bean
+    ReactiveSessionRegistry reactiveSessionRegistry() {
+        return new InMemoryReactiveSessionRegistry();
+    }
+
+    @Bean
+    ReactiveOAuth2AccessTokenResponseClient<OAuth2AuthorizationCodeGrantRequest>
+    authorizationCodeAccessTokenResponseClient() {
+        return new WebClientReactiveAuthorizationCodeTokenResponseClient();
+    }
+
+    private ServerLogoutHandler clearCookies(String... names) {
+        return (exchange, auth) -> {
+            ServerHttpResponse resp = exchange.getExchange().getResponse();
+            for (String n : names) {
+                resp.addCookie(ResponseCookie.from(n, "").path("/")
+                        .maxAge(Duration.ZERO).build());
+            }
+            return Mono.empty();
+        };
+    }
+
+    private ServerLogoutHandler customServerLogoutHandler() {
+        return (exchange, auth) -> Mono.empty(); // your logic
+    }
+
+    private ServerOAuth2AuthorizationRequestResolver serverAuthorizationRequestResolver() {
+        return null; // your resolver
+    }
+
+    private ServerAuthorizationRequestRepository<OAuth2AuthorizationRequest>
+    serverAuthorizationRequestRepository() {
+        return null; // e.g. new WebSessionServerOAuth2AuthorizationRequestRepository()
+    }
+}
+```
+
+---
+
+## Key takeaways
+
+1. **Not a 1:1 mapping.** `successHandler`/`defaultSuccessUrl` merge into one `authenticationSuccessHandler` slot; the logout sub-flags become composed `ServerLogoutHandler`s; the OAuth2 token endpoint becomes a `ReactiveOAuth2AccessTokenResponseClient` bean.
+2. **Session management is the weakest area.** `invalidateSessionStrategy` and `sessionFixation` have no direct reactive equivalents, `sessionCreationPolicy` becomes a `ServerSecurityContextRepository` choice, and `sessionConcurrency` requires a recent Spring Security version.
+3. **`authorizationCodeGrant()` disappears** — its methods live directly on the flat `oauth2Client(...)` spec.
+4. **Dependencies:** add `spring-boot-starter-webflux` + `spring-security-oauth2-client` and remove the servlet (`spring-boot-starter-web`) starter — don't keep both stacks on the classpath.
+
+If you share your exact **Spring Security / Spring Boot version**, I can confirm which version-gated features (especially reactive concurrent-session control) are actually available to you.
+
