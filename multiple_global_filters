@@ -1,0 +1,270 @@
+# Reading Session JSON → Parsing → Adding Headers Downstream (Spring Cloud Gateway WebFlux)
+
+The right tool here is a **`GlobalFilter`**, because you want this to run on *every* routed request. The key WebFlux rule: `exchange.getSession()` returns a `Mono<WebSession>`, so everything must stay reactive — compose with `flatMap`, **never** call `.block()`.
+
+The full flow is: **read session → parse JSON → extract fields → mutate request with new headers → forward downstream**.
+
+---
+
+## 1. The DTO you parse into
+
+```java
+import java.util.List;
+
+public class SessionInfo {
+    private String userId;
+    private String tenantId;
+    private List<String> roles;
+
+    // no-arg constructor required by Jackson
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+
+    public String getTenantId() { return tenantId; }
+    public void setTenantId(String tenantId) { this.tenantId = tenantId; }
+
+    public List<String> getRoles() { return roles; }
+    public void setRoles(List<String> roles) { this.roles = roles; }
+}
+```
+
+---
+
+## 2. The Global Filter
+
+Replace `"SESSION_JSON"` with the actual attribute name under which your JSON is stored in the session.
+
+```java
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.core.Ordered;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.util.List;
+
+@Component
+public class SessionToHeaderGlobalFilter implements GlobalFilter, Ordered {
+
+    private static final String SESSION_JSON_ATTRIBUTE = "SESSION_JSON";
+
+    private static final String USER_ID_HEADER   = "X-User-Id";
+    private static final String TENANT_ID_HEADER = "X-Tenant-Id";
+    private static final String ROLES_HEADER     = "X-User-Roles";
+
+    private final ObjectMapper objectMapper;
+
+    public SessionToHeaderGlobalFilter(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        return exchange.getSession()                          // Mono<WebSession>
+                .flatMap(session -> {
+                    Object rawValue = session.getAttribute(SESSION_JSON_ATTRIBUTE);
+
+                    // No session data -> continue untouched
+                    if (rawValue == null) {
+                        return chain.filter(exchange);
+                    }
+
+                    SessionInfo info;
+                    try {
+                        info = parseSessionInfo(rawValue);   // JSON -> Object
+                    } catch (Exception ex) {
+                        // Pick your policy: reject, log+continue, or 500.
+                        // Rejecting is safest so identity is never silently dropped.
+                        return unauthorized(exchange);
+                    }
+
+                    // Mutate the request -> add trusted headers
+                    ServerHttpRequest mutatedRequest = exchange.getRequest()
+                            .mutate()
+                            .headers(headers -> {
+                                // Strip any client-supplied copies first (anti-spoofing)
+                                headers.remove(USER_ID_HEADER);
+                                headers.remove(TENANT_ID_HEADER);
+                                headers.remove(ROLES_HEADER);
+
+                                setIfPresent(headers, USER_ID_HEADER, info.getUserId());
+                                setIfPresent(headers, TENANT_ID_HEADER, info.getTenantId());
+
+                                List<String> roles = info.getRoles();
+                                if (roles != null && !roles.isEmpty()) {
+                                    headers.set(ROLES_HEADER, String.join(",", roles));
+                                }
+                            })
+                            .build();
+
+                    // Forward the mutated exchange downstream
+                    return chain.filter(
+                            exchange.mutate().request(mutatedRequest).build());
+                });
+    }
+
+    private SessionInfo parseSessionInfo(Object rawValue) throws JsonProcessingException {
+        // If the attribute is a raw JSON String
+        if (rawValue instanceof String json) {
+            return objectMapper.readValue(json, SessionInfo.class);
+        }
+        // If Spring Session already deserialized it into a Map / JsonNode / object
+        return objectMapper.convertValue(rawValue, SessionInfo.class);
+    }
+
+    private static void setIfPresent(HttpHeaders headers, String name, String value) {
+        if (StringUtils.hasText(value)) {
+            headers.set(name, value);
+        }
+    }
+
+    private static Mono<Void> unauthorized(ServerWebExchange exchange) {
+        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+        return exchange.getResponse().setComplete();
+    }
+
+    @Override
+    public int getOrder() {
+        // Run early so the headers are present before routing/forwarding
+        return Ordered.HIGHEST_PRECEDENCE + 10;
+    }
+}
+```
+
+`ObjectMapper` is already a Spring bean, so it autowires in directly.
+
+---
+
+## Why each piece matters
+
+**1. Stay reactive — never `.block()`.** `exchange.getSession()` gives a `Mono<WebSession>`. Compose with `flatMap` so you don't stall the Netty event loop.
+
+**2. Requests are immutable — mutate, don't set.** You can't add a header to the incoming request directly. Build a new request via `.mutate().headers(...).build()`, then a new exchange via `exchange.mutate().request(...).build()`, and pass *that* down the chain.
+
+**3. Handle both attribute shapes.** Depending on how the value was stored, the session attribute may be a raw JSON **String** (use `readValue`) or an already-deserialized **Map/object** (use `convertValue`). The `parseSessionInfo` helper covers both.
+
+**4. Header values are plain strings.** Flatten the object into individual headers (as above). If a downstream service genuinely needs the whole structure, forward the JSON itself: `.header("X-Session-Info", json)`.
+
+**5. Order matters.** A high precedence (`HIGHEST_PRECEDENCE + 10`) ensures this runs before the routing filter so the headers are applied before the request is forwarded.
+
+---
+
+## Security notes (don't skip these)
+
+- **Prevent spoofing:** always `remove(...)` any client-supplied copies of your identity headers *before* setting them from trusted session data. Otherwise a caller can send their own `X-User-Id` and impersonate someone.
+- **Keep headers small:** put compact identifiers (`X-User-Id`, `X-Tenant-Id`, `X-User-Roles`) rather than secrets, tokens, or large JSON blobs.
+
+---
+
+## Multi-instance gateways
+
+If you run more than one gateway instance, the in-memory `WebSession` won't be shared. Back it with a distributed store using **Spring Session + Redis** so the session is readable on every request regardless of which instance handles it:
+
+```properties
+spring.session.store-type=redis
+```
+
+with the `spring-session-data-redis` dependency. Spring Session provides the reactive `WebSession` integration needed for WebFlux.
+
+---
+
+## If you only want this on *some* routes
+
+Swap the `GlobalFilter` for an `AbstractGatewayFilterFactory` and reference it per-route under `filters:` in `application.yml`. The session-reading/parsing logic inside is identical — only the wiring changes.
+
+**The three things to adapt for your case:** (a) the session attribute name, (b) which JSON fields map to which headers, and (c) your error policy when the JSON is missing or malformed.
+
+
+
+
+
+
+
+Yes. You can have **multiple `GlobalFilter`s** in Spring Cloud Gateway.
+
+Spring will collect all `GlobalFilter` beans, combine them with route-specific `GatewayFilter`s, and sort them using `Ordered` / `@Order`. The lowest order value runs earlier in the **pre** phase and later in the **post** phase. ([cloud.spring.io](https://cloud.spring.io/spring-cloud-gateway/reference/html/))
+
+Example:
+
+```java
+@Component
+public class ExistingGlobalFilter implements GlobalFilter, Ordered {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        // existing logic
+        return chain.filter(exchange);
+    }
+
+    @Override
+    public int getOrder() {
+        return 0;
+    }
+}
+```
+
+And your new session/header filter:
+
+```java
+@Component
+public class SessionHeaderGlobalFilter implements GlobalFilter, Ordered {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        return exchange.getSession()
+                .flatMap(session -> {
+                    // read session, parse JSON, mutate headers
+                    return chain.filter(exchange);
+                });
+    }
+
+    @Override
+    public int getOrder() {
+        return -100;
+    }
+}
+```
+
+Because `-100` is lower than `0`, `SessionHeaderGlobalFilter` runs **before** `ExistingGlobalFilter` in the request/pre phase.
+
+---
+
+You can also use `@Order` instead of implementing `Ordered`:
+
+```java
+@Component
+@Order(-100)
+public class SessionHeaderGlobalFilter implements GlobalFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        return exchange.getSession()
+                .flatMap(session -> {
+                    // logic
+                    return chain.filter(exchange);
+                });
+    }
+}
+```
+
+---
+
+So yes, you can keep your existing `GlobalFilter` and add another one.
+
+Just be careful with the ordering:
+
+```java
+public int getOrder() {
+    return Ordered.HIGHEST_PRECEDENCE + 10;
+}
+```
+
+Use a very early order if the session-derived headers must be available to later filters and downstream routing.
+
