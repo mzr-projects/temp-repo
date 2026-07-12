@@ -1,0 +1,510 @@
+Here's the full conversion to Spring WebFlux. I'm targeting the current stack: Spring Boot 4.1.0 is the latest stable release (June 10, 2026), built on Spring Framework 7 and requiring Java 17 minimum, which pairs with Spring Security 7.x.
+
+A few important conceptual shifts before the code:
+
+- `SecurityFilterChain`/`HttpSecurity` → `SecurityWebFilterChain`/`ServerHttpSecurity`, and you use `ReactiveSecurityContextHolder` instead of `SecurityContextHolder`, configure `SecurityWebFilterChain` instead of `SecurityFilterChain`, and all operations must return `Mono` or `Flux`
+- There is no `HttpServletRequest` bean to inject — request data comes from the `ServerWebExchange`. Your `CustomTokenResponseClient(httpServletRequest)` pattern doesn't translate directly; instead, the reactive way is a `WebClientReactiveAuthorizationCodeTokenResponseClient` with a parameters converter, wired into `OidcAuthorizationCodeReactiveAuthenticationManager` / `OAuth2LoginReactiveAuthenticationManager` via `DelegatingReactiveAuthenticationManager`. Per-request values get smuggled through the `OAuth2AuthorizationRequest`'s additional parameters (set in the resolver).
+- Session concurrency, cookies, invalid-session handling all change (WebFlux uses `WebSession`, `CookieWebSessionIdResolver`, and `ReactiveSessionRegistry`).
+
+---
+
+## 1. `SecurityConfig.java`
+
+```java
+package ir.csas.gateway.config;
+
+import ir.csas.gateway.properties.GatewayProperties;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.DelegatingReactiveAuthenticationManager;
+import org.springframework.security.authentication.ReactiveAuthenticationManager;
+import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
+import org.springframework.security.config.web.server.ServerHttpSecurity;
+import org.springframework.security.core.session.InMemoryReactiveSessionRegistry;
+import org.springframework.security.core.session.ReactiveSessionRegistry;
+import org.springframework.security.oauth2.client.authentication.OAuth2LoginReactiveAuthenticationManager;
+import org.springframework.security.oauth2.client.endpoint.WebClientReactiveAuthorizationCodeTokenResponseClient;
+import org.springframework.security.oauth2.client.oidc.authentication.OidcAuthorizationCodeReactiveAuthenticationManager;
+import org.springframework.security.oauth2.client.oidc.userinfo.OidcReactiveOAuth2UserService;
+import org.springframework.security.oauth2.client.oidc.web.server.logout.OidcClientInitiatedServerLogoutSuccessHandler;
+import org.springframework.security.oauth2.client.registration.ReactiveClientRegistrationRepository;
+import org.springframework.security.oauth2.client.userinfo.DefaultReactiveOAuth2UserService;
+import org.springframework.security.web.server.SecurityWebFilterChain;
+import org.springframework.security.web.server.WebFilterExchange;
+import org.springframework.security.web.server.authentication.RedirectServerAuthenticationSuccessHandler;
+import org.springframework.security.web.server.authentication.ServerAuthenticationEntryPoint;
+import org.springframework.security.web.server.authorization.ServerAccessDeniedHandler;
+import org.springframework.security.web.server.session.InvalidateLeastUsedServerMaximumSessionsExceededHandler;
+import org.springframework.security.web.server.util.matcher.PathPatternParserServerWebExchangeMatcher;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.reactive.CorsConfigurationSource;
+import org.springframework.web.cors.reactive.UrlBasedCorsConfigurationSource;
+import org.springframework.web.server.session.InMemoryWebSessionStore;
+import org.springframework.web.server.session.WebSessionStore;
+import reactor.core.publisher.Mono;
+
+import java.util.Arrays;
+
+@Configuration
+@EnableWebFluxSecurity
+@Slf4j
+public class SecurityConfig {
+
+    private final GatewayProperties gatewayProperties;
+    private final ReactiveClientRegistrationRepository clientRegistrationRepository;
+    private final GatewayOAuth2FailureHandler gatewayOAuth2FailureHandler;
+    private final CustomReactiveJwtDecoderFactory jwtDecoderFactory;
+
+    public SecurityConfig(GatewayProperties gatewayProperties,
+                          ReactiveClientRegistrationRepository clientRegistrationRepository,
+                          GatewayOAuth2FailureHandler gatewayOAuth2FailureHandler,
+                          CustomReactiveJwtDecoderFactory jwtDecoderFactory) {
+        this.gatewayProperties = gatewayProperties;
+        this.clientRegistrationRepository = clientRegistrationRepository;
+        this.gatewayOAuth2FailureHandler = gatewayOAuth2FailureHandler;
+        this.jwtDecoderFactory = jwtDecoderFactory;
+    }
+
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http,
+                                                         ReactiveSessionRegistry sessionRegistry,
+                                                         WebSessionStore webSessionStore) {
+
+        CustomServerAuthRequestResolver authorizationRequestResolver =
+                new CustomServerAuthRequestResolver(clientRegistrationRepository);
+
+        ReactiveAuthenticationManager loginAuthenticationManager = loginAuthenticationManager();
+
+        http
+            .csrf(ServerHttpSecurity.CsrfSpec::disable)
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+            .exceptionHandling(ex -> ex
+                    .authenticationEntryPoint(authenticationEntryPoint())
+                    .accessDeniedHandler(accessDeniedHandler()))
+            .authorizeExchange(this::applyAuthExchangeConfig)
+            .sessionManagement(sessions -> sessions
+                    .concurrentSessions(concurrency -> concurrency
+                            .maximumSessions(org.springframework.security.web.server.authentication.SessionLimit.of(5))
+                            .maximumSessionsExceededHandler(
+                                    new InvalidateLeastUsedServerMaximumSessionsExceededHandler(webSessionStore))
+                            .sessionRegistry(sessionRegistry)))
+            .oauth2ResourceServer(rs -> rs
+                    .jwt(jwt -> jwt.jwtDecoder(
+                            jwtDecoderFactory.createDecoder()))
+                    // same "swallow" behavior as your empty servlet entry point
+                    .authenticationEntryPoint((exchange, e) -> Mono.empty()))
+            .oauth2Client(client -> client
+                    .authorizationRequestResolver(authorizationRequestResolver))
+            .oauth2Login(login -> login
+                    .authorizationRequestResolver(authorizationRequestResolver)
+                    // replaces redirectionEndpoint().baseUri("/api/public/callback")
+                    .authenticationMatcher(
+                            new PathPatternParserServerWebExchangeMatcher("/api/public/callback"))
+                    .authenticationManager(loginAuthenticationManager)
+                    .authenticationSuccessHandler(
+                            new RedirectServerAuthenticationSuccessHandler(gatewayProperties.getFrontUrl()))
+                    .authenticationFailureHandler(gatewayOAuth2FailureHandler))
+            .logout(logout -> logout
+                    .logoutUrl("/api/public/logout")
+                    .logoutSuccessHandler(oidcLogoutSuccessHandler()));
+
+        return http.build();
+    }
+
+    /**
+     * Replaces CustomTokenResponseClient + CustomTokenRequestConverter.
+     * The reactive token response client gets extra form parameters through
+     * a parameters converter instead of a RequestEntityConverter.
+     */
+    private ReactiveAuthenticationManager loginAuthenticationManager() {
+        WebClientReactiveAuthorizationCodeTokenResponseClient tokenResponseClient =
+                new WebClientReactiveAuthorizationCodeTokenResponseClient();
+        tokenResponseClient.addParametersConverter(new CustomTokenParametersConverter());
+
+        OidcAuthorizationCodeReactiveAuthenticationManager oidcManager =
+                new OidcAuthorizationCodeReactiveAuthenticationManager(
+                        tokenResponseClient, new OidcReactiveOAuth2UserService());
+        // replaces the JwtDecoderFactory<ClientRegistration> bean of the servlet version
+        oidcManager.setJwtDecoderFactory(jwtDecoderFactory);
+
+        OAuth2LoginReactiveAuthenticationManager oauth2Manager =
+                new OAuth2LoginReactiveAuthenticationManager(
+                        tokenResponseClient, new DefaultReactiveOAuth2UserService());
+
+        return new DelegatingReactiveAuthenticationManager(oidcManager, oauth2Manager);
+    }
+
+    private void applyAuthExchangeConfig(ServerHttpSecurity.AuthorizeExchangeSpec auth) {
+        if (gatewayProperties.isUnsecure()) {
+            auth.anyExchange().permitAll();
+        } else {
+            auth.pathMatchers("/api/public/**").permitAll()
+                .anyExchange().authenticated();
+        }
+    }
+
+    /**
+     * Replaces the manual LogoutHandler redirect to the end-session endpoint.
+     * This handler builds the id_token_hint + post_logout_redirect_uri URL for you
+     * and invalidates the WebSession first (default logout handlers still run).
+     */
+    private OidcClientInitiatedServerLogoutSuccessHandler oidcLogoutSuccessHandler() {
+        OidcClientInitiatedServerLogoutSuccessHandler handler =
+                new OidcClientInitiatedServerLogoutSuccessHandler(clientRegistrationRepository);
+        handler.setPostLogoutRedirectUri(gatewayProperties.getFrontUrl());
+        return handler;
+    }
+
+    @Bean
+    public ServerAuthenticationEntryPoint authenticationEntryPoint() {
+        return (exchange, ex) ->
+                SecurityUtils.sendForbidden(exchange.getResponse(), gatewayProperties.getRedirectUrl());
+    }
+
+    @Bean
+    public ServerAccessDeniedHandler accessDeniedHandler() {
+        return (exchange, denied) -> {
+            exchange.getRequest().getQueryParams()
+                    .forEach((key, values) -> log.info("(accessDeniedHandler) {}: {}", key, values));
+            return SecurityUtils.sendForbidden(exchange.getResponse(), gatewayProperties.getRedirectUrl());
+        };
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOriginPatterns(gatewayProperties.getCors());
+        configuration.setAllowedMethods(Arrays.asList("HEAD", "GET", "POST", "PUT", "DELETE", "PATCH"));
+        configuration.setAllowCredentials(true);
+        configuration.setAllowedHeaders(Arrays.asList("Authorization", "Cache-Control", "Content-Type"));
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
+    }
+
+    @Bean
+    public ReactiveSessionRegistry reactiveSessionRegistry() {
+        // If you use Spring Session (e.g. Redis), replace with
+        // SpringSessionBackedReactiveSessionRegistry for cluster-safe concurrency control
+        return new InMemoryReactiveSessionRegistry();
+    }
+
+    @Bean
+    public WebSessionStore webSessionStore() {
+        return new InMemoryWebSessionStore();
+    }
+}
+```
+
+> **Note the imports:** in WebFlux, `CorsConfigurationSource` comes from `org.springframework.web.cors.reactive`, not `org.springframework.web.cors` — a classic conversion pitfall.
+
+---
+
+## 2. `SecurityUtils.java` (reactive version)
+
+```java
+package ir.csas.gateway.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import reactor.core.publisher.Mono;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+
+@Slf4j
+public final class SecurityUtils {
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    private SecurityUtils() {
+    }
+
+    public static Mono<Void> sendForbidden(ServerHttpResponse response, String redirectUrl) {
+        try {
+            response.setStatusCode(HttpStatus.FORBIDDEN);
+            response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+            byte[] body = OBJECT_MAPPER.writeValueAsBytes(Map.of(
+                    "status", 403,
+                    "message", "Access denied",
+                    "redirectLink", redirectUrl));
+            DataBuffer buffer = response.bufferFactory().wrap(body);
+            return response.writeWith(Mono.just(buffer));
+        } catch (Exception e) {
+            log.error("failed to write forbidden response", e);
+            response.setStatusCode(HttpStatus.FORBIDDEN);
+            return response.setComplete();
+        }
+    }
+}
+```
+
+---
+
+## 3. `GatewayOAuth2FailureHandler.java`
+
+```java
+package ir.csas.gateway.config;
+
+import ir.csas.gateway.properties.GatewayProperties;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.web.server.WebFilterExchange;
+import org.springframework.security.web.server.authentication.ServerAuthenticationFailureHandler;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class GatewayOAuth2FailureHandler implements ServerAuthenticationFailureHandler {
+
+    private final GatewayProperties gatewayProperties;
+
+    @Override
+    public Mono<Void> onAuthenticationFailure(WebFilterExchange webFilterExchange,
+                                              AuthenticationException exception) {
+        log.error("OAuth2 authentication failed", exception);
+        return SecurityUtils.sendForbidden(
+                webFilterExchange.getExchange().getResponse(),
+                gatewayProperties.getRedirectUrl());
+    }
+}
+```
+
+---
+
+## 4. `CustomServerAuthRequestResolver.java`
+
+This replaces `CustomAuthRequestResolver`. Anything your old resolver read from `HttpServletRequest` is now read from the `ServerWebExchange`, and anything the token request later needs is stashed in `additionalParameters` (that's how it survives to the token call, since reactive converters have no request access):
+
+```java
+package ir.csas.gateway.config;
+
+import org.springframework.security.oauth2.client.registration.ReactiveClientRegistrationRepository;
+import org.springframework.security.oauth2.client.web.server.DefaultServerOAuth2AuthorizationRequestResolver;
+import org.springframework.security.oauth2.client.web.server.ServerOAuth2AuthorizationRequestResolver;
+import org.springframework.security.oauth2.core.endpoint.OAuth2AuthorizationRequest;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class CustomServerAuthRequestResolver implements ServerOAuth2AuthorizationRequestResolver {
+
+    private final DefaultServerOAuth2AuthorizationRequestResolver delegate;
+
+    public CustomServerAuthRequestResolver(ReactiveClientRegistrationRepository clientRegistrationRepository) {
+        this.delegate = new DefaultServerOAuth2AuthorizationRequestResolver(clientRegistrationRepository);
+    }
+
+    @Override
+    public Mono<OAuth2AuthorizationRequest> resolve(ServerWebExchange exchange) {
+        return delegate.resolve(exchange).map(request -> customize(request, exchange));
+    }
+
+    @Override
+    public Mono<OAuth2AuthorizationRequest> resolve(ServerWebExchange exchange, String clientRegistrationId) {
+        return delegate.resolve(exchange, clientRegistrationId).map(request -> customize(request, exchange));
+    }
+
+    private OAuth2AuthorizationRequest customize(OAuth2AuthorizationRequest request, ServerWebExchange exchange) {
+        Map<String, Object> additionalParameters = new LinkedHashMap<>(request.getAdditionalParameters());
+
+        // TODO: port the logic of your old CustomAuthRequestResolver here.
+        // Example: forward an incoming query parameter to the IdP and keep a
+        // copy so the token request converter can also send it:
+        // String tenant = exchange.getRequest().getQueryParams().getFirst("tenant");
+        // if (tenant != null) {
+        //     additionalParameters.put("tenant", tenant);
+        // }
+
+        return OAuth2AuthorizationRequest.from(request)
+                .additionalParameters(additionalParameters)
+                .build();
+    }
+}
+```
+
+---
+
+## 5. `CustomTokenParametersConverter.java`
+
+This replaces both `CustomTokenResponseClient` and `CustomTokenRequestConverter`. It has no access to the live request — it reads the values the resolver put on the authorization request:
+
+```java
+package ir.csas.gateway.config;
+
+import org.springframework.core.convert.converter.Converter;
+import org.springframework.security.oauth2.client.endpoint.OAuth2AuthorizationCodeGrantRequest;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+
+public class CustomTokenParametersConverter
+        implements Converter<OAuth2AuthorizationCodeGrantRequest, MultiValueMap<String, String>> {
+
+    @Override
+    public MultiValueMap<String, String> convert(OAuth2AuthorizationCodeGrantRequest grantRequest) {
+        MultiValueMap<String, String> parameters = new LinkedMultiValueMap<>();
+
+        // Values stashed by CustomServerAuthRequestResolver are available here:
+        grantRequest.getAuthorizationExchange()
+                .getAuthorizationRequest()
+                .getAdditionalParameters()
+                .forEach((key, value) -> parameters.add(key, String.valueOf(value)));
+
+        // TODO: port the logic of your old CustomTokenRequestConverter here
+        // (extra form fields sent to the token endpoint, custom client auth, etc.)
+
+        return parameters;
+    }
+}
+```
+
+---
+
+## 6. `CustomReactiveJwtDecoderFactory.java`
+
+Replaces `CustomJwtDecoder` + the `JwtDecoderFactory<ClientRegistration>` bean:
+
+```java
+package ir.csas.gateway.config;
+
+import org.springframework.boot.autoconfigure.security.oauth2.resource.OAuth2ResourceServerProperties;
+import org.springframework.security.oauth2.client.registration.ClientRegistration;
+import org.springframework.security.oauth2.jwt.NimbusReactiveJwtDecoder;
+import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
+import org.springframework.security.oauth2.jwt.ReactiveJwtDecoderFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class CustomReactiveJwtDecoderFactory implements ReactiveJwtDecoderFactory<ClientRegistration> {
+
+    private final OAuth2ResourceServerProperties properties;
+
+    public CustomReactiveJwtDecoderFactory(OAuth2ResourceServerProperties properties) {
+        this.properties = properties;
+    }
+
+    @Override
+    public ReactiveJwtDecoder createDecoder(ClientRegistration context) {
+        return createDecoder();
+    }
+
+    public ReactiveJwtDecoder createDecoder() {
+        // TODO: apply whatever customization CustomJwtDecoder did
+        // (custom validators, claim set converters, etc.)
+        return NimbusReactiveJwtDecoder
+                .withJwkSetUri(properties.getJwt().getJwkSetUri())
+                .build();
+    }
+}
+```
+
+---
+
+## 7. `SessionConfig.java` — cookie SameSite (replaces `CookieSerializer`)
+
+There is no `CookieSerializer` in WebFlux unless you use Spring Session. The native way:
+
+```java
+package ir.csas.gateway.config;
+
+import ir.csas.gateway.properties.GatewayProperties;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.server.session.CookieWebSessionIdResolver;
+import org.springframework.web.server.session.WebSessionIdResolver;
+
+@Configuration
+@RequiredArgsConstructor
+public class SessionConfig {
+
+    private final GatewayProperties gatewayProperties;
+
+    @Bean
+    public WebSessionIdResolver webSessionIdResolver() {
+        CookieWebSessionIdResolver resolver = new CookieWebSessionIdResolver();
+        resolver.addCookieInitializer(builder -> builder
+                .sameSite(gatewayProperties.getSameSite())
+                .httpOnly(true));
+        return resolver;
+    }
+}
+```
+
+---
+
+## 8. Dependencies (`pom.xml`)
+
+```xml
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.1.0</version>
+</parent>
+
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-webflux</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-oauth2-client</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+    </dependency>
+    <!-- Optional: distributed sessions (recommended for a gateway) -->
+    <!--
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.session</groupId>
+        <artifactId>spring-session-data-redis</artifactId>
+    </dependency>
+    -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+```
+
+Remove `spring-boot-starter-web` — if it's on the classpath, Boot boots a servlet container and none of this reactive config applies. Also make sure at least one `ClientRegistration` is configured through a `ReactiveClientRegistrationRepository` bean, which Spring Boot builds automatically from the `spring.security.oauth2.client.registration` properties — your existing YAML keys stay the same.
+
+---
+
+## What changed and what has no 1:1 equivalent
+
+| Servlet original | WebFlux replacement |
+|---|---|
+| `SecurityFilterChain` / `HttpSecurity` | `SecurityWebFilterChain` / `ServerHttpSecurity` |
+| `ClientRegistrationRepository` | `ReactiveClientRegistrationRepository` |
+| `CustomTokenResponseClient(HttpServletRequest)` | `WebClientReactiveAuthorizationCodeTokenResponseClient` + parameters converter, wired via authentication managers |
+| `CustomAuthRequestResolver` | `ServerOAuth2AuthorizationRequestResolver` delegating to `DefaultServerOAuth2AuthorizationRequestResolver` |
+| `JwtDecoderFactory<ClientRegistration>` | `ReactiveJwtDecoderFactory<ClientRegistration>` set on the OIDC authentication manager |
+| Manual `LogoutHandler` redirect with `id_token_hint` | `OidcClientInitiatedServerLogoutSuccessHandler` (does exactly this, correctly) |
+| `SessionRegistry` + `maximumSessions(5)` | `ReactiveSessionRegistry` + `concurrentSessions(...)` (requires Spring Security ≥ 6.3, included in Boot 4.x) |
+| `CookieSerializer` SameSite | `CookieWebSessionIdResolver.addCookieInitializer(...)` |
+| `SessionCreationPolicy.ALWAYS`, `sessionFixation().newSession()`, `invalidSessionStrategy` | No direct equivalents. WebFlux creates the `WebSession` lazily, session IDs are rotated on authentication by default, and an invalid/expired session simply results in an unauthenticated exchange — which lands in your `ServerAuthenticationEntryPoint`, giving you the same forbidden-with-redirect behavior |
+| `AuthenticationEntryPoint` / `AccessDeniedHandler` | `ServerAuthenticationEntryPoint` / `ServerAccessDeniedHandler` returning `Mono<Void>` |
+
+Two caveats worth flagging: the `InMemoryReactiveSessionRegistry` and `InMemoryWebSessionStore` won't work across multiple gateway instances — for a clustered gateway, add Spring Session Redis and use `SpringSessionBackedReactiveSessionRegistry`. And since I can't see the bodies of your `Custom*` classes, I've left clearly marked `TODO` blocks where their specific logic (extra token parameters, JWT validation tweaks, etc.) needs to be ported — if you share those classes, I can convert them precisely too.
