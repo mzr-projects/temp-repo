@@ -1,0 +1,169 @@
+No search needed — this is a protocol-design question, and it's an important one to get right. Let me give you the two viable strategies, and a clear recommendation for your stack (small local model + tools that already return structured data).
+
+## The key insight: don't make the model carry structured data
+
+You have two possible channels for a table or chart to reach the UI:
+
+1. **In-band**: the model writes it in the token stream (e.g., a Markdown table), and the UI parses/renders it
+2. **Out-of-band**: your backend already *has* the structured data (it came from Feign, inside the tool!) and sends it to the UI as a **separate typed SSE event**, while the model only streams the narrative text
+
+For an 8B local model, option 2 is dramatically more reliable. Asking llama-8B to faithfully re-emit 15 rows × 6 columns of Persian data as a well-formed Markdown table or JSON *inside its answer* will produce mangled rows, dropped columns, and hallucinated values regularly. You already have the exact data in Java — never round-trip data through an LLM when you can pass it around the LLM.
+
+## Recommended architecture: typed events, data flows around the model
+
+Extend your SSE protocol from 3 event types to 4:
+
+```
+event:session   → session id (once)
+event:token     → narrative text chunks (from the model)
+event:data      → structured payload: {"kind":"table"|"chart", ...} (from your tools, verbatim)
+event:done      → end of stream
+```
+
+### Backend: a per-request event channel the tools can push to
+
+```java
+/** Request-scoped bridge between tool execution and the SSE stream. */
+public class StreamEventChannel {
+    private final Sinks.Many<UiEvent> sink = Sinks.many().unicast().onBackpressureBuffer();
+
+    public void emitTable(String title, List<String> columns, List<List<String>> rows) {
+        sink.tryEmitNext(new UiEvent("table", Map.of(
+                "title", title, "columns", columns, "rows", rows)));
+    }
+
+    public void emitChart(String title, String chartType, List<String> labels, List<Number> values) {
+        sink.tryEmitNext(new UiEvent("chart", Map.of(
+                "title", title, "chartType", chartType,   // "line" | "bar" | "pie"
+                "labels", labels, "values", values)));
+    }
+
+    public Flux<UiEvent> events() { return sink.asFlux(); }
+    public void complete()        { sink.tryEmitComplete(); }
+
+    public record UiEvent(String kind, Map<String, Object> payload) {}
+}
+```
+
+Pass it to tools via Spring AI's `ToolContext` (tool methods can declare a `ToolContext` parameter that is **not** exposed to the model):
+
+```java
+@Tool(description = "...")
+public String searchProfiles(/* flattened params */, ToolContext toolContext) {
+    ProfileSearchResult result = identityClient.searchProfiles(buildFilter(...));
+
+    // 1) push the exact data to the UI channel — bypasses the model entirely
+    StreamEventChannel channel = (StreamEventChannel) toolContext.getContext().get("uiChannel");
+    channel.emitTable("نتایج جستجوی پروفایل",
+            List.of("نام", "کد ملی", "موبایل", "وضعیت"),
+            result.items().stream()
+                  .map(p -> List.of(p.fullName(), p.nationalCodeMasked(),
+                                    p.mobileMasked(), p.status()))
+                  .toList());
+
+    // 2) give the model only a compact summary to talk about
+    return "تعداد %d پروفایل یافت شد. جدول نتایج برای کاربر نمایش داده شده است؛ خلاصه کوتاهی ارائه بده."
+            .formatted(result.total());
+}
+```
+
+Service layer merges the two streams:
+
+```java
+public Flux<ServerSentEvent<String>> chatStream(String sessionId, String userMessage) {
+    StreamEventChannel channel = new StreamEventChannel();
+
+    Flux<ServerSentEvent<String>> tokens = chatClient.prompt()
+            .user(userMessage)
+            .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
+            .toolContext(Map.of("uiChannel", channel))
+            .stream()
+            .content()
+            .doOnTerminate(channel::complete)
+            .map(chunk -> sse("token", chunk));
+
+    Flux<ServerSentEvent<String>> dataEvents = channel.events()
+            .map(ev -> sse("data", toJson(ev)));   // {"kind":"table","payload":{...}}
+
+    return Flux.merge(tokens, dataEvents);          // interleaved as they occur
+}
+```
+
+The beautiful property: the table event arrives **the moment the tool finishes** — often *before* the model's narrative tokens — so the user sees the data table immediately while the summary is still typing.
+
+### Frontend: switch on event kind
+
+Extend the parser loop you already have:
+
+```javascript
+case 'token':
+  botBubble.textContent += data;
+  break;
+
+case 'data': {
+  const ev = JSON.parse(data);
+  if (ev.kind === 'table')  renderTable(botContainer, ev.payload);
+  else if (ev.kind === 'chart') renderChart(botContainer, ev.payload);
+  break;
+}
+```
+
+```javascript
+function renderTable(container, p) {
+  const table = document.createElement('table');
+  table.innerHTML =
+    '<caption>' + esc(p.title) + '</caption>' +
+    '<thead><tr>' + p.columns.map(c => '<th>' + esc(c) + '</th>').join('') + '</tr></thead>' +
+    '<tbody>' + p.rows.map(r =>
+        '<tr>' + r.map(c => '<td>' + esc(c) + '</td>').join('') + '</tr>').join('') + '</tbody>';
+  container.appendChild(table);
+}
+
+function renderChart(container, p) {          // Chart.js
+  const canvas = document.createElement('canvas');
+  container.appendChild(canvas);
+  new Chart(canvas, {
+    type: p.chartType,
+    data: { labels: p.labels, datasets: [{ label: p.title, data: p.values }] }
+  });
+}
+```
+
+(`esc()` = HTML-escape — the payload contains downstream-service data, treat it as untrusted.)
+
+## The fallback strategy: Markdown rendering for model-authored structure
+
+For *small* structure the model composes itself (a 3-row comparison, a bullet list), in-band Markdown is fine and worth supporting as a complement:
+
+- System prompt addition: «اگر پاسخ شامل مقایسه یا فهرست چندستونه است، آن را به صورت جدول Markdown ارائه بده.»
+- Frontend: accumulate tokens into a buffer and re-render through a Markdown library on each chunk:
+
+```javascript
+case 'token':
+  markdownBuffer += data;
+  botBubble.innerHTML = DOMPurify.sanitize(marked.parse(markdownBuffer));
+  break;
+```
+
+Re-parsing the whole buffer per token is cheap for chat-sized text, and it gracefully handles the "half-finished table" state during streaming. **But** keep this for cosmetic structure only — never for real data rows, for the reliability reasons above.
+
+## Decision rule (put this in your team's docs)
+
+| Content | Channel | Renderer |
+|---|---|---|
+| Narrative answer, explanations | `token` events | Markdown (marked + DOMPurify) |
+| Real data rows from a service (profiles, fines, trips) | `data` event, `kind:"table"` | Native table component |
+| Time series / aggregates worth plotting | `data` event, `kind:"chart"` | Chart.js/ECharts |
+| Tiny model-composed comparisons | `token` events as Markdown table | Markdown renderer |
+
+And the deciding question is always: **"Did this data come from a Feign call?" → then it must travel as a `data` event, never through the model's mouth.**
+
+## Design notes for production
+
+1. **Version the envelope** — `{"v":1,"kind":"table",...}` so you can evolve payload shapes without breaking older UI builds.
+2. **Non-streaming consumers**: in the `/complete` endpoint, collect `data` events into a `attachments: [...]` array alongside the final text — same information, one JSON.
+3. **Chat memory**: only the model's text lands in history. If follow-ups need the table data ("سطر دوم را بیشتر توضیح بده"), the tool summary string you return to the model should include row identifiers so the model can call the tool again for details.
+4. **Chart decisions**: let *Java* decide table vs chart (e.g., if the result is a numeric series over dates → chart; otherwise table). Don't ask the model to choose — it's another reliability leak on 8B models.
+5. **RTL tables**: add `dir="rtl"` on the `<table>`; for charts, most libraries need explicit RTL config for Persian labels — test with real data early.
+
+This keeps the LLM doing what it's good at (understanding the user, choosing tools, narrating) while everything with rows, columns, and numbers travels deterministically from Feign to pixels.
