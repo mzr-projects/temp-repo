@@ -1,0 +1,254 @@
+No search needed — this is pure wiring. Let me show exactly where `RoutingQueryBuilder` sits in the call chain, with all the pieces connected end-to-end.
+
+## The call chain at a glance
+
+```
+ChatController
+   └─► ChatService.chatStream(sessionId, userMessage)
+          ├─► 1. RoutingService.decide(sessionId, userMessage)
+          │        ├─► RoutingQueryBuilder.build(sessionId, userMessage)   ← builds the ROUTING query
+          │        ├─► SemanticIntentRouter.route(routingQuery)            ← vector search
+          │        └─► SessionIntentCache (sticky fallback)
+          └─► 2. chatClient.prompt().user(userMessage) ...                 ← ORIGINAL message to LLM
+                       .tools(scopedTools)                                 ← scoped by the decision
+```
+
+Key rule to keep in mind while wiring: **`RoutingQueryBuilder`'s output is used only for the vector search — never sent to the LLM and never stored in memory.**
+
+## 1. The beans you need (recap + one new one)
+
+You already have `RoutingQueryBuilder`, `SemanticIntentRouter`, and `SessionIntentCache` from the previous answer. Add Caffeine for the cache if you haven't:
+
+```xml
+<dependency>
+    <groupId>com.github.ben-manes.caffeine</groupId>
+    <artifactId>caffeine</artifactId>
+</dependency>
+```
+
+Now compose them into one **`RoutingService`** so `ChatService` stays clean:
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RoutingService {
+
+    private final RoutingQueryBuilder queryBuilder;
+    private final SemanticIntentRouter router;
+    private final SessionIntentCache intentCache;
+
+    private static final double STICKY_FALLBACK_THRESHOLD = 0.70;
+
+    public RoutingDecision decide(String sessionId, String userMessage) {
+
+        // Step 1: build the context-enriched routing query
+        String routingQuery = queryBuilder.build(sessionId, userMessage);
+        log.debug("session={} routingQuery='{}'", sessionId, routingQuery);
+
+        // Step 2: semantic routing on the enriched query
+        RoutingDecision decision = router.route(routingQuery);
+
+        // Step 3: sticky-intent fallback for ambiguous follow-ups
+        if (decision.unknown() || decision.confidence() < STICKY_FALLBACK_THRESHOLD) {
+            Optional<String> sticky = intentCache.lastIntent(sessionId);
+            if (sticky.isPresent()) {
+                log.info("session={} sticky fallback: {} (score was {})",
+                         sessionId, sticky.get(), decision.confidence());
+                decision = new RoutingDecision(sticky.get(), 0.0, false);
+            }
+        }
+
+        // Step 4: remember confident decisions for future follow-ups
+        if (!decision.unknown()) {
+            intentCache.remember(sessionId, decision.intent(), decision.confidence());
+        }
+
+        log.info("session={} intent={} confidence={}",
+                 sessionId, decision.intent(), decision.confidence());
+        return decision;
+    }
+}
+```
+
+## 2. `RoutingQueryBuilder` — one correction for real-world wiring
+
+One subtle but important detail about how it reads memory. The `MessageChatMemoryAdvisor` **appends the current exchange to memory only after the response completes**. So when `RoutingQueryBuilder.build()` runs (before the LLM call), `chatMemory.get(sessionId)` contains only *previous* turns — which is exactly what you want: the last `USER` message in memory is the *previous* user message, not the current one. No off-by-one filtering needed. ✅
+
+Here's the final version with that assumption made explicit:
+
+```java
+@Component
+@RequiredArgsConstructor
+public class RoutingQueryBuilder {
+
+    private final ChatMemory chatMemory;
+
+    private static final int SHORT_MESSAGE_THRESHOLD = 20;
+    private static final Set<String> CONTINUATION_PREFIXES = Set.of(
+            "و ", "بعد", "همچنین", "اون", "آن", "همون", "همان",
+            "چطور", "پس ", "خب ", "اگه", "اگر", "چی ", "کی ", "چرا");
+
+    /**
+     * Builds the query used ONLY for semantic intent routing.
+     * NOTE: must be called BEFORE the ChatClient call — memory then contains
+     * only previous turns, so the last USER message is the previous question.
+     */
+    public String build(String sessionId, String userMessage) {
+        String normalized = PersianTextUtils.normalize(userMessage.trim());
+
+        if (!isLikelyFollowUp(normalized)) {
+            return normalized;
+        }
+
+        return lastUserMessage(sessionId)
+                .map(prev -> prev + " — " + normalized)
+                .orElse(normalized);
+    }
+
+    private Optional<String> lastUserMessage(String sessionId) {
+        List<Message> history = chatMemory.get(sessionId);
+        if (history == null || history.isEmpty()) return Optional.empty();
+
+        for (int i = history.size() - 1; i >= 0; i--) {          // walk backwards
+            Message m = history.get(i);
+            if (m.getMessageType() == MessageType.USER
+                    && m.getText() != null && !m.getText().isBlank()) {
+                return Optional.of(PersianTextUtils.normalize(m.getText()));
+            }
+        }
+        return Optional.empty();
+    }
+
+    private boolean isLikelyFollowUp(String msg) {
+        if (msg.length() < SHORT_MESSAGE_THRESHOLD) return true;
+        return CONTINUATION_PREFIXES.stream().anyMatch(msg::startsWith);
+    }
+}
+```
+
+(It injects the same `ChatMemory` bean you defined in `ChatConfig` — the JDBC-backed `MessageWindowChatMemory`. Nothing new to configure.)
+
+## 3. The updated `ChatService` — where it all comes together
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ChatService {
+
+    private final ChatClient chatClient;          // built WITHOUT defaultTools
+    private final RoutingService routingService;
+    private final List<ChatbotTools> allTools;
+
+    public Flux<ServerSentEvent<String>> chatStream(String sessionId, String userMessage) {
+
+        // ---- ROUTING PHASE (deterministic, ~20-50ms) ----
+        RoutingDecision decision = routingService.decide(sessionId, userMessage);
+
+        Object[] scopedTools = decision.unknown()
+                ? allTools.toArray()                                   // safety net: all tools
+                : allTools.stream()
+                          .filter(t -> t.intent().equals(decision.intent()))
+                          .toArray();
+
+        // ---- LLM PHASE (original message, scoped tools, full memory) ----
+        return chatClient.prompt()
+                .user(userMessage)                 // ⚠️ ORIGINAL message — not the routing query
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
+                .tools(scopedTools)
+                .stream()
+                .content()
+                .map(chunk -> ServerSentEvent.<String>builder()
+                        .event("token").data(chunk).build())
+                .onErrorResume(ex -> {
+                    log.error("Streaming failed session={}", sessionId, ex);
+                    return Flux.just(ServerSentEvent.<String>builder()
+                            .event("token")
+                            .data("متأسفانه خطایی رخ داد. لطفاً دوباره تلاش کنید.")
+                            .build());
+                });
+    }
+}
+```
+
+And make sure `ChatConfig` no longer registers tools globally (they're now per-request):
+
+```java
+@Bean
+public ChatClient chatClient(ChatClient.Builder builder, ChatMemory chatMemory) {
+    return builder
+            .defaultSystem(SYSTEM_PROMPT + "\n" + PROFILE_EXTRACTION_RULES)
+            .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+            // no .defaultTools(...) anymore — ChatService supplies them per request
+            .build();
+}
+```
+
+## 4. Trace of a real session through this wiring
+
+**Turn 1**: `«مشخصات خودرو با پلاک ۱۲الف۳۴۵ رو بده»`
+
+| Step | What happens |
+|---|---|
+| `queryBuilder.build()` | 34 chars, no continuation prefix → not a follow-up → returns message as-is |
+| `router.route()` | scores 0.86 against VEHICLE examples → `VEHICLE` |
+| `intentCache.remember()` | caches `session → VEHICLE` |
+| `chatClient` | gets only `VehicleTools`, calls `getVehicle("12ALF345")`, streams answer |
+| memory advisor | saves user + assistant messages *after* completion |
+
+**Turn 2**: `«و جریمه‌هاش؟»`
+
+| Step | What happens |
+|---|---|
+| `queryBuilder.build()` | 12 chars + starts with «و » → follow-up → finds last user msg in memory → returns `«مشخصات خودرو با پلاک ۱۲الف۳۴۵ رو بده — و جریمه‌هاش؟»` |
+| `router.route()` | enriched query scores high on VEHICLE → `VEHICLE` (sticky not even needed) |
+| `chatClient` | receives **original** «و جریمه‌هاش؟» + history via advisor → model resolves «هاش» → calls `getVehicleFines("12ALF345")` |
+
+## 5. Tests for the wiring itself
+
+`RoutingQueryBuilder` is pure logic + a `ChatMemory` read — unit test it without any LLM:
+
+```java
+@ExtendWith(MockitoExtension.class)
+class RoutingQueryBuilderTest {
+
+    @Mock ChatMemory chatMemory;
+    @InjectMocks RoutingQueryBuilder builder;
+
+    @Test
+    void standaloneMessage_returnedAsIs() {
+        String result = builder.build("s1", "مشخصات خودرو با پلاک ۱۲الف۳۴۵ رو بده");
+        assertThat(result).doesNotContain("—");
+        verifyNoInteractions(chatMemory);              // no memory read for standalone
+    }
+
+    @Test
+    void shortFollowUp_enrichedWithPreviousUserMessage() {
+        when(chatMemory.get("s1")).thenReturn(List.of(
+                new UserMessage("مشخصات خودرو با پلاک ۱۲الف۳۴۵ رو بده"),
+                new AssistantMessage("خودروی شما پژو ۲۰۶ است")));
+
+        String result = builder.build("s1", "و جریمه‌هاش؟");
+
+        assertThat(result).contains("پلاک").contains("جریمه‌هاش");
+    }
+
+    @Test
+    void followUpWithEmptyHistory_returnsMessageUnchanged() {
+        when(chatMemory.get("s1")).thenReturn(List.of());
+        assertThat(builder.build("s1", "و جریمه‌هاش؟")).isEqualTo("و جریمه‌هاش؟");
+    }
+}
+```
+
+Plus one integration test through `RoutingService` asserting the full cascade (enriched-query hit → sticky fallback → unknown), using the real `SimpleVectorStore` seeded with your examples and the real Ollama embedding model — that's the test that validates your `MIN_SCORE`/`STICKY_FALLBACK_THRESHOLD` numbers against actual Persian embeddings.
+
+## Common wiring mistakes to avoid
+
+1. **Sending the enriched query to the LLM** — it pollutes memory with «قبلی — فعلی» strings and confuses future enrichments. Original message to the LLM, always.
+2. **Calling `decide()` after the ChatClient call** — the memory would then already contain the current message, and `lastUserMessage()` would return the *current* message instead of the previous one. Routing must run first (as in the code above).
+3. **Forgetting to remove `defaultTools`** — if tools are registered both globally and per-request, scoping does nothing and you're back to the all-tools-every-time behavior.
+4. **Normalizing only one side** — `PersianTextUtils.normalize` must be applied to seed examples *and* routing queries (it is, in both code paths — keep it that way when you refactor).
+
+That's the whole integration: one new `RoutingService` bean orchestrating the three routing components, `ChatService` calling it first, and tools scoped per request based on the outcome.
