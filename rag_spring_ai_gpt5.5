@@ -1,0 +1,1180 @@
+Below is a **production-ready architecture** you can use for a Spring Boot + Spring AI chatbot that accepts user messages and files — **PDF, CSV, images, responses from other services, etc.** — uses **RAG**, and routes the user request to the correct internal service.
+
+---
+
+## 1. Recommended high-level architecture
+
+Think of your chatbot as **two pipelines**:
+
+```text
+                ┌─────────────────────────────┐
+                │        User / Client         │
+                └──────────────┬──────────────┘
+                               │
+                               ▼
+                    ┌────────────────────┐
+                    │ Chat API Controller │
+                    └─────────┬──────────┘
+                              │
+                              ▼
+                    ┌────────────────────┐
+                    │ Request Normalizer  │
+                    │ text/files/context  │
+                    └─────────┬──────────┘
+                              │
+                              ▼
+                    ┌────────────────────┐
+                    │  Intent / Router    │
+                    │ classify request    │
+                    └─────────┬──────────┘
+                              │
+          ┌───────────────────┼────────────────────┐
+          ▼                   ▼                    ▼
+ ┌────────────────┐   ┌────────────────┐   ┌────────────────┐
+ │ RAG Answering  │   │ Business Tool  │   │ External API    │
+ │ knowledge base │   │ Service A/B/C  │   │ Service Client  │
+ └───────┬────────┘   └───────┬────────┘   └───────┬────────┘
+         │                    │                    │
+         └────────────────────┼────────────────────┘
+                              ▼
+                    ┌────────────────────┐
+                    │ Response Composer  │
+                    └─────────┬──────────┘
+                              ▼
+                    ┌────────────────────┐
+                    │ Final AI Response   │
+                    └────────────────────┘
+```
+
+And separately:
+
+```text
+             ┌─────────────────────────────┐
+             │  PDFs / CSV / Images / APIs │
+             └──────────────┬──────────────┘
+                            ▼
+                  ┌──────────────────┐
+                  │ Ingestion Service │
+                  └────────┬─────────┘
+                           ▼
+                  ┌──────────────────┐
+                  │ Extract Text/Data │
+                  └────────┬─────────┘
+                           ▼
+                  ┌──────────────────┐
+                  │ Chunk + Metadata │
+                  └────────┬─────────┘
+                           ▼
+                  ┌──────────────────┐
+                  │ Embedding Model   │
+                  └────────┬─────────┘
+                           ▼
+                  ┌──────────────────┐
+                  │ Vector Database   │
+                  │ PGVector/Qdrant   │
+                  └──────────────────┘
+```
+
+Spring AI’s RAG support is built around an ETL flow where `DocumentReader`, `DocumentTransformer`, and `DocumentWriter` produce and store `Document` objects for retrieval; its RAG advisors then use a `VectorStore` during chat requests. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html?utm_source=openai))
+
+---
+
+## 2. Core design decision
+
+You should separate these responsibilities:
+
+| Responsibility | Recommended component |
+|---|---|
+| Chat API | Spring Boot REST/WebSocket controller |
+| Conversation memory | Database + Spring AI chat memory advisor |
+| Routing | Intent classifier + deterministic rules |
+| RAG | Spring AI `QuestionAnswerAdvisor` or `RetrievalAugmentationAdvisor` |
+| Tool/service calls | Spring AI tool calling or your own dispatcher |
+| Vector DB | PGVector, Qdrant, Redis, Pinecone, Weaviate, etc. |
+| File ingestion | Async ingestion workers |
+| PDF extraction | Spring AI PDF document reader |
+| CSV extraction | Custom `DocumentReader` or Apache Commons CSV |
+| Image extraction | OCR/vision model, then store extracted text |
+| Observability | Spring Boot Actuator, metrics, traces, logs |
+
+For production, I would **not** let the LLM directly decide everything. Use the LLM for semantic classification, but validate its decision with allowed routes, user permissions, service availability, and confidence thresholds.
+
+---
+
+## 3. Suggested technology stack
+
+For a first production version, I would use:
+
+```text
+Backend:        Spring Boot 3.x
+AI framework:   Spring AI 2.x
+LLM:            OpenAI / Azure OpenAI / Anthropic / local model
+Embeddings:     same provider or dedicated embedding model
+Vector DB:      PostgreSQL + PGVector
+Storage:        S3 / MinIO / Azure Blob for uploaded files
+Metadata DB:    PostgreSQL
+Queue:          Kafka / RabbitMQ / SQS for ingestion jobs
+Cache:          Redis
+Observability:  Micrometer + OpenTelemetry + Grafana/Prometheus
+```
+
+PGVector is a strong default if you already use PostgreSQL. Spring AI has a PGVector vector store starter and notes that the store needs an `EmbeddingModel` to calculate embeddings for documents. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/vectordbs/pgvector.html?utm_source=openai))
+
+Avoid `SimpleVectorStore` for production; Spring AI’s documentation describes it as suitable only for testing or demonstrations. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/vectordbs.html?utm_source=openai))
+
+---
+
+## 4. Maven dependencies example
+
+Example dependencies:
+
+```xml
+<dependencies>
+    <!-- Web API -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- Validation -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+
+    <!-- Spring AI model provider, example: OpenAI -->
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-starter-model-openai</artifactId>
+    </dependency>
+
+    <!-- RAG advisor support -->
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-vector-store-advisor</artifactId>
+    </dependency>
+
+    <!-- PGVector vector database -->
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-starter-vector-store-pgvector</artifactId>
+    </dependency>
+
+    <!-- PDF ingestion -->
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-pdf-document-reader</artifactId>
+    </dependency>
+
+    <!-- PostgreSQL -->
+    <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+
+    <!-- Actuator / observability -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <!-- Optional: CSV parsing -->
+    <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-csv</artifactId>
+        <version>1.11.0</version>
+    </dependency>
+</dependencies>
+```
+
+Spring AI’s PDF document reader is the official way to read PDF content into `Document` objects, and the RAG advisor dependency is needed for advisors such as `QuestionAnswerAdvisor` and `VectorStoreChatMemoryAdvisor`. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html?utm_source=openai))
+
+---
+
+## 5. Application properties example
+
+```yaml
+spring:
+  application:
+    name: ai-chatbot
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ai_chatbot
+    username: postgres
+    password: postgres
+
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4.1-mini
+      embedding:
+        options:
+          model: text-embedding-3-small
+
+    vectorstore:
+      pgvector:
+        initialize-schema: true
+        dimensions: 1536
+        distance-type: COSINE_DISTANCE
+        index-type: HNSW
+        schema-name: public
+        vector-table-name: vector_store
+        max-document-batch-size: 1000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+```
+
+For production, set `initialize-schema: false` after the initial setup and manage schema changes with Flyway or Liquibase. The Spring AI PGVector docs note that schema initialization must be explicitly enabled; older versions behaved differently. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/vectordbs/pgvector.html?utm_source=openai))
+
+---
+
+## 6. Domain model
+
+Create a normalized chat request object:
+
+```java
+public record ChatRequest(
+        String conversationId,
+        String userId,
+        String message,
+        List<UploadedInput> inputs
+) {}
+
+public record UploadedInput(
+        String inputId,
+        InputType type,
+        String fileName,
+        String contentType,
+        String storageUrl
+) {}
+
+public enum InputType {
+    PDF,
+    CSV,
+    IMAGE,
+    SERVICE_RESPONSE,
+    TEXT
+}
+```
+
+Define the router output:
+
+```java
+public record RouteDecision(
+        RouteTarget target,
+        boolean useRag,
+        boolean requiresToolCall,
+        String reason,
+        double confidence
+) {}
+
+public enum RouteTarget {
+    GENERAL_QA,
+    DOCUMENT_QA,
+    ORDER_SERVICE,
+    CUSTOMER_SERVICE,
+    BILLING_SERVICE,
+    REPORT_GENERATION,
+    HUMAN_HANDOFF,
+    UNSUPPORTED
+}
+```
+
+---
+
+## 7. Chat controller
+
+```java
+@RestController
+@RequestMapping("/api/chat")
+@RequiredArgsConstructor
+public class ChatController {
+
+    private final ChatOrchestrator chatOrchestrator;
+
+    @PostMapping
+    public ChatResponseDto chat(@Valid @RequestBody ChatRequest request) {
+        return chatOrchestrator.handle(request);
+    }
+}
+```
+
+---
+
+## 8. Chat orchestrator
+
+This is the heart of your application.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ChatOrchestrator {
+
+    private final IntentRouter intentRouter;
+    private final RagService ragService;
+    private final BusinessServiceDispatcher dispatcher;
+    private final ResponseComposer responseComposer;
+
+    public ChatResponseDto handle(ChatRequest request) {
+
+        RouteDecision decision = intentRouter.route(request);
+
+        if (decision.confidence() < 0.70) {
+            return new ChatResponseDto(
+                    request.conversationId(),
+                    "I’m not fully sure which service should handle this. Can you clarify your request?"
+            );
+        }
+
+        return switch (decision.target()) {
+            case DOCUMENT_QA, GENERAL_QA -> {
+                String answer = ragService.answer(request, decision);
+                yield new ChatResponseDto(request.conversationId(), answer);
+            }
+
+            case ORDER_SERVICE,
+                 CUSTOMER_SERVICE,
+                 BILLING_SERVICE,
+                 REPORT_GENERATION -> {
+                ServiceResult serviceResult = dispatcher.dispatch(decision, request);
+                String finalAnswer = responseComposer.compose(request, serviceResult);
+                yield new ChatResponseDto(request.conversationId(), finalAnswer);
+            }
+
+            case HUMAN_HANDOFF -> new ChatResponseDto(
+                    request.conversationId(),
+                    "I’ll transfer this to a human agent."
+            );
+
+            case UNSUPPORTED -> new ChatResponseDto(
+                    request.conversationId(),
+                    "Sorry, I can’t help with that request yet."
+            );
+        };
+    }
+}
+```
+
+---
+
+## 9. Intent router using structured output
+
+Spring AI’s `ChatClient` can return a Java type using `entity(...)`, which is useful for structured routing/classification responses. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/chatclient.html?utm_source=openai))
+
+```java
+@Service
+@RequiredArgsConstructor
+public class IntentRouter {
+
+    private final ChatClient chatClient;
+
+    public RouteDecision route(ChatRequest request) {
+        String system = """
+                You are a routing classifier for an enterprise chatbot.
+
+                Choose exactly one target:
+                - GENERAL_QA
+                - DOCUMENT_QA
+                - ORDER_SERVICE
+                - CUSTOMER_SERVICE
+                - BILLING_SERVICE
+                - REPORT_GENERATION
+                - HUMAN_HANDOFF
+                - UNSUPPORTED
+
+                Rules:
+                - If the user asks about uploaded documents, choose DOCUMENT_QA.
+                - If the user asks about orders, choose ORDER_SERVICE.
+                - If the user asks about invoices, payments, or refunds, choose BILLING_SERVICE.
+                - If the user requests a generated report, choose REPORT_GENERATION.
+                - If the request is dangerous, unclear, or requires human approval, choose HUMAN_HANDOFF.
+                - Return confidence between 0 and 1.
+                """;
+
+        return chatClient.prompt()
+                .system(system)
+                .user("""
+                        User message:
+                        %s
+
+                        Inputs:
+                        %s
+                        """.formatted(request.message(), request.inputs()))
+                .call()
+                .entity(RouteDecision.class);
+    }
+}
+```
+
+In production, validate this result:
+
+```java
+@Component
+public class RouteDecisionValidator {
+
+    public RouteDecision validate(RouteDecision decision, ChatRequest request) {
+        if (decision == null || decision.target() == null) {
+            return new RouteDecision(
+                    RouteTarget.HUMAN_HANDOFF,
+                    false,
+                    false,
+                    "Invalid route decision",
+                    0.0
+            );
+        }
+
+        if (decision.confidence() < 0 || decision.confidence() > 1) {
+            return new RouteDecision(
+                    RouteTarget.HUMAN_HANDOFF,
+                    false,
+                    false,
+                    "Invalid confidence score",
+                    0.0
+            );
+        }
+
+        return decision;
+    }
+}
+```
+
+---
+
+## 10. RAG service with Spring AI
+
+Simple RAG version:
+
+```java
+@Configuration
+public class AiConfig {
+
+    @Bean
+    ChatClient ragChatClient(ChatModel chatModel, VectorStore vectorStore) {
+        return ChatClient.builder(chatModel)
+                .defaultSystem("""
+                        You are a helpful assistant.
+                        Answer using the retrieved context when available.
+                        If the answer is not in the context, say you do not know.
+                        Do not invent facts.
+                        """)
+                .defaultAdvisors(
+                        QuestionAnswerAdvisor.builder(vectorStore).build()
+                )
+                .build();
+    }
+}
+```
+
+```java
+@Service
+@RequiredArgsConstructor
+public class RagService {
+
+    private final ChatClient ragChatClient;
+
+    public String answer(ChatRequest request, RouteDecision decision) {
+        return ragChatClient.prompt()
+                .user(request.message())
+                .call()
+                .content();
+    }
+}
+```
+
+Spring AI provides `QuestionAnswerAdvisor` for the “naive RAG” pattern and also has `RetrievalAugmentationAdvisor` for more modular RAG flows. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/advisors.html?utm_source=openai))
+
+For more advanced production RAG, prefer `RetrievalAugmentationAdvisor` when you need custom query transformation, metadata filtering, retrieval logic, or post-retrieval document processing.
+
+---
+
+## 11. RAG with metadata filtering
+
+You should store metadata with each document chunk:
+
+```java
+Map<String, Object> metadata = Map.of(
+        "tenantId", tenantId,
+        "sourceType", "PDF",
+        "sourceId", fileId,
+        "fileName", fileName,
+        "userId", userId,
+        "visibility", "PRIVATE"
+);
+```
+
+Then retrieve only allowed documents.
+
+Conceptually:
+
+```java
+String answer = chatClient.prompt()
+        .user(request.message())
+        .advisors(advisor -> advisor
+                .param("filterExpression", "tenantId == '" + tenantId + "'"))
+        .call()
+        .content();
+```
+
+Use metadata filtering for:
+
+```text
+tenantId
+userId
+departmentId
+documentType
+securityLevel
+sourceSystem
+createdAt
+language
+```
+
+This is essential. Without metadata filtering, one user may retrieve another user’s document chunks.
+
+---
+
+## 12. PDF ingestion
+
+```java
+@Service
+@RequiredArgsConstructor
+public class PdfIngestionService {
+
+    private final VectorStore vectorStore;
+
+    public void ingestPdf(Resource pdfResource, String tenantId, String sourceId) {
+
+        PagePdfDocumentReader reader = new PagePdfDocumentReader(
+                pdfResource,
+                PdfDocumentReaderConfig.builder()
+                        .withPagesPerDocument(1)
+                        .build()
+        );
+
+        TokenTextSplitter splitter = new TokenTextSplitter();
+
+        List<Document> documents = reader.read();
+
+        List<Document> enriched = documents.stream()
+                .map(doc -> new Document(
+                        doc.getText(),
+                        enrichMetadata(doc.getMetadata(), tenantId, sourceId, "PDF")
+                ))
+                .toList();
+
+        List<Document> chunks = splitter.apply(enriched);
+
+        vectorStore.add(chunks);
+    }
+
+    private Map<String, Object> enrichMetadata(
+            Map<String, Object> existing,
+            String tenantId,
+            String sourceId,
+            String sourceType
+    ) {
+        Map<String, Object> metadata = new HashMap<>(existing);
+        metadata.put("tenantId", tenantId);
+        metadata.put("sourceId", sourceId);
+        metadata.put("sourceType", sourceType);
+        return metadata;
+    }
+}
+```
+
+Spring AI’s ETL docs describe `PagePdfDocumentReader`, `TokenTextSplitter`, and `VectorStore` as a typical RAG loading chain. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html?utm_source=openai))
+
+---
+
+## 13. CSV ingestion
+
+CSV usually needs custom logic because rows have structure. Do not simply embed the raw CSV file as one large text block.
+
+Example approach:
+
+```java
+@Service
+@RequiredArgsConstructor
+public class CsvIngestionService {
+
+    private final VectorStore vectorStore;
+
+    public void ingestCsv(InputStream inputStream, String tenantId, String sourceId) throws IOException {
+
+        Reader reader = new InputStreamReader(inputStream);
+
+        CSVParser parser = CSVFormat.DEFAULT
+                .builder()
+                .setHeader()
+                .setSkipHeaderRecord(true)
+                .build()
+                .parse(reader);
+
+        List<Document> docs = new ArrayList<>();
+
+        for (CSVRecord record : parser) {
+            String text = record.toMap().entrySet().stream()
+                    .map(e -> e.getKey() + ": " + e.getValue())
+                    .collect(Collectors.joining("\n"));
+
+            Map<String, Object> metadata = Map.of(
+                    "tenantId", tenantId,
+                    "sourceId", sourceId,
+                    "sourceType", "CSV",
+                    "rowNumber", record.getRecordNumber()
+            );
+
+            docs.add(new Document(text, metadata));
+        }
+
+        TokenTextSplitter splitter = new TokenTextSplitter();
+        vectorStore.add(splitter.apply(docs));
+    }
+}
+```
+
+Recommended CSV strategies:
+
+| CSV type | Strategy |
+|---|---|
+| Small FAQ CSV | One row = one document |
+| Product catalog | One product = one document |
+| Transactions | Usually do **not** embed all rows; query database directly |
+| Analytics/reporting CSV | Store structured data in DB, use tools/SQL, not only RAG |
+
+---
+
+## 14. Image ingestion
+
+For images, you have two options:
+
+### Option A — OCR/vision extraction, then RAG
+
+```text
+Image → OCR or vision model → extracted text → chunks → embeddings → vector DB
+```
+
+Use this for:
+
+```text
+scanned PDFs
+receipts
+screenshots
+forms
+diagrams with text
+```
+
+### Option B — Multimodal chat
+
+```text
+User sends image → send image directly to multimodal model → answer
+```
+
+Use this for:
+
+```text
+visual reasoning
+image description
+UI screenshot understanding
+damage inspection
+chart interpretation
+```
+
+Spring AI has a multimodality API for sending media with messages to supported models. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/multimodality.html?utm_source=openai))
+
+For RAG, however, most production systems still convert image content to **text + metadata** before embedding, because vector retrieval is usually text-centric.
+
+---
+
+## 15. Ingesting responses from other services
+
+If another service returns JSON, normalize it into documents.
+
+Example:
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ServiceResponseIngestionService {
+
+    private final VectorStore vectorStore;
+    private final ObjectMapper objectMapper;
+
+    public void ingestServiceResponse(
+            String json,
+            String tenantId,
+            String sourceSystem,
+            String entityId
+    ) throws JsonProcessingException {
+
+        JsonNode root = objectMapper.readTree(json);
+
+        String text = flattenJson(root);
+
+        Document document = new Document(
+                text,
+                Map.of(
+                        "tenantId", tenantId,
+                        "sourceType", "SERVICE_RESPONSE",
+                        "sourceSystem", sourceSystem,
+                        "entityId", entityId
+                )
+        );
+
+        vectorStore.add(List.of(document));
+    }
+
+    private String flattenJson(JsonNode node) {
+        // Implement your own JSON-to-readable-text logic.
+        return node.toPrettyString();
+    }
+}
+```
+
+But be careful: if the data is highly structured and frequently updated — orders, invoices, balances, inventory — prefer **tool calling / service calls** over RAG. RAG is better for knowledge retrieval; APIs/databases are better for live transactional data.
+
+---
+
+## 16. Service routing and tool execution
+
+You can implement routing manually:
+
+```java
+@Service
+@RequiredArgsConstructor
+public class BusinessServiceDispatcher {
+
+    private final OrderService orderService;
+    private final BillingService billingService;
+    private final CustomerService customerService;
+    private final ReportService reportService;
+
+    public ServiceResult dispatch(RouteDecision decision, ChatRequest request) {
+        return switch (decision.target()) {
+            case ORDER_SERVICE -> orderService.handle(request);
+            case BILLING_SERVICE -> billingService.handle(request);
+            case CUSTOMER_SERVICE -> customerService.handle(request);
+            case REPORT_GENERATION -> reportService.handle(request);
+            default -> throw new IllegalArgumentException("Unsupported route: " + decision.target());
+        };
+    }
+}
+```
+
+Or expose methods as Spring AI tools. Spring AI’s tool calling support lets a model interact with APIs/tools, and Spring AI’s `ChatClient` can run tool-calling loops through its advisor chain. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/api/tools.html?utm_source=openai))
+
+Example tool:
+
+```java
+@Component
+public class OrderTools {
+
+    private final OrderService orderService;
+
+    public OrderTools(OrderService orderService) {
+        this.orderService = orderService;
+    }
+
+    @Tool(description = "Get order status by order id")
+    public OrderStatus getOrderStatus(String orderId) {
+        return orderService.getOrderStatus(orderId);
+    }
+}
+```
+
+Then configure:
+
+```java
+@Bean
+ChatClient toolEnabledChatClient(ChatModel chatModel, OrderTools orderTools) {
+    return ChatClient.builder(chatModel)
+            .defaultTools(orderTools)
+            .defaultSystem("""
+                    You are a business assistant.
+                    Use tools when the user asks about live business data.
+                    Use RAG when the user asks about documentation or policy.
+                    """)
+            .build();
+}
+```
+
+My recommendation: for critical business actions, use **manual dispatch** first. Use autonomous tool calling only after you have strong logging, validation, approval workflows, and tests.
+
+---
+
+## 17. Response composer
+
+After a service responds, let the LLM produce a user-friendly answer.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ResponseComposer {
+
+    private final ChatClient chatClient;
+
+    public String compose(ChatRequest request, ServiceResult result) {
+        return chatClient.prompt()
+                .system("""
+                        You convert internal service results into clear user-facing answers.
+                        Do not expose internal IDs, stack traces, implementation details, or secrets.
+                        If the service result contains an error, explain it safely.
+                        """)
+                .user("""
+                        User question:
+                        %s
+
+                        Service result:
+                        %s
+                        """.formatted(request.message(), result))
+                .call()
+                .content();
+    }
+}
+```
+
+---
+
+## 18. Handling uploads asynchronously
+
+For production, do **not** ingest large PDFs/images inside the chat HTTP request.
+
+Use this flow:
+
+```text
+1. User uploads file.
+2. Store raw file in S3/MinIO/blob storage.
+3. Create ingestion job in DB.
+4. Queue ingestion event.
+5. Worker extracts text.
+6. Worker chunks and embeds.
+7. Worker writes chunks to vector DB.
+8. Mark document as READY.
+9. Chat can now use it.
+```
+
+Example status model:
+
+```java
+public enum IngestionStatus {
+    UPLOADED,
+    PROCESSING,
+    READY,
+    FAILED
+}
+```
+
+Chat response while processing:
+
+```text
+“I received your PDF and I’m still processing it. Please try again in a few seconds.”
+```
+
+---
+
+## 19. Database tables
+
+Minimum schema:
+
+```sql
+create table conversation (
+    id uuid primary key,
+    tenant_id varchar(100) not null,
+    user_id varchar(100) not null,
+    created_at timestamp not null,
+    updated_at timestamp not null
+);
+
+create table chat_message (
+    id uuid primary key,
+    conversation_id uuid not null references conversation(id),
+    role varchar(30) not null,
+    content text not null,
+    created_at timestamp not null
+);
+
+create table uploaded_file (
+    id uuid primary key,
+    tenant_id varchar(100) not null,
+    user_id varchar(100) not null,
+    file_name varchar(500) not null,
+    content_type varchar(200) not null,
+    storage_url text not null,
+    ingestion_status varchar(50) not null,
+    created_at timestamp not null,
+    updated_at timestamp not null
+);
+
+create table ingestion_job (
+    id uuid primary key,
+    file_id uuid not null references uploaded_file(id),
+    status varchar(50) not null,
+    error_message text,
+    created_at timestamp not null,
+    updated_at timestamp not null
+);
+```
+
+The vector table can be managed by Spring AI PGVector or by migrations.
+
+---
+
+## 20. RAG quality recommendations
+
+Use this as your default:
+
+```text
+Chunk size:        300–800 tokens
+Chunk overlap:     50–150 tokens
+Top K:             4–8 chunks
+Similarity cutoff: tune experimentally
+Metadata filters:  always
+Reranking:         add later for quality
+Citations:         include source title/page when possible
+```
+
+Add metadata like:
+
+```java
+metadata.put("page", pageNumber);
+metadata.put("section", sectionTitle);
+metadata.put("sourceUrl", sourceUrl);
+metadata.put("fileName", fileName);
+```
+
+Then instruct the model:
+
+```text
+Use the provided context only.
+If the answer is not in the context, say you do not know.
+When possible, cite the document name and page.
+```
+
+---
+
+## 21. Security checklist
+
+For production, implement:
+
+```text
+Authentication:          OAuth2/JWT/session auth
+Authorization:           tenant/user-level access checks
+Metadata filtering:      tenantId, userId, document visibility
+File scanning:           antivirus/malware scanning
+Content-type validation: never trust file extensions
+File size limits:        prevent abuse
+Prompt injection guard:  treat retrieved docs as untrusted content
+PII redaction:           where needed
+Secrets protection:      never send secrets to the model
+Audit logs:              every route/tool/action
+Rate limiting:           per user and tenant
+Human approval:          for destructive actions
+```
+
+Especially with RAG, remember: documents may contain malicious instructions such as “ignore previous instructions.” Your system prompt should explicitly say retrieved documents are **data**, not instructions.
+
+---
+
+## 22. Production observability
+
+Track at least:
+
+```text
+request_count
+request_latency
+model_latency
+embedding_latency
+vector_search_latency
+tool_call_latency
+tokens_in
+tokens_out
+estimated_cost
+route_target
+route_confidence
+rag_documents_returned
+rag_similarity_scores
+ingestion_duration
+ingestion_failures
+```
+
+Spring AI supports observability for `ChatClient` calls and vector store interactions, and the docs point to Spring Boot metrics/tracing for enabling metrics and traces. ([docs.spring.io](https://docs.spring.io/spring-ai/reference/observability/?utm_source=openai))
+
+---
+
+## 23. Testing strategy
+
+You need more than unit tests.
+
+### Unit tests
+
+```text
+IntentRouterTest
+RagServiceTest
+CsvIngestionServiceTest
+PdfIngestionServiceTest
+BusinessServiceDispatcherTest
+```
+
+### Integration tests
+
+```text
+Postgres + PGVector Testcontainers
+Mock LLM provider
+Mock external business services
+File upload + ingestion flow
+```
+
+### RAG evaluation tests
+
+Prepare golden datasets:
+
+```json
+{
+  "question": "What is the refund period?",
+  "expectedSource": "refund-policy.pdf",
+  "expectedAnswerContains": ["30 days"]
+}
+```
+
+Measure:
+
+```text
+retrieval precision
+answer correctness
+hallucination rate
+citation correctness
+latency
+cost
+```
+
+---
+
+## 24. Recommended implementation phases
+
+### Phase 1 — MVP
+
+```text
+Text chat
+PDF ingestion
+PGVector
+Basic RAG
+Manual service routing
+Conversation storage
+```
+
+### Phase 2 — Multi-input
+
+```text
+CSV ingestion
+Image OCR
+External service response ingestion
+Metadata filtering
+Streaming responses
+```
+
+### Phase 3 — Production hardening
+
+```text
+Auth
+Rate limits
+Audit logs
+Observability
+Evaluation framework
+Prompt-injection defenses
+Human handoff
+```
+
+### Phase 4 — Advanced AI
+
+```text
+Tool calling
+Reranking
+Hybrid search
+Agentic workflows
+Multimodal chat
+Feedback-based improvement
+```
+
+---
+
+## 25. The key rule: RAG vs service calls
+
+Use this decision table:
+
+| User asks about | Best approach |
+|---|---|
+| Company policy | RAG |
+| PDF/manual/contract content | RAG |
+| Uploaded CSV explanation | RAG + structured parsing |
+| Current order status | Service call |
+| Invoice balance | Service call |
+| Generate report | Service call + LLM summary |
+| Analyze screenshot | Vision model/OCR |
+| Search across documents | RAG |
+| Perform an action | Tool/service call with validation |
+
+RAG should answer from knowledge. Tools/services should handle live state and actions.
+
+---
+
+## 26. Minimal production-ready flow
+
+The ideal chat flow is:
+
+```java
+public ChatResponseDto handle(ChatRequest request) {
+
+    validateUserAccess(request);
+
+    normalizeInputs(request);
+
+    RouteDecision route = intentRouter.route(request);
+
+    route = routeDecisionValidator.validate(route, request);
+
+    auditRouteDecision(request, route);
+
+    if (route.target() == RouteTarget.DOCUMENT_QA) {
+        return answerWithRag(request, route);
+    }
+
+    if (isBusinessService(route.target())) {
+        ServiceResult result = dispatcher.dispatch(route, request);
+        return composeFinalResponse(request, result);
+    }
+
+    return fallback(request);
+}
+```
+
+---
+
+## 27. My recommended architecture for your project
+
+Use this:
+
+```text
+Spring Boot monolith first, modularized internally:
+
+com.yourcompany.chat
+  ├── api
+  ├── orchestration
+  ├── routing
+  ├── rag
+  ├── ingestion
+  ├── tools
+  ├── services
+  ├── security
+  ├── observability
+  └── persistence
+```
+
+Start with PGVector unless you already have a dedicated vector DB requirement. Use Spring AI RAG advisors for document Q&A. Use manual dispatch for business services. Add tool calling later when your guardrails are mature.
+
+This gives you a clean, production-oriented chatbot that can handle PDFs, CSVs, images, service responses, RAG, and routing without turning the whole system into an unpredictable “LLM decides everything” agent.
