@@ -1,0 +1,180 @@
+# RAG (Retrieval-Augmented Generation) — Explained in Detail
+
+## The Problem RAG Solves
+
+LLMs have three fundamental limitations:
+
+1. **Knowledge cutoff** — the model only knows what was in its training data. It knows nothing about your company's internal documents, your product catalog, or anything that happened after training.
+2. **No private data** — it has never seen your order database, your HR policies, your API docs.
+3. **Hallucination** — when asked about things it doesn't know, an LLM will often confidently make something up rather than say "I don't know."
+
+You *could* fine-tune a model on your data, but that's expensive, slow, hard to update (retrain every time a document changes), and doesn't actually fix hallucination well.
+
+RAG takes a different approach: **instead of teaching the model your data, you look up the relevant data at question-time and paste it into the prompt.** The model then answers *grounded* in that provided context.
+
+The name literally describes the flow: **Retrieval** (find relevant documents) → **Augmented** (inject them into the prompt) → **Generation** (LLM writes the answer).
+
+---
+
+## The Core Insight: Embeddings & Semantic Search
+
+The magic that makes retrieval work is **embeddings**.
+
+An embedding model converts text into a vector — a list of numbers (e.g., 1,536 floats) — that represents the text's *meaning*. Texts with similar meanings end up close together in that vector space:
+
+```
+"How do I reset my password?"     → [0.12, -0.83, 0.44, ...]
+"Steps to recover account access" → [0.14, -0.79, 0.41, ...]   ← very close
+"Best pizza recipe"               → [-0.67, 0.22, -0.91, ...]  ← far away
+```
+
+This means you can find relevant documents by **similarity of meaning**, not keyword matching. "My login isn't working" will match a document titled "Password Recovery Procedure" even though they share zero keywords. That's the leap over classic full-text search.
+
+Vectors are stored in a **vector store/database** — PGVector (Postgres extension), Chroma, Milvus, Weaviate, Redis, Elasticsearch, Pinecone, etc. — which can efficiently answer "give me the K vectors nearest to this query vector" (typically via cosine similarity and ANN indexes like HNSW).
+
+---
+
+## The Two Phases of RAG
+
+### Phase 1: Ingestion (offline, ahead of time)
+
+This is the ETL pipeline that prepares your knowledge base:
+
+```
+Documents (PDF, Word, HTML, Confluence, DB rows...)
+   │
+   ▼  1. READ — extract raw text
+   │
+   ▼  2. SPLIT — chunk into pieces (e.g., 300–1000 tokens each)
+   │
+   ▼  3. ENRICH — attach metadata (source, date, department, ACLs)
+   │
+   ▼  4. EMBED — convert each chunk to a vector
+   │
+   ▼  5. STORE — write (vector + text + metadata) to vector store
+```
+
+**Why chunking?** Two reasons:
+- The context window is finite — you can't paste a 200-page manual into a prompt.
+- Retrieval precision — if a whole document is one vector, the vector is a mushy average of many topics. Small, focused chunks give sharp matches.
+
+Chunking is more art than science. Common strategies: fixed-size with overlap (e.g., 800 tokens, 100 overlap so ideas that straddle a boundary aren't lost), sentence/paragraph-aware splitting, or structure-aware splitting (by headings, sections). Bad chunking is the #1 cause of bad RAG quality.
+
+In Spring AI, this maps directly onto the API:
+
+```java
+// Ingestion pipeline
+var reader   = new PagePdfDocumentReader(pdfResource);        // 1. read
+var splitter = TokenTextSplitter.builder()
+                   .withChunkSize(800)
+                   .build();                                   // 2. split
+
+List<Document> chunks = splitter.apply(reader.get());
+chunks.forEach(d -> d.getMetadata().put("source", "hr-handbook")); // 3. enrich
+
+vectorStore.add(chunks);   // 4 + 5: embeds via EmbeddingModel and stores
+```
+
+### Phase 2: Retrieval & Generation (online, per user question)
+
+```
+User: "How many vacation days do I get after 5 years?"
+   │
+   ▼  1. EMBED the question with the same embedding model
+   │
+   ▼  2. SEARCH the vector store → top-K most similar chunks
+   │        (optionally filtered by metadata: department = HR)
+   │
+   ▼  3. AUGMENT — build a prompt like:
+   │
+   │     "Answer using ONLY the following context.
+   │      If the answer isn't in the context, say you don't know.
+   │
+   │      Context:
+   │      [chunk 1: 'Employees with 5+ years of service accrue 25 days...']
+   │      [chunk 2: '...vacation policy revision 2024...']
+   │
+   │      Question: How many vacation days do I get after 5 years?"
+   │
+   ▼  4. GENERATE — LLM answers grounded in the chunks
+   │
+   ▼  "After 5 years of service you're entitled to 25 vacation days,
+      per the HR handbook (revised 2024)."
+```
+
+In Spring AI this whole phase is one advisor — this is what the `QuestionAnswerAdvisor` in my first answer was doing:
+
+```java
+ChatClient chatClient = builder
+    .defaultAdvisors(
+        QuestionAnswerAdvisor.builder(vectorStore)
+            .searchRequest(SearchRequest.builder()
+                .topK(5)                       // retrieve 5 chunks
+                .similarityThreshold(0.7)      // ignore weak matches
+                .build())
+            .build())
+    .build();
+
+// Now every prompt is automatically augmented with retrieved context
+String answer = chatClient.prompt()
+    .user("How many vacation days do I get after 5 years?")
+    .call()
+    .content();
+```
+
+The advisor intercepts the request, does the embed → search → prompt-stuffing dance, and forwards the augmented prompt to the model. Your calling code doesn't change at all.
+
+---
+
+## Why RAG Instead of Alternatives?
+
+| Approach | Fresh data? | Cost | Hallucination control | Source attribution |
+|---|---|---|---|---|
+| **Fine-tuning** | No — retrain to update | High | Weak | None |
+| **Long context** (paste everything) | Yes | Very high per call, slow | OK | Hard |
+| **RAG** | Yes — re-index a doc in seconds | Low (only relevant chunks sent) | Strong ("answer only from context") | Built-in (you know which chunks were used) |
+
+That last column matters a lot in production: because *you* selected the chunks, you can show the user **citations** ("source: HR Handbook, p. 12") and let them verify. That's a huge trust win for a business chatbot.
+
+---
+
+## Where RAG Fits in *Your* Architecture
+
+Recall your requirements — users upload files, and prompts either hit services or the model. RAG is the answer to the **files** part:
+
+- **Tool calling** → for *structured, live* data ("show my orders" → call OrderService → render table)
+- **RAG** → for *unstructured knowledge* ("what does the attached contract say about termination?" → ingest PDF → retrieve relevant clauses → answer with citations)
+
+For user-uploaded files, you run the ingestion pipeline on upload (scoped to that conversation via metadata filtering, e.g. `conversationId = X`, so users can't retrieve each other's documents), then the QA advisor retrieves from those chunks for subsequent questions in that chat.
+
+The two even combine: a tool can *be* a retrieval call ("agentic RAG" — the model decides *when* to search the knowledge base, rather than searching on every message).
+
+---
+
+## Advanced Techniques (when naive RAG isn't enough)
+
+Naive RAG (embed → top-K → stuff prompt) gets you ~80% of the way. Production systems commonly add:
+
+1. **Query transformation** — rewrite the user's question before searching. E.g., "what about after 10?" is meaningless alone; rewrite using chat history to "how many vacation days after 10 years of service?" (Spring AI has `RewriteQueryTransformer` / `CompressionQueryTransformer` in its modular RAG API.)
+2. **Hybrid search** — combine vector similarity with keyword (BM25) search. Vectors miss exact identifiers ("error TX-4491"); keywords miss paraphrases. Fusing both is markedly better.
+3. **Reranking** — retrieve 50 candidates cheaply, then use a cross-encoder reranker model to pick the best 5. Big precision boost.
+4. **Metadata filtering** — restrict search by tenant, ACL, date, document type *before* similarity kicks in. **In multi-user production this is a security requirement, not an optimization** — retrieval must respect document permissions per user.
+5. **Contextual/parent-chunk retrieval** — match on small chunks (precise), but hand the LLM the surrounding section (more context to answer from).
+6. **Evaluation** — measure retrieval quality (did the right chunk get retrieved?) and answer quality (is the answer faithful to the chunks?) with a golden question set in CI. Spring AI ships `RelevancyEvaluator` and `FactCheckingEvaluator` for this.
+
+---
+
+## Common Failure Modes to Watch
+
+- **Garbage chunks** → bad PDF extraction (tables mangled, headers merged). Inspect your extracted text early.
+- **Wrong chunk size** → too small = fragments without context; too big = diluted vectors and wasted tokens.
+- **Retrieval miss** → the answer exists but wasn't in the top-K. Tune K, threshold, add hybrid search/reranking.
+- **The model ignores the context** → strengthen the system prompt ("answer ONLY from the context; otherwise say you don't know") and test for it.
+- **Stale index** → documents changed but embeddings didn't. You need an update/delete strategy keyed by document ID.
+- **Embedding model mismatch** → query and documents *must* use the same embedding model. Changing the model means re-embedding the whole corpus.
+
+---
+
+**One-sentence summary:** RAG turns your LLM from a closed-book exam into an open-book exam — you fetch the right pages (semantic search over embedded chunks) and staple them to the question, so the model answers from *your* data, with sources, without retraining anything.
+
+Want me to go deeper on a specific part — e.g., designing the ingestion pipeline for user-uploaded files in your chatbot, choosing a vector store (PGVector vs. dedicated), or the modular RAG API in Spring AI (`RetrievalAugmentationAdvisor`)?
