@@ -1,0 +1,132 @@
+Yes — in Reactor/Spring WebFlux you should **wait for the `Flux<String>` to complete**, combine all emitted chunks, then save the final value.
+
+`@HttpExchange` / `@PostExchange` can be used as a declarative HTTP client method, and returning `Flux<String>` is appropriate for a streamed response. Reactor’s `Flux.collectList()` collects all emitted items and emits a `Mono<List<T>>` **only when the Flux completes**. ([docs.enterprise.spring.io](https://docs.enterprise.spring.io/spring-framework/reference/integration/rest-clients.html?utm_source=openai))
+
+## 1. If you only want to save after the full stream is received
+
+```java
+@Service
+@RequiredArgsConstructor
+public class MathService {
+
+    private final MathClient mathClient;
+    private final MathResultRepository repository;
+
+    public Mono<MathResult> callServiceAndSave(MathRequest request) {
+        return mathClient.calculate(request)     // Flux<String>
+                .collectList()                  // Mono<List<String>> after stream completes
+                .map(chunks -> String.join("", chunks))
+                .flatMap(fullData -> {
+                    MathResult entity = new MathResult();
+                    entity.setResult(fullData);
+                    return repository.save(entity);
+                });
+    }
+}
+```
+
+Repository example:
+
+```java
+public interface MathResultRepository
+        extends ReactiveCrudRepository<MathResult, Long> {
+}
+```
+
+Spring Data reactive repositories return reactive types such as `Mono`/`Flux`, so `repository.save(...)` should be chained with `flatMap`, not called separately. ([docs.spring.io](https://docs.spring.io/spring-data/relational/reference/r2dbc/repositories.html?utm_source=openai))
+
+---
+
+## 2. If your controller should still return the stream to the caller, but save after completion
+
+If you want to **stream data back to the client immediately** and also save the full accumulated response when the stream finishes, do this:
+
+```java
+@GetMapping(value = "/math", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux<String> math(MathRequest request) {
+    return mathService.streamAndSave(request);
+}
+```
+
+Service:
+
+```java
+@Service
+@RequiredArgsConstructor
+public class MathService {
+
+    private final MathClient mathClient;
+    private final MathResultRepository repository;
+
+    public Flux<String> streamAndSave(MathRequest request) {
+        return Flux.defer(() -> {
+            StringBuilder builder = new StringBuilder();
+
+            return mathClient.calculate(request)
+                    .doOnNext(chunk -> builder.append(chunk))
+                    .concatWith(Mono.defer(() -> {
+                        String fullData = builder.toString();
+
+                        MathResult entity = new MathResult();
+                        entity.setResult(fullData);
+
+                        return repository.save(entity)
+                                .then(Mono.empty());
+                    }));
+        });
+    }
+}
+```
+
+Important: use `Flux.defer(...)` so each request/subscription gets its own `StringBuilder`.
+
+---
+
+## 3. Do **not** use `subscribe()` inside your service
+
+Avoid this:
+
+```java
+mathClient.calculate(request)
+        .collectList()
+        .subscribe(data -> repository.save(...)); // bad
+```
+
+In WebFlux, you should return the `Mono` or `Flux` and let Spring subscribe. Manually subscribing can cause hidden execution, lost errors, and lifecycle problems.
+
+---
+
+## 4. If you use blocking JPA instead of reactive R2DBC
+
+If your database call is blocking, for example with `JpaRepository`, do not run it directly on the WebFlux event loop. Wrap it on `boundedElastic`:
+
+```java
+public Mono<MathResult> callServiceAndSave(MathRequest request) {
+    return mathClient.calculate(request)
+            .collectList()
+            .map(chunks -> String.join("", chunks))
+            .flatMap(fullData ->
+                    Mono.fromCallable(() -> {
+                        MathResult entity = new MathResult();
+                        entity.setResult(fullData);
+                        return jpaRepository.save(entity);
+                    }).subscribeOn(Schedulers.boundedElastic())
+            );
+}
+```
+
+But if your whole app is reactive, prefer **R2DBC** or another reactive database driver.
+
+---
+
+### Short answer
+
+Use:
+
+```java
+flux.collectList()
+    .map(list -> String.join("", list))
+    .flatMap(fullData -> repository.save(new MathResult(fullData)));
+```
+
+If you need to **return the stream and save at the end**, use `doOnNext` to accumulate and `concatWith` to save after completion.
