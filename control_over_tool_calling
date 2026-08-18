@@ -1,0 +1,81 @@
+The behavior you're seeing is normal: the model *always* generates some text response, and whether it calls a tool is entirely its decision. You can't force Ollama/Qwen to return a fixed string — but you **can detect on the Spring AI side that no tool was called and substitute your own message**. There are a few ways to do it:
+
+## Option 1: User-controlled tool execution (recommended)
+
+Disable automatic tool execution, check `hasToolCalls()` yourself, and if the model didn't call a tool, discard its answer and return your custom message:
+
+```java
+ToolCallingManager toolCallingManager = ToolCallingManager.builder().build();
+
+ChatOptions chatOptions = ToolCallingChatOptions.builder()
+    .toolCallbacks(ToolCallbacks.from(new MyTools()))
+    .internalToolExecutionEnabled(false)   // Spring AI 1.0.x
+    .build();
+
+Prompt prompt = new Prompt(userQuestion, chatOptions);
+ChatResponse chatResponse = chatModel.call(prompt);
+
+if (!chatResponse.hasToolCalls()) {
+    // Model decided not to call any tool -> return YOUR message
+    return "Sorry, I can only help with X. Please rephrase your request.";
+}
+
+// Otherwise run the normal tool loop
+while (chatResponse.hasToolCalls()) {
+    ToolExecutionResult result = toolCallingManager.executeToolCalls(prompt, chatResponse);
+    prompt = new Prompt(result.conversationHistory(), chatOptions);
+    chatResponse = chatModel.call(prompt);
+}
+return chatResponse.getResult().getOutput().getText();
+```
+
+> ⚠️ Version note: `internalToolExecutionEnabled(false)` exists in Spring AI 1.x. In newer versions (2.x+) that flag was removed — instead you just call `ChatModel` directly (tools aren't auto-executed there), or with `ChatClient` disable the advisor via `.advisors(AdvisorParams.toolCallingAdvisorAutoRegister(false))`.
+
+## Option 2: An Advisor that intercepts the response
+
+If you want this behavior reusable across your app, wrap the logic in a custom `CallAdvisor`:
+
+```java
+public class FallbackMessageAdvisor implements CallAdvisor {
+
+    @Override
+    public ChatClientResponse adviseCall(ChatClientRequest request, CallAdvisorChain chain) {
+        ChatClientResponse response = chain.nextCall(request);
+        ChatResponse chatResponse = response.chatResponse();
+
+        boolean toolWasUsed = chatResponse.getResults().stream()
+            .anyMatch(g -> g.getOutput().hasToolCalls());
+
+        if (!toolWasUsed) {
+            // replace the model's text with your fixed message
+            AssistantMessage custom = new AssistantMessage("Sorry, I can only answer questions about X.");
+            ChatResponse replaced = ChatResponse.builder()
+                .generations(List.of(new Generation(custom)))
+                .build();
+            return response.mutate().chatResponse(replaced).build();
+        }
+        return response;
+    }
+
+    @Override public String getName() { return "fallbackAdvisor"; }
+    @Override public int getOrder() { return Ordered.LOWEST_PRECEDENCE; }
+}
+```
+
+Note: to detect "no tool called" reliably with an advisor, it must run *inside/before* the tool-execution loop finishes — with auto tool execution the final response never contains tool calls (they're consumed internally). So Option 1 gives you cleaner control; the advisor approach works best when combined with disabled internal execution.
+
+## Option 3: Prompt-level control (softer, less reliable)
+
+Add a system prompt like:
+
+```
+If the user's request does not match any available tool,
+respond with exactly: "Sorry, I can only help with X."
+Do not answer anything else.
+```
+
+This often works, but with smaller Qwen models on Ollama it's not guaranteed — the model may still improvise. That's why combining it with Option 1 (a hard programmatic check) is the robust solution.
+
+## Summary
+
+The key insight: **you can't make the model return a fixed message, but you can detect the absence of a tool call (`chatResponse.hasToolCalls() == false`) and replace its output with your own string before returning it to the user.** Option 1 is the standard Spring AI way to do this.
