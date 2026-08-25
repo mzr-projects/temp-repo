@@ -1,0 +1,33 @@
+public class LoopDetector {
+    private final Deque<String> recentChunks = new ArrayDeque<>();
+    private final int windowSize;
+    private final int repeatThreshold;
+
+    public LoopDetector(int windowSize, int repeatThreshold) {
+        this.windowSize = windowSize;
+        this.repeatThreshold = repeatThreshold;
+    }
+
+    public boolean isLooping(String chunk) {
+        recentChunks.addLast(chunk);
+        if (recentChunks.size() > windowSize) recentChunks.removeFirst();
+
+        String combined = String.join("", recentChunks);
+        return hasRepeatingPattern(combined, repeatThreshold);
+    }
+
+    private boolean hasRepeatingPattern(String text, int minRepeats) {
+        // check for repeated substrings of length 5-50 chars
+        for (int len = 5; len <= 50 && len <= text.length() / minRepeats; len++) {
+            String candidate = text.substring(text.length() - len);
+            int count = 0;
+            int idx = text.length() - len;
+            while (idx >= 0 && text.startsWith(candidate, idx)) {
+                count++;
+                idx -= len;
+            }
+            if (count >= minRepeats) return true;
+        }
+        return false;
+    }
+}
