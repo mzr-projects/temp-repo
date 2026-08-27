@@ -1,0 +1,1026 @@
+Yes — if all 2,000 JSON records belong to **one person** and you want output like:
+
+- most common `source`
+- least common `source`
+- most common `destination`
+- least common `destination`
+- most common `source → destination`
+- most common `source → destination + type`
+- most used transfer type: `AIRLINE`, `TRAIN`, etc.
+- markdown tables
+
+Then the **best robust solution** is:
+
+> **Do the counting/aggregation in Java, not inside the model.**  
+> Return the model a compact analysis result or final Markdown.
+
+Do **not** send all 2,000 records to Qwen and ask it to count. The model may make counting mistakes. Java/SQL should calculate counts exactly. The model can then explain the result nicely.
+
+---
+
+# Recommended design
+
+Instead of this:
+
+```java
+@Tool
+public List<TransferDto> getAllTransfersForPerson(String personId) {
+    return transferService.getTransfers(personId); // bad for 2000 records
+}
+```
+
+Use this:
+
+```java
+@Tool
+public TransferMarkdownAnalysisResponse analyzePersonTransfers(
+        String personId,
+        LocalDate dateFrom,
+        LocalDate dateTo,
+        Integer topN
+) {
+    return transferAnalysisService.analyzePersonTransfers(personId, dateFrom, dateTo, topN);
+}
+```
+
+The tool returns something like:
+
+```json
+{
+  "personId": "P-1001",
+  "totalTransfers": 2034,
+  "markdown": "## Transfer Analysis for Person P-1001\n\n..."
+}
+```
+
+Then the model can directly return the markdown to the user.
+
+---
+
+# Example input JSON records
+
+Your records may look like:
+
+```json
+[
+  {
+    "border": "Germany-France",
+    "date": "2026-08-21",
+    "source": "Berlin",
+    "destination": "Paris",
+    "type": "AIRLINE"
+  },
+  {
+    "border": "Germany-France",
+    "date": "2026-08-22",
+    "source": "Berlin",
+    "destination": "Paris",
+    "type": "TRAIN"
+  },
+  {
+    "border": "France-Spain",
+    "date": "2026-08-25",
+    "source": "Paris",
+    "destination": "Madrid",
+    "type": "AIRLINE"
+  }
+]
+```
+
+---
+
+# Target Markdown output
+
+You want output like this:
+
+```markdown
+## Transfer Analysis
+
+### Summary
+
+| Metric | Value |
+|---|---:|
+| Total transfers | 2,034 |
+| Date range | 2025-01-01 to 2026-08-26 |
+| Unique sources | 18 |
+| Unique destinations | 22 |
+| Unique source-destination routes | 74 |
+| Unique transfer types | 4 |
+
+### Most Common Sources
+
+| Rank | Source | Count | Percentage |
+|---:|---|---:|---:|
+| 1 | Berlin | 422 | 20.75% |
+| 2 | Paris | 319 | 15.68% |
+| 3 | Rome | 201 | 9.88% |
+
+### Least Common Sources
+
+| Rank | Source | Count | Percentage |
+|---:|---|---:|---:|
+| 1 | Zurich | 3 | 0.15% |
+| 2 | Vienna | 7 | 0.34% |
+| 3 | Brussels | 11 | 0.54% |
+
+### Most Common Destinations
+
+| Rank | Destination | Count | Percentage |
+|---:|---|---:|---:|
+| 1 | Paris | 501 | 24.63% |
+| 2 | Madrid | 244 | 12.00% |
+| 3 | Amsterdam | 189 | 9.29% |
+
+### Most Common Routes
+
+| Rank | Source | Destination | Count | Percentage |
+|---:|---|---|---:|---:|
+| 1 | Berlin | Paris | 232 | 11.41% |
+| 2 | Paris | Madrid | 167 | 8.21% |
+| 3 | Rome | Paris | 99 | 4.87% |
+
+### Most Common Route + Type
+
+| Rank | Source | Destination | Type | Count | Percentage |
+|---:|---|---|---|---:|---:|
+| 1 | Berlin | Paris | AIRLINE | 151 | 7.42% |
+| 2 | Berlin | Paris | TRAIN | 81 | 3.98% |
+| 3 | Paris | Madrid | AIRLINE | 72 | 3.54% |
+```
+
+This is deterministic and safe.
+
+---
+
+# Full Java example
+
+## 1. Transfer type enum
+
+```java
+public enum TransferType {
+    AIRLINE,
+    TRAIN,
+    BUS,
+    SHIP,
+    TRUCK,
+    CAR,
+    OTHER
+}
+```
+
+---
+
+## 2. Transfer DTO
+
+```java
+import java.time.LocalDate;
+
+public record TransferDto(
+        String personId,
+        String border,
+        LocalDate date,
+        String source,
+        String destination,
+        TransferType type
+) {}
+```
+
+---
+
+## 3. Analysis response DTO
+
+```java
+public record TransferMarkdownAnalysisResponse(
+        String personId,
+        int totalTransfers,
+        String markdown
+) {}
+```
+
+---
+
+## 4. Internal statistics DTOs
+
+```java
+public record CountRow(
+        String value,
+        long count,
+        double percentage
+) {}
+```
+
+```java
+public record RouteCountRow(
+        String source,
+        String destination,
+        long count,
+        double percentage
+) {}
+```
+
+```java
+public record RouteTypeCountRow(
+        String source,
+        String destination,
+        TransferType type,
+        long count,
+        double percentage
+) {}
+```
+
+---
+
+## 5. Composite grouping keys
+
+```java
+public record RouteKey(
+        String source,
+        String destination
+) {}
+```
+
+```java
+public record RouteTypeKey(
+        String source,
+        String destination,
+        TransferType type
+) {}
+```
+
+---
+
+# 6. Service that analyzes the transfers
+
+This service does the real work.
+
+```java
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+@Service
+public class TransferAnalysisService {
+
+    private final TransferRepository transferRepository;
+
+    public TransferAnalysisService(TransferRepository transferRepository) {
+        this.transferRepository = transferRepository;
+    }
+
+    public TransferMarkdownAnalysisResponse analyzePersonTransfers(
+            String personId,
+            LocalDate dateFrom,
+            LocalDate dateTo,
+            Integer requestedTopN
+    ) {
+        int topN = normalizeTopN(requestedTopN);
+
+        List<TransferDto> transfers = transferRepository
+                .findTransfersForPerson(personId, dateFrom, dateTo)
+                .stream()
+                .map(this::toDto)
+                .toList();
+
+        int total = transfers.size();
+
+        if (total == 0) {
+            String markdown = """
+                    ## Transfer Analysis
+
+                    No transfer records were found for the selected person and date range.
+                    """;
+
+            return new TransferMarkdownAnalysisResponse(personId, 0, markdown);
+        }
+
+        LocalDate minDate = transfers.stream()
+                .map(TransferDto::date)
+                .filter(Objects::nonNull)
+                .min(LocalDate::compareTo)
+                .orElse(null);
+
+        LocalDate maxDate = transfers.stream()
+                .map(TransferDto::date)
+                .filter(Objects::nonNull)
+                .max(LocalDate::compareTo)
+                .orElse(null);
+
+        List<CountRow> mostSources = topCounts(
+                transfers,
+                t -> clean(t.source()),
+                total,
+                topN
+        );
+
+        List<CountRow> leastSources = bottomCounts(
+                transfers,
+                t -> clean(t.source()),
+                total,
+                topN
+        );
+
+        List<CountRow> mostDestinations = topCounts(
+                transfers,
+                t -> clean(t.destination()),
+                total,
+                topN
+        );
+
+        List<CountRow> leastDestinations = bottomCounts(
+                transfers,
+                t -> clean(t.destination()),
+                total,
+                topN
+        );
+
+        List<CountRow> mostTypes = topCounts(
+                transfers,
+                t -> t.type() == null ? "UNKNOWN" : t.type().name(),
+                total,
+                topN
+        );
+
+        List<CountRow> leastTypes = bottomCounts(
+                transfers,
+                t -> t.type() == null ? "UNKNOWN" : t.type().name(),
+                total,
+                topN
+        );
+
+        List<CountRow> mostBorders = topCounts(
+                transfers,
+                t -> clean(t.border()),
+                total,
+                topN
+        );
+
+        List<CountRow> leastBorders = bottomCounts(
+                transfers,
+                t -> clean(t.border()),
+                total,
+                topN
+        );
+
+        List<RouteCountRow> mostRoutes = topRoutes(transfers, total, topN);
+        List<RouteCountRow> leastRoutes = bottomRoutes(transfers, total, topN);
+
+        List<RouteTypeCountRow> mostRouteTypes = topRouteTypes(transfers, total, topN);
+        List<RouteTypeCountRow> leastRouteTypes = bottomRouteTypes(transfers, total, topN);
+
+        String markdown = buildMarkdown(
+                personId,
+                total,
+                minDate,
+                maxDate,
+                transfers,
+                mostSources,
+                leastSources,
+                mostDestinations,
+                leastDestinations,
+                mostTypes,
+                leastTypes,
+                mostBorders,
+                leastBorders,
+                mostRoutes,
+                leastRoutes,
+                mostRouteTypes,
+                leastRouteTypes
+        );
+
+        return new TransferMarkdownAnalysisResponse(personId, total, markdown);
+    }
+
+    private int normalizeTopN(Integer requestedTopN) {
+        if (requestedTopN == null || requestedTopN <= 0) {
+            return 10;
+        }
+
+        return Math.min(requestedTopN, 25);
+    }
+
+    private TransferDto toDto(TransferEntity entity) {
+        return new TransferDto(
+                entity.getPersonId(),
+                entity.getBorderName(),
+                entity.getTransferDate(),
+                entity.getSource(),
+                entity.getDestination(),
+                entity.getType()
+        );
+    }
+
+    private String clean(String value) {
+        if (value == null || value.isBlank()) {
+            return "UNKNOWN";
+        }
+
+        return value.trim();
+    }
+
+    private double percentage(long count, int total) {
+        if (total == 0) {
+            return 0.0;
+        }
+
+        return count * 100.0 / total;
+    }
+
+    private <T> List<CountRow> topCounts(
+            List<TransferDto> transfers,
+            java.util.function.Function<TransferDto, String> classifier,
+            int total,
+            int limit
+    ) {
+        return transfers.stream()
+                .collect(Collectors.groupingBy(classifier, Collectors.counting()))
+                .entrySet()
+                .stream()
+                .map(e -> new CountRow(e.getKey(), e.getValue(), percentage(e.getValue(), total)))
+                .sorted(
+                        Comparator.comparingLong(CountRow::count)
+                                .reversed()
+                                .thenComparing(CountRow::value)
+                )
+                .limit(limit)
+                .toList();
+    }
+
+    private List<CountRow> bottomCounts(
+            List<TransferDto> transfers,
+            java.util.function.Function<TransferDto, String> classifier,
+            int total,
+            int limit
+    ) {
+        return transfers.stream()
+                .collect(Collectors.groupingBy(classifier, Collectors.counting()))
+                .entrySet()
+                .stream()
+                .map(e -> new CountRow(e.getKey(), e.getValue(), percentage(e.getValue(), total)))
+                .sorted(
+                        Comparator.comparingLong(CountRow::count)
+                                .thenComparing(CountRow::value)
+                )
+                .limit(limit)
+                .toList();
+    }
+
+    private List<RouteCountRow> topRoutes(
+            List<TransferDto> transfers,
+            int total,
+            int limit
+    ) {
+        return routeCounts(transfers, total)
+                .stream()
+                .sorted(
+                        Comparator.comparingLong(RouteCountRow::count)
+                                .reversed()
+                                .thenComparing(RouteCountRow::source)
+                                .thenComparing(RouteCountRow::destination)
+                )
+                .limit(limit)
+                .toList();
+    }
+
+    private List<RouteCountRow> bottomRoutes(
+            List<TransferDto> transfers,
+            int total,
+            int limit
+    ) {
+        return routeCounts(transfers, total)
+                .stream()
+                .sorted(
+                        Comparator.comparingLong(RouteCountRow::count)
+                                .thenComparing(RouteCountRow::source)
+                                .thenComparing(RouteCountRow::destination)
+                )
+                .limit(limit)
+                .toList();
+    }
+
+    private List<RouteCountRow> routeCounts(
+            List<TransferDto> transfers,
+            int total
+    ) {
+        Map<RouteKey, Long> grouped = transfers.stream()
+                .collect(Collectors.groupingBy(
+                        t -> new RouteKey(clean(t.source()), clean(t.destination())),
+                        Collectors.counting()
+                ));
+
+        return grouped.entrySet()
+                .stream()
+                .map(e -> new RouteCountRow(
+                        e.getKey().source(),
+                        e.getKey().destination(),
+                        e.getValue(),
+                        percentage(e.getValue(), total)
+                ))
+                .toList();
+    }
+
+    private List<RouteTypeCountRow> topRouteTypes(
+            List<TransferDto> transfers,
+            int total,
+            int limit
+    ) {
+        return routeTypeCounts(transfers, total)
+                .stream()
+                .sorted(
+                        Comparator.comparingLong(RouteTypeCountRow::count)
+                                .reversed()
+                                .thenComparing(RouteTypeCountRow::source)
+                                .thenComparing(RouteTypeCountRow::destination)
+                                .thenComparing(r -> r.type() == null ? "UNKNOWN" : r.type().name())
+                )
+                .limit(limit)
+                .toList();
+    }
+
+    private List<RouteTypeCountRow> bottomRouteTypes(
+            List<TransferDto> transfers,
+            int total,
+            int limit
+    ) {
+        return routeTypeCounts(transfers, total)
+                .stream()
+                .sorted(
+                        Comparator.comparingLong(RouteTypeCountRow::count)
+                                .thenComparing(RouteTypeCountRow::source)
+                                .thenComparing(RouteTypeCountRow::destination)
+                                .thenComparing(r -> r.type() == null ? "UNKNOWN" : r.type().name())
+                )
+                .limit(limit)
+                .toList();
+    }
+
+    private List<RouteTypeCountRow> routeTypeCounts(
+            List<TransferDto> transfers,
+            int total
+    ) {
+        Map<RouteTypeKey, Long> grouped = transfers.stream()
+                .collect(Collectors.groupingBy(
+                        t -> new RouteTypeKey(
+                                clean(t.source()),
+                                clean(t.destination()),
+                                t.type()
+                        ),
+                        Collectors.counting()
+                ));
+
+        return grouped.entrySet()
+                .stream()
+                .map(e -> new RouteTypeCountRow(
+                        e.getKey().source(),
+                        e.getKey().destination(),
+                        e.getKey().type(),
+                        e.getValue(),
+                        percentage(e.getValue(), total)
+                ))
+                .toList();
+    }
+
+    private String buildMarkdown(
+            String personId,
+            int total,
+            LocalDate minDate,
+            LocalDate maxDate,
+            List<TransferDto> transfers,
+            List<CountRow> mostSources,
+            List<CountRow> leastSources,
+            List<CountRow> mostDestinations,
+            List<CountRow> leastDestinations,
+            List<CountRow> mostTypes,
+            List<CountRow> leastTypes,
+            List<CountRow> mostBorders,
+            List<CountRow> leastBorders,
+            List<RouteCountRow> mostRoutes,
+            List<RouteCountRow> leastRoutes,
+            List<RouteTypeCountRow> mostRouteTypes,
+            List<RouteTypeCountRow> leastRouteTypes
+    ) {
+        long uniqueSources = transfers.stream()
+                .map(t -> clean(t.source()))
+                .distinct()
+                .count();
+
+        long uniqueDestinations = transfers.stream()
+                .map(t -> clean(t.destination()))
+                .distinct()
+                .count();
+
+        long uniqueRoutes = transfers.stream()
+                .map(t -> new RouteKey(clean(t.source()), clean(t.destination())))
+                .distinct()
+                .count();
+
+        long uniqueTypes = transfers.stream()
+                .map(t -> t.type() == null ? "UNKNOWN" : t.type().name())
+                .distinct()
+                .count();
+
+        StringBuilder md = new StringBuilder();
+
+        md.append("## Transfer Analysis\n\n");
+
+        md.append("### Summary\n\n");
+        md.append("| Metric | Value |\n");
+        md.append("|---|---:|\n");
+        md.append("| Person ID | ").append(escape(personId)).append(" |\n");
+        md.append("| Total transfers | ").append(total).append(" |\n");
+        md.append("| Date range | ").append(minDate).append(" to ").append(maxDate).append(" |\n");
+        md.append("| Unique sources | ").append(uniqueSources).append(" |\n");
+        md.append("| Unique destinations | ").append(uniqueDestinations).append(" |\n");
+        md.append("| Unique source-destination routes | ").append(uniqueRoutes).append(" |\n");
+        md.append("| Unique transfer types | ").append(uniqueTypes).append(" |\n\n");
+
+        appendCountTable(md, "### Most Common Sources", "Source", mostSources);
+        appendCountTable(md, "### Least Common Sources", "Source", leastSources);
+
+        appendCountTable(md, "### Most Common Destinations", "Destination", mostDestinations);
+        appendCountTable(md, "### Least Common Destinations", "Destination", leastDestinations);
+
+        appendCountTable(md, "### Most Common Transfer Types", "Type", mostTypes);
+        appendCountTable(md, "### Least Common Transfer Types", "Type", leastTypes);
+
+        appendCountTable(md, "### Most Common Borders", "Border", mostBorders);
+        appendCountTable(md, "### Least Common Borders", "Border", leastBorders);
+
+        appendRouteTable(md, "### Most Common Source-Destination Routes", mostRoutes);
+        appendRouteTable(md, "### Least Common Source-Destination Routes", leastRoutes);
+
+        appendRouteTypeTable(md, "### Most Common Source-Destination-Type Combinations", mostRouteTypes);
+        appendRouteTypeTable(md, "### Least Common Source-Destination-Type Combinations", leastRouteTypes);
+
+        md.append("### Notes\n\n");
+        md.append("- Percentages are calculated against total transfers: ")
+                .append(total)
+                .append(".\n");
+        md.append("- Least common tables include one-time routes if they exist.\n");
+        md.append("- `UNKNOWN` means the original record had a null or blank value.\n");
+
+        return md.toString();
+    }
+
+    private void appendCountTable(
+            StringBuilder md,
+            String title,
+            String columnName,
+            List<CountRow> rows
+    ) {
+        md.append(title).append("\n\n");
+        md.append("| Rank | ").append(columnName).append(" | Count | Percentage |\n");
+        md.append("|---:|---|---:|---:|\n");
+
+        for (int i = 0; i < rows.size(); i++) {
+            CountRow row = rows.get(i);
+
+            md.append("| ")
+                    .append(i + 1)
+                    .append(" | ")
+                    .append(escape(row.value()))
+                    .append(" | ")
+                    .append(row.count())
+                    .append(" | ")
+                    .append(formatPercent(row.percentage()))
+                    .append(" |\n");
+        }
+
+        md.append("\n");
+    }
+
+    private void appendRouteTable(
+            StringBuilder md,
+            String title,
+            List<RouteCountRow> rows
+    ) {
+        md.append(title).append("\n\n");
+        md.append("| Rank | Source | Destination | Count | Percentage |\n");
+        md.append("|---:|---|---|---:|---:|\n");
+
+        for (int i = 0; i < rows.size(); i++) {
+            RouteCountRow row = rows.get(i);
+
+            md.append("| ")
+                    .append(i + 1)
+                    .append(" | ")
+                    .append(escape(row.source()))
+                    .append(" | ")
+                    .append(escape(row.destination()))
+                    .append(" | ")
+                    .append(row.count())
+                    .append(" | ")
+                    .append(formatPercent(row.percentage()))
+                    .append(" |\n");
+        }
+
+        md.append("\n");
+    }
+
+    private void appendRouteTypeTable(
+            StringBuilder md,
+            String title,
+            List<RouteTypeCountRow> rows
+    ) {
+        md.append(title).append("\n\n");
+        md.append("| Rank | Source | Destination | Type | Count | Percentage |\n");
+        md.append("|---:|---|---|---|---:|---:|\n");
+
+        for (int i = 0; i < rows.size(); i++) {
+            RouteTypeCountRow row = rows.get(i);
+
+            md.append("| ")
+                    .append(i + 1)
+                    .append(" | ")
+                    .append(escape(row.source()))
+                    .append(" | ")
+                    .append(escape(row.destination()))
+                    .append(" | ")
+                    .append(row.type() == null ? "UNKNOWN" : row.type().name())
+                    .append(" | ")
+                    .append(row.count())
+                    .append(" | ")
+                    .append(formatPercent(row.percentage()))
+                    .append(" |\n");
+        }
+
+        md.append("\n");
+    }
+
+    private String formatPercent(double value) {
+        return String.format("%.2f%%", value);
+    }
+
+    private String escape(String value) {
+        if (value == null) {
+            return "UNKNOWN";
+        }
+
+        return value.replace("|", "\\|");
+    }
+}
+```
+
+---
+
+# 7. Repository example
+
+If your data is in a database, expose a method like this.
+
+```java
+import java.time.LocalDate;
+import java.util.List;
+
+public interface TransferRepository {
+
+    List<TransferEntity> findTransfersForPerson(
+            String personId,
+            LocalDate dateFrom,
+            LocalDate dateTo
+    );
+}
+```
+
+If you use Spring Data JPA, it could be:
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+
+import java.time.LocalDate;
+import java.util.List;
+
+public interface TransferJpaRepository extends JpaRepository<TransferEntity, String> {
+
+    @Query("""
+            select t
+            from TransferEntity t
+            where t.personId = :personId
+              and (:dateFrom is null or t.transferDate >= :dateFrom)
+              and (:dateTo is null or t.transferDate <= :dateTo)
+            order by t.transferDate asc
+            """)
+    List<TransferEntity> findTransfersForPerson(
+            String personId,
+            LocalDate dateFrom,
+            LocalDate dateTo
+    );
+}
+```
+
+---
+
+# 8. Spring AI tool
+
+Expose only the analysis tool to the model.
+
+```java
+import org.springframework.ai.tool.annotation.Tool;
+import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.stereotype.Component;
+
+import java.time.LocalDate;
+
+@Component
+public class TransferAnalysisTools {
+
+    private final TransferAnalysisService transferAnalysisService;
+
+    public TransferAnalysisTools(TransferAnalysisService transferAnalysisService) {
+        this.transferAnalysisService = transferAnalysisService;
+    }
+
+    @Tool(description = """
+            Analyze all transfer records for one person and return a Markdown report.
+
+            Use this tool when the user asks for:
+            - most common source
+            - least common source
+            - most common destination
+            - least common destination
+            - most common source-destination route
+            - least common source-destination route
+            - transfer type distribution
+            - airline/train/bus/ship/truck/car usage
+            - markdown tables about transfer activity
+
+            This tool performs exact counting in the backend.
+            It does not return raw transfer records.
+            """)
+    public TransferMarkdownAnalysisResponse analyzePersonTransfers(
+            @ToolParam(description = "The person ID whose transfer records should be analyzed.")
+            String personId,
+
+            @ToolParam(description = "Optional start date in yyyy-MM-dd format.")
+            LocalDate dateFrom,
+
+            @ToolParam(description = "Optional end date in yyyy-MM-dd format.")
+            LocalDate dateTo,
+
+            @ToolParam(description = "Number of rows to show in each top/least table. Default 10. Maximum 25.")
+            Integer topN
+    ) {
+        return transferAnalysisService.analyzePersonTransfers(
+                personId,
+                dateFrom,
+                dateTo,
+                topN
+        );
+    }
+}
+```
+
+---
+
+# 9. ChatClient setup
+
+```java
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class AiConfig {
+
+    @Bean
+    ChatClient chatClient(
+            ChatClient.Builder builder,
+            TransferAnalysisTools transferAnalysisTools
+    ) {
+        return builder
+                .defaultSystem("""
+                        You are a transfer data analyst.
+
+                        When the user asks for transfer statistics, markdown tables,
+                        most common source, least common source, destination analysis,
+                        route analysis, or type analysis, use the transfer analysis tool.
+
+                        Do not ask for raw transfer records.
+                        Use the exact backend-generated statistics.
+                        Return the markdown from the tool clearly to the user.
+                        You may add a short interpretation after the tables.
+                        """)
+                .defaultTools(transferAnalysisTools)
+                .build();
+    }
+}
+```
+
+---
+
+# 10. Controller example
+
+```java
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/person-transfer-analysis")
+public class PersonTransferAnalysisController {
+
+    private final ChatClient chatClient;
+
+    public PersonTransferAnalysisController(ChatClient chatClient) {
+        this.chatClient = chatClient;
+    }
+
+    @PostMapping
+    public String analyze(@RequestBody TransferQuestionRequest request) {
+        return chatClient.prompt()
+                .user(request.question())
+                .call()
+                .content();
+    }
+}
+```
+
+```java
+public record TransferQuestionRequest(
+        String question
+) {}
+```
+
+Example request:
+
+```json
+{
+  "question": "Analyze transfers for person P-1001 from 2025-01-01 to 2026-08-26. Give me markdown tables for most and least source, destination, route, and flight/train type."
+}
+```
+
+---
+
+# 11. What the model should call
+
+The model should call your tool like:
+
+```json
+{
+  "personId": "P-1001",
+  "dateFrom": "2025-01-01",
+  "dateTo": "2026-08-26",
+  "topN": 10
+}
+```
+
+The tool returns:
+
+```json
+{
+  "personId": "P-1001",
+  "totalTransfers": 2034,
+  "markdown": "## Transfer Analysis\n\n### Summary\n\n| Metric | Value |\n|---|---:|\n..."
+}
+```
+
+Then Qwen returns the markdown to the user.
+
+---
+
+# Important point
+
+For your case, **Solution 1 pagination is not the best final design** if the goal is only statistics and markdown tables.
+
+Pagination is useful when the model must inspect individual records.
+
+But your task is:
+
+```text
+Count, group, rank, summarize, and format as Markdown.
+```
+
+So the best design is:
+
+```text
+Raw 2,000 transfers stay in backend
+        ↓
+Java calculates exact stats
+        ↓
+Tool returns Markdown or compact stats
+        ↓
+Model presents final answer
+```
+
+This is faster, cheaper, more accurate, and avoids context-window problems.
+
+---
+
+# If you still want to combine with Solution 1
+
+You can use both tools:
+
+```java
+searchTransfers(...)
+analyzePersonTransfers(...)
+```
+
+Use:
+
+- `analyzePersonTransfers(...)` for statistics and markdown.
+- `searchTransfers(...)` only when the user asks to see actual individual transfer records.
+
+For your current requirement, I would implement **`analyzePersonTransfers`** first.
