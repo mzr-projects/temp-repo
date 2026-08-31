@@ -1,0 +1,355 @@
+Here's a complete, production-ready example of the map-reduce strategy. The key idea: **we bypass tool calling entirely for the heavy data** — your code fetches and chunks the data, the LLM analyzes each chunk (map), and a final call merges everything into one markdown report (reduce).
+
+## Project structure
+
+```
+├── controller/
+│   └── AnalysisController.java
+├── service/
+│   ├── SalesApiClient.java
+│   └── MapReduceAnalysisService.java
+├── model/
+│   ├── SalesRecord.java
+│   └── ChunkAnalysis.java
+└── config/
+    └── AiConfig.java
+```
+
+## 1. The data model
+
+```java
+// model/SalesRecord.java
+public record SalesRecord(
+        String orderId,
+        String product,
+        String category,
+        String region,
+        BigDecimal amount,
+        LocalDate orderDate
+) {}
+```
+
+```java
+// model/ChunkAnalysis.java
+// Holds the partial result of the "map" phase for one chunk
+public record ChunkAnalysis(
+        int chunkIndex,
+        int recordCount,
+        String analysis   // markdown-ish partial insights from the LLM
+) {}
+```
+
+## 2. The REST client (fetches the thousands of records)
+
+```java
+// service/SalesApiClient.java
+@Service
+public class SalesApiClient {
+
+    private final RestClient restClient;
+
+    public SalesApiClient(RestClient.Builder builder,
+                          @Value("${sales.api.base-url}") String baseUrl) {
+        this.restClient = builder.baseUrl(baseUrl).build();
+    }
+
+    public List<SalesRecord> fetchSalesData(String from, String to) {
+        return restClient.get()
+                .uri(uri -> uri.path("/sales")
+                        .queryParam("from", from)
+                        .queryParam("to", to)
+                        .build())
+                .retrieve()
+                .body(new ParameterizedTypeReference<List<SalesRecord>>() {});
+    }
+}
+```
+
+## 3. Configuration
+
+```java
+// config/AiConfig.java
+@Configuration
+public class AiConfig {
+
+    @Bean
+    public ChatClient chatClient(ChatClient.Builder builder) {
+        return builder
+                .defaultOptions(ChatOptions.builder()
+                        .temperature(0.2)   // low temp = consistent analysis
+                        .build())
+                .build();
+    }
+
+    // Dedicated executor so parallel map calls don't starve your web threads
+    @Bean(destroyMethod = "shutdown")
+    public ExecutorService analysisExecutor() {
+        // Virtual threads (Java 21+) are ideal: map calls are I/O-bound
+        return Executors.newVirtualThreadPerTaskExecutor();
+        // Pre-Java 21 alternative:
+        // return Executors.newFixedThreadPool(4);
+    }
+}
+```
+
+```yaml
+# application.yml
+sales:
+  api:
+    base-url: https://your-api.example.com
+
+analysis:
+  chunk-size: 200        # records per LLM call — tune to your model's context
+  max-parallel-calls: 4  # respect your provider's rate limits
+
+spring:
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4o-mini   # cheap model for map phase is a common optimization
+```
+
+## 4. The map-reduce service (the heart of it)
+
+```java
+// service/MapReduceAnalysisService.java
+@Service
+public class MapReduceAnalysisService {
+
+    private static final Logger log = LoggerFactory.getLogger(MapReduceAnalysisService.class);
+
+    private final ChatClient chatClient;
+    private final SalesApiClient salesApiClient;
+    private final ExecutorService analysisExecutor;
+    private final ObjectMapper objectMapper;
+
+    @Value("${analysis.chunk-size:200}")
+    private int chunkSize;
+
+    @Value("${analysis.max-parallel-calls:4}")
+    private int maxParallelCalls;
+
+    public MapReduceAnalysisService(ChatClient chatClient,
+                                    SalesApiClient salesApiClient,
+                                    ExecutorService analysisExecutor,
+                                    ObjectMapper objectMapper) {
+        this.chatClient = chatClient;
+        this.salesApiClient = salesApiClient;
+        this.analysisExecutor = analysisExecutor;
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * Entry point: fetch -> chunk -> map (parallel) -> reduce -> markdown report.
+     */
+    public String analyzeSalesData(String from, String to, String userQuestion) {
+        // 1. FETCH
+        List<SalesRecord> allRecords = salesApiClient.fetchSalesData(from, to);
+        log.info("Fetched {} records", allRecords.size());
+
+        if (allRecords.isEmpty()) {
+            return "## Analysis Report\n\nNo data found for the given period.";
+        }
+
+        // 2. CHUNK
+        List<List<SalesRecord>> chunks = partition(allRecords, chunkSize);
+        log.info("Split into {} chunks of up to {} records", chunks.size(), chunkSize);
+
+        // 3. MAP — analyze each chunk in parallel (bounded)
+        List<ChunkAnalysis> partials = mapPhase(chunks, userQuestion);
+
+        // 4. REDUCE — merge partial analyses into the final markdown report
+        return reducePhase(partials, userQuestion, allRecords.size(), from, to);
+    }
+
+    // ---------- MAP PHASE ----------
+
+    private List<ChunkAnalysis> mapPhase(List<List<SalesRecord>> chunks, String userQuestion) {
+        Semaphore rateLimiter = new Semaphore(maxParallelCalls);
+
+        List<CompletableFuture<ChunkAnalysis>> futures = new ArrayList<>();
+        for (int i = 0; i < chunks.size(); i++) {
+            final int chunkIndex = i;
+            final List<SalesRecord> chunk = chunks.get(i);
+
+            futures.add(CompletableFuture.supplyAsync(() -> {
+                try {
+                    rateLimiter.acquire();
+                    return analyzeChunk(chunkIndex, chunk, userQuestion);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Chunk analysis interrupted", e);
+                } finally {
+                    rateLimiter.release();
+                }
+            }, analysisExecutor));
+        }
+
+        return futures.stream()
+                .map(CompletableFuture::join)
+                .sorted(Comparator.comparingInt(ChunkAnalysis::chunkIndex))
+                .toList();
+    }
+
+    private ChunkAnalysis analyzeChunk(int chunkIndex, List<SalesRecord> chunk, String userQuestion) {
+        String chunkData = toCompactCsv(chunk);   // CSV = ~40-50% fewer tokens than JSON
+
+        String partialAnalysis = chatClient.prompt()
+                .system("""
+                        You are a data analyst performing a PARTIAL analysis of one \
+                        chunk of a larger dataset. Other chunks are analyzed separately \
+                        and your output will later be merged.
+
+                        Extract from this chunk ONLY:
+                        - Key numeric facts: totals, counts, min/max, averages
+                        - Top items (products, regions, categories) with their figures
+                        - Notable anomalies or outliers
+                        - Anything specifically relevant to the user's question
+
+                        Be terse and factual. Use plain bullet points with concrete \
+                        numbers. Do NOT write introductions, conclusions, or \
+                        recommendations — that happens in the merge step.
+                        """)
+                .user(u -> u.text("""
+                        User's question: {question}
+
+                        Chunk {index} data (CSV):
+                        {data}
+                        """)
+                        .param("question", userQuestion)
+                        .param("index", chunkIndex + 1)
+                        .param("data", chunkData))
+                .call()
+                .content();
+
+        log.debug("Chunk {} analyzed ({} records)", chunkIndex, chunk.size());
+        return new ChunkAnalysis(chunkIndex, chunk.size(), partialAnalysis);
+    }
+
+    // ---------- REDUCE PHASE ----------
+
+    private String reducePhase(List<ChunkAnalysis> partials, String userQuestion,
+                               int totalRecords, String from, String to) {
+        String combinedPartials = partials.stream()
+                .map(p -> "### Partial analysis — chunk %d (%d records)%n%s"
+                        .formatted(p.chunkIndex() + 1, p.recordCount(), p.analysis()))
+                .collect(Collectors.joining("\n\n---\n\n"));
+
+        return chatClient.prompt()
+                .system("""
+                        You are a senior data analyst. You are given partial analyses \
+                        of chunks from a single large dataset. Merge them into ONE \
+                        coherent final report.
+
+                        Rules:
+                        - Aggregate figures across chunks where possible (sum totals, \
+                          recompute overall top lists, weight averages by record count)
+                        - Resolve contradictions by preferring majority evidence
+                        - Never mention "chunks" or the merging process in your output
+
+                        Format the ENTIRE response as Markdown:
+                        - ## Summary — 3-5 sentence executive overview
+                        - ## Key Metrics — a Markdown table
+                        - ## Detailed Findings — grouped bullet points
+                        - ## Anomalies — if any were found
+                        - ## Recommendations — actionable next steps
+                        """)
+                .user(u -> u.text("""
+                        User's question: {question}
+                        Dataset: {total} sales records, period {from} to {to}.
+
+                        Partial analyses to merge:
+
+                        {partials}
+                        """)
+                        .param("question", userQuestion)
+                        .param("total", totalRecords)
+                        .param("from", from)
+                        .param("to", to)
+                        .param("partials", combinedPartials))
+                .call()
+                .content();
+    }
+
+    // ---------- HELPERS ----------
+
+    private static <T> List<List<T>> partition(List<T> list, int size) {
+        List<List<T>> parts = new ArrayList<>();
+        for (int i = 0; i < list.size(); i += size) {
+            parts.add(list.subList(i, Math.min(i + size, list.size())));
+        }
+        return parts;
+    }
+
+    /** Compact CSV serialization — dramatically cheaper in tokens than JSON. */
+    private String toCompactCsv(List<SalesRecord> records) {
+        StringBuilder sb = new StringBuilder("orderId,product,category,region,amount,orderDate\n");
+        for (SalesRecord r : records) {
+            sb.append(r.orderId()).append(',')
+              .append(escape(r.product())).append(',')
+              .append(escape(r.category())).append(',')
+              .append(r.region()).append(',')
+              .append(r.amount()).append(',')
+              .append(r.orderDate()).append('\n');
+        }
+        return sb.toString();
+    }
+
+    private String escape(String value) {
+        return value != null && value.contains(",") ? "\"" + value + "\"" : value;
+    }
+}
+```
+
+## 5. The controller
+
+```java
+// controller/AnalysisController.java
+@RestController
+@RequestMapping("/api/analysis")
+public class AnalysisController {
+
+    private final MapReduceAnalysisService analysisService;
+
+    public AnalysisController(MapReduceAnalysisService analysisService) {
+        this.analysisService = analysisService;
+    }
+
+    @GetMapping(value = "/sales", produces = MediaType.TEXT_MARKDOWN_VALUE)
+    public String analyzeSales(@RequestParam String from,
+                               @RequestParam String to,
+                               @RequestParam(defaultValue = "Provide a general analysis of trends, top performers and anomalies")
+                               String question) {
+        return analysisService.analyzeSalesData(from, to, question);
+    }
+}
+```
+
+Call it like:
+
+```
+GET /api/analysis/sales?from=2026-01-01&to=2026-06-30&question=Which regions are underperforming and why?
+```
+
+## Key design decisions worth understanding
+
+**Why no `@Tool` here?** Since *you* decide the data must be fully analyzed, letting the model "decide" to fetch it via a tool adds nothing — it just forces the giant payload through the tool-calling loop's conversation history. Orchestrating explicitly gives you full control over token budgets.
+
+**Chunk size (200)** — tune this. Rough math: estimate ~15–40 tokens per record depending on field sizes. With 200 records ≈ 5–8k tokens per map call, you're comfortably inside any modern model's window with room for the prompt and response.
+
+**Semaphore rate limiting** — providers throttle you (requests/min and tokens/min). Bounding parallelism to ~4 concurrent calls avoids 429 errors. If you hit them anyway, add retry with backoff (e.g., Spring Retry or Resilience4j around `analyzeChunk`).
+
+**Terse map prompt, rich reduce prompt** — the map phase should extract *facts with numbers*, not prose. If chunks return verbose essays, the reduce prompt gets bloated and merging quality drops. The reduce phase is where the markdown polish happens.
+
+**Cost optimization option** — use a cheap/fast model (e.g., `gpt-4o-mini`, `claude-haiku`) for the map phase and a stronger model for the reduce phase. You'd inject two `ChatClient` beans with different default options.
+
+**One caveat on accuracy** — LLMs aggregating numbers across chunks can make arithmetic mistakes. For metrics that must be exact (grand totals, exact counts), compute them in Java and inject them into the reduce prompt as ground truth, letting the LLM handle only interpretation:
+
+```java
+.param("groundTruth", "Exact total revenue: %s, exact record count: %d"
+        .formatted(computeTotal(allRecords), allRecords.size()))
+```
+
+That hybrid — deterministic math in Java + LLM narrative on top — gives you the best of both worlds. Want me to add streaming support (so the final report streams to the client as it's generated), or a two-model setup for the cost optimization?
