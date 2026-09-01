@@ -1,0 +1,374 @@
+Below is a complete, production-grade architecture for exactly this use case. It combines three Spring AI features to get "sticky" context + correct routing:
+
+1. **Chat memory (persistent)** — so the LLM sees prior turns and can resolve "give me the trips" → "trips for national code 3424534". This works because LLMs are stateless and do not retain information about previous interactions, so Spring AI provides chat memory features that allow you to store and retrieve information across multiple interactions, and the MessageChatMemoryAdvisor manages conversation memory using the provided ChatMemory implementation — on each interaction it retrieves the conversation history and includes it in the prompt as a collection of messages.
+2. **`@Tool` methods** — the LLM itself does the routing. When you pass a tool bean, Spring AI scans it, finds the `@Tool` annotations, generates the JSON schema for the method signatures, and provides them to the LLM, which then picks the right tool from your descriptions.
+3. **A deterministic conversation-state store + `ToolContext`** — a *defense-in-depth* layer so you never depend solely on the LLM remembering the national code. ToolContext lets you pass non-model data (tenant IDs, user IDs, request scope) to tool methods; the data is not sent to the model — it's purely for the tool's internal use.
+
+---
+
+## Architecture
+
+```
+User ──▶ ChatController ──▶ ChatService
+                              │  conversationId = userId
+                              ▼
+                        ChatClient
+                        ├─ MessageChatMemoryAdvisor (JDBC-persisted history)
+                        ├─ SimpleLoggerAdvisor
+                        └─ tools: PersonTools (biography, trips)
+                                    │
+                                    ▼
+                        ConversationStateService (Redis/Caffeine)
+                        └─ last known nationalCode per conversation
+                                    │
+                                    ▼
+                        Downstream REST APIs (RestClient + Resilience4j)
+```
+
+**Routing** is done by the model via tool descriptions. **Context** is guaranteed two ways: the model usually extracts `3424534` from history; if it doesn't, the tool falls back to the last national code saved in the state store.
+
+---
+
+## 1. Dependencies (`pom.xml`)
+
+```xml
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-starter-model-openai</artifactId> <!-- or your provider -->
+    </dependency>
+    <!-- Persistent chat memory -->
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-starter-model-chat-memory-repository-jdbc</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.github.resilience4j</groupId>
+        <artifactId>resilience4j-spring-boot3</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+</dependencies>
+```
+
+For production, don't use in-memory history — for production systems, in-memory storage is not enough; Spring AI provides `JdbcChatMemoryRepository` for persistent storage.
+
+## 2. `application.yml`
+
+```yaml
+spring:
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4o
+          temperature: 0.1        # low temp = deterministic routing
+    chat:
+      memory:
+        repository:
+          jdbc:
+            initialize-schema: always   # use 'never' + Flyway in real prod
+  datasource:
+    url: jdbc:postgresql://localhost:5432/chatdb
+    username: ${DB_USER}
+    password: ${DB_PASS}
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      personApi:
+        slidingWindowSize: 20
+        failureRateThreshold: 50
+        waitDurationInOpenState: 30s
+  retry:
+    instances:
+      personApi:
+        maxAttempts: 3
+        waitDuration: 500ms
+```
+
+## 3. ChatClient configuration
+
+```java
+@Configuration
+public class AiConfig {
+
+    private static final String SYSTEM_PROMPT = """
+        You are an assistant for a citizen-services application.
+        Rules:
+        1. When the user asks for a person's biography, call getBiography.
+        2. When the user asks for trips, call getTrips.
+        3. A national code is a numeric identifier the user provides (e.g. 3424534).
+        4. If the current message does not contain a national code, reuse the most
+           recent national code mentioned earlier in this conversation.
+        5. If no national code exists anywhere in the conversation, do NOT guess or
+           call any tool — ask the user to provide one.
+        6. Never invent data. Only answer from tool results.
+        """;
+
+    @Bean
+    ChatMemory chatMemory(JdbcChatMemoryRepository repository) {
+        return MessageWindowChatMemory.builder()
+                .chatMemoryRepository(repository)
+                .maxMessages(30)
+                .build();
+    }
+
+    @Bean
+    ChatClient chatClient(ChatClient.Builder builder,
+                          ChatMemory chatMemory,
+                          PersonTools personTools) {
+        return builder
+                .defaultSystem(SYSTEM_PROMPT)
+                .defaultAdvisors(
+                        MessageChatMemoryAdvisor.builder(chatMemory).build(),
+                        new SimpleLoggerAdvisor())
+                .defaultTools(personTools)
+                .build();
+    }
+}
+```
+
+Notes:
+- `MessageWindowChatMemory` maintains a window of messages up to a specified maximum size (default 20); when the limit is exceeded, older messages are evicted, but system messages are preserved.
+- It is recommended to register the advisors at build time using the builder's `defaultAdvisors()` method.
+
+## 4. Conversation state store (the robustness layer)
+
+This guarantees the national code survives even if the LLM fails to extract it from history (long conversations, window eviction, model glitches).
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ConversationStateService {
+
+    private static final Duration TTL = Duration.ofHours(2);
+    private final StringRedisTemplate redis;
+
+    public void saveNationalCode(String conversationId, String nationalCode) {
+        redis.opsForValue().set(key(conversationId), nationalCode, TTL);
+    }
+
+    public Optional<String> getNationalCode(String conversationId) {
+        return Optional.ofNullable(redis.opsForValue().get(key(conversationId)));
+    }
+
+    private String key(String conversationId) {
+        return "conv:state:nationalCode:" + conversationId;
+    }
+}
+```
+
+## 5. The tools (routing targets)
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class PersonTools {
+
+    private static final Pattern NATIONAL_CODE = Pattern.compile("^\\d{6,10}$");
+
+    private final PersonApiClient personApiClient;
+    private final ConversationStateService stateService;
+
+    @Tool(description = """
+        Returns the biography of a person identified by their national code.
+        Use when the user asks about a person's biography, profile, or personal info.
+        """)
+    public BiographyResponse getBiography(
+            @ToolParam(description = "The person's national code, digits only",
+                       required = false) String nationalCode,
+            ToolContext toolContext) {
+
+        String code = resolveNationalCode(nationalCode, toolContext);
+        String conversationId = conversationId(toolContext);
+
+        BiographyResponse response = personApiClient.fetchBiography(code);
+        // persist the code deterministically for follow-up requests
+        stateService.saveNationalCode(conversationId, code);
+        return response;
+    }
+
+    @Tool(description = """
+        Returns the list of trips of a person identified by their national code.
+        Use when the user asks about trips, travels, or journeys.
+        If the user does not repeat the national code, it is resolved automatically
+        from the conversation.
+        """)
+    public TripsResponse getTrips(
+            @ToolParam(description = "The person's national code, digits only",
+                       required = false) String nationalCode,
+            ToolContext toolContext) {
+
+        String code = resolveNationalCode(nationalCode, toolContext);
+        String conversationId = conversationId(toolContext);
+
+        TripsResponse response = personApiClient.fetchTrips(code);
+        stateService.saveNationalCode(conversationId, code);
+        return response;
+    }
+
+    /** Model-provided value wins; otherwise fall back to stored state. */
+    private String resolveNationalCode(String provided, ToolContext ctx) {
+        String candidate = StringUtils.hasText(provided)
+                ? provided.trim()
+                : stateService.getNationalCode(conversationId(ctx)).orElse(null);
+
+        if (candidate == null) {
+            // Returned to the LLM, which will relay the question to the user
+            throw new ToolExecutionException(
+                "No national code available. Ask the user to provide one.");
+        }
+        if (!NATIONAL_CODE.matcher(candidate).matches()) {
+            throw new ToolExecutionException(
+                "Invalid national code format: must be 6-10 digits.");
+        }
+        return candidate;
+    }
+
+    private String conversationId(ToolContext ctx) {
+        return (String) ctx.getContext().get("conversationId");
+    }
+}
+```
+
+Key design points:
+- `nationalCode` is `required = false` deliberately — by default every parameter is required; you make a parameter optional via `@ToolParam(required = false)`. That lets the model call `getTrips` with no argument on the follow-up message and lets *your code* resolve it deterministically.
+- The `ToolContext` parameter never appears in the model's schema; it's injected by the framework. It enables supplying supplemental data such as user identity, which is combined with the tool parameters provided by the AI model.
+- If you want the raw API payload returned straight to the caller (skipping LLM rewriting), Spring AI supports that too: by default tool call return values are sent back to the AI model for further processing, but scenarios like data search may require direct results to be returned to the caller instead — set `returnDirect = true` in the `@Tool` annotation.
+
+## 6. Resilient REST client
+
+```java
+@Component
+public class PersonApiClient {
+
+    private final RestClient restClient;
+
+    public PersonApiClient(RestClient.Builder builder,
+                           @Value("${person.api.base-url}") String baseUrl) {
+        this.restClient = builder
+                .baseUrl(baseUrl)
+                .requestFactory(ClientHttpRequestFactoryBuilder.jdk()
+                        .withCustomizer(c -> {})
+                        .build(ClientHttpRequestFactorySettings.defaults()
+                                .withConnectTimeout(Duration.ofSeconds(3))
+                                .withReadTimeout(Duration.ofSeconds(10))))
+                .build();
+    }
+
+    @Retry(name = "personApi")
+    @CircuitBreaker(name = "personApi", fallbackMethod = "biographyFallback")
+    public BiographyResponse fetchBiography(String nationalCode) {
+        return restClient.get()
+                .uri("/persons/{code}/biography", nationalCode)
+                .retrieve()
+                .onStatus(s -> s.value() == 404, (req, res) -> {
+                    throw new PersonNotFoundException(nationalCode);
+                })
+                .body(BiographyResponse.class);
+    }
+
+    @Retry(name = "personApi")
+    @CircuitBreaker(name = "personApi", fallbackMethod = "tripsFallback")
+    public TripsResponse fetchTrips(String nationalCode) {
+        return restClient.get()
+                .uri("/persons/{code}/trips", nationalCode)
+                .retrieve()
+                .body(TripsResponse.class);
+    }
+
+    BiographyResponse biographyFallback(String code, Throwable t) {
+        throw new DownstreamUnavailableException("Biography service unavailable", t);
+    }
+    TripsResponse tripsFallback(String code, Throwable t) {
+        throw new DownstreamUnavailableException("Trip service unavailable", t);
+    }
+}
+```
+
+## 7. Chat service + controller
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ChatService {
+
+    private final ChatClient chatClient;
+
+    public String chat(String userId, String message) {
+        String conversationId = userId; // one memory thread per user
+
+        return chatClient.prompt()
+                .user(message)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+                .toolContext(Map.of("conversationId", conversationId,
+                                    "userId", userId))
+                .call()
+                .content();
+    }
+}
+```
+
+```java
+@RestController
+@RequestMapping("/api/chat")
+@RequiredArgsConstructor
+public class ChatController {
+
+    private final ChatService chatService;
+
+    @PostMapping
+    public ResponseEntity<ChatResponseDto> chat(
+            @AuthenticationPrincipal Jwt jwt,          // derive user from auth, never from body
+            @Valid @RequestBody ChatRequestDto request) {
+        String userId = jwt.getSubject();
+        return ResponseEntity.ok(
+                new ChatResponseDto(chatService.chat(userId, request.message())));
+    }
+}
+```
+
+Per-user isolation is exactly the documented pattern: the conversation history will be retrieved from the memory based on the specified conversation ID, and using a per-user ID ensures each user has an isolated chat memory.
+
+---
+
+## How your scenario plays out
+
+| Turn | Message | What happens |
+|---|---|---|
+| 1 | "give me the biography of a person with national code 3424534" | LLM routes to `getBiography(nationalCode="3424534")` → REST call → code saved to Redis → answer returned |
+| 2 | "give me the trips" | Memory advisor injects turn 1 into the prompt → LLM routes to `getTrips`, typically passing `3424534` from history. **Even if it passes nothing**, the tool resolves the code from Redis state. |
+| 2 (no code anywhere) | "give me the trips" (fresh conversation) | Tool throws → LLM asks the user for a national code |
+
+## Production checklist
+
+- **Persistence**: JDBC chat memory + Redis state with TTL — survives restarts and multiple app instances (both stores are shared, so the app stays stateless/horizontally scalable).
+- **Security**: derive `userId` from the authenticated principal, never trust a client-sent conversation ID (prevents cross-user memory leakage). Consider prompt-injection hardening: validate the national code format in code (done above), not in the prompt.
+- **Authorization**: before calling downstream APIs, verify this user is allowed to query that national code (add the check inside `resolveNationalCode` using `userId` from `ToolContext`).
+- **Observability**: `SimpleLoggerAdvisor` + Micrometer; log every tool invocation with conversationId (mask the national code in logs — it's PII).
+- **Resilience**: timeouts + retry + circuit breaker on every downstream call (done above).
+- **Determinism**: low temperature + precise tool descriptions + a strict system prompt is what makes routing reliable.
+- **Memory window tuning**: keep `maxMessages` big enough to cover realistic sessions; the Redis state store covers the case where the code scrolls out of the window.
+
+This gives you LLM-driven routing with a deterministic safety net, so "give me the trips" always resolves to the right national code even in edge cases.
