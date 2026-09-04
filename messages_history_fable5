@@ -1,0 +1,334 @@
+Here's a complete, production-grade solution. The core idea: in Spring AI, the underlying storage of messages is handled by the `ChatMemoryRepository`, whose sole responsibility is to store and retrieve messages, while the `ChatMemory` implementation decides which messages to keep and when to remove them. Since Spring AI ships repository implementations for Cassandra, CosmosDB, in-memory, JDBC, MongoDB, and Neo4j — but **not Elasticsearch** — you implement `ChatMemoryRepository` yourself. That interface is also your clean extension point for custom fields.
+
+## 1. Dependencies
+
+```xml
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-starter-model-openai</artifactId> <!-- or your model -->
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
+</dependency>
+```
+
+## 2. Custom document with your extra fields
+
+```java
+@Document(indexName = "chat-memory")
+@Setting(shards = 1, replicas = 1)
+public class ChatMessageDocument {
+
+    @Id
+    private String id;
+
+    @Field(type = FieldType.Keyword)
+    private String conversationId;
+
+    @Field(type = FieldType.Keyword)
+    private String messageType;          // USER, ASSISTANT, SYSTEM, TOOL
+
+    @Field(type = FieldType.Text)
+    private String content;
+
+    @Field(type = FieldType.Integer)
+    private int messageOrder;            // preserves conversation ordering
+
+    @Field(type = FieldType.Date, format = DateFormat.date_time)
+    private Instant timestamp;
+
+    // ---- YOUR CUSTOM FIELDS ----
+    @Field(type = FieldType.Keyword)
+    private String userId;
+
+    @Field(type = FieldType.Keyword)
+    private String tenantId;
+
+    @Field(type = FieldType.Keyword)
+    private String channel;              // web, mobile, api...
+
+    @Field(type = FieldType.Keyword)
+    private String modelName;
+
+    @Field(type = FieldType.Integer)
+    private Integer tokenCount;
+
+    @Field(type = FieldType.Object, enabled = true)
+    private Map<String, Object> metadata = new HashMap<>();
+
+    // getters/setters/builder omitted for brevity
+}
+```
+
+**Why `messageOrder` matters:** Elasticsearch doesn't guarantee insertion order on retrieval, and message order is critical for LLM context. Always sort on it when reading.
+
+## 3. Context holder for per-request custom fields
+
+The repository's `saveAll` only receives `(conversationId, List<Message>)`, so you need a way to inject request-scoped data (userId, tenantId, etc.). A `ThreadLocal`-based context is the cleanest approach that doesn't fight the framework:
+
+```java
+public final class ChatContext {
+
+    public record ContextData(String userId, String tenantId, String channel, String modelName) {}
+
+    private static final ThreadLocal<ContextData> CONTEXT = new ThreadLocal<>();
+
+    public static void set(ContextData data) { CONTEXT.set(data); }
+    public static ContextData get() { return CONTEXT.get(); }
+    public static void clear() { CONTEXT.remove(); }
+
+    private ChatContext() {}
+}
+```
+
+> If you use reactive/streaming endpoints, be aware advisors may hop threads. In that case, prefer stuffing custom fields into each `Message`'s metadata map (shown in the mapper below, which reads from both sources) or use `TransmittableThreadLocal`/Reactor context.
+
+## 4. Mapper: Spring AI `Message` ↔ your document
+
+```java
+@Component
+public class ChatMessageMapper {
+
+    public ChatMessageDocument toDocument(String conversationId, Message message, int order) {
+        ChatMessageDocument doc = new ChatMessageDocument();
+        doc.setId(conversationId + "-" + order);   // deterministic id → idempotent writes
+        doc.setConversationId(conversationId);
+        doc.setMessageType(message.getMessageType().name());
+        doc.setContent(message.getText());
+        doc.setMessageOrder(order);
+        doc.setTimestamp(Instant.now());
+
+        // carry over any metadata already attached to the message
+        Map<String, Object> meta = new HashMap<>(message.getMetadata());
+        meta.remove("messageType"); // internal Spring AI key
+        doc.setMetadata(meta);
+
+        // enrich with request-scoped custom fields
+        ChatContext.ContextData ctx = ChatContext.get();
+        if (ctx != null) {
+            doc.setUserId(ctx.userId());
+            doc.setTenantId(ctx.tenantId());
+            doc.setChannel(ctx.channel());
+            doc.setModelName(ctx.modelName());
+        }
+        return doc;
+    }
+
+    public Message toMessage(ChatMessageDocument doc) {
+        return switch (MessageType.valueOf(doc.getMessageType())) {
+            case USER -> UserMessage.builder()
+                    .text(doc.getContent())
+                    .metadata(doc.getMetadata())
+                    .build();
+            case ASSISTANT -> new AssistantMessage(doc.getContent(), doc.getMetadata());
+            case SYSTEM -> SystemMessage.builder()
+                    .text(doc.getContent())
+                    .metadata(doc.getMetadata())
+                    .build();
+            case TOOL -> new ToolResponseMessage(List.of(), doc.getMetadata());
+        };
+    }
+}
+```
+
+## 5. The Elasticsearch `ChatMemoryRepository`
+
+The interface contract you must honor: `deleteByConversationId(String)`, `findByConversationId(String)`, `findConversationIds()`, and `saveAll(String, List<Message>)` — where `saveAll` **replaces** all existing messages for the given conversation ID with the provided messages.
+
+```java
+@Repository
+public class ElasticsearchChatMemoryRepository implements ChatMemoryRepository {
+
+    private static final IndexCoordinates INDEX = IndexCoordinates.of("chat-memory");
+
+    private final ElasticsearchOperations operations;
+    private final ChatMessageMapper mapper;
+
+    public ElasticsearchChatMemoryRepository(ElasticsearchOperations operations,
+                                             ChatMessageMapper mapper) {
+        this.operations = operations;
+        this.mapper = mapper;
+    }
+
+    @Override
+    public List<String> findConversationIds() {
+        Query query = NativeQuery.builder()
+                .withAggregation("conversations", Aggregation.of(a -> a
+                        .terms(t -> t.field("conversationId").size(10_000))))
+                .withMaxResults(0)
+                .build();
+
+        SearchHits<ChatMessageDocument> hits =
+                operations.search(query, ChatMessageDocument.class, INDEX);
+
+        ElasticsearchAggregations aggs = (ElasticsearchAggregations) hits.getAggregations();
+        if (aggs == null) return List.of();
+
+        return aggs.get("conversations").aggregation().getAggregate()
+                .sterms().buckets().array().stream()
+                .map(b -> b.key().stringValue())
+                .toList();
+    }
+
+    @Override
+    public List<Message> findByConversationId(String conversationId) {
+        Assert.hasText(conversationId, "conversationId must not be empty");
+
+        Query query = NativeQuery.builder()
+                .withQuery(q -> q.term(t -> t.field("conversationId").value(conversationId)))
+                .withSort(Sort.by(Sort.Direction.ASC, "messageOrder"))
+                .withMaxResults(1000)
+                .build();
+
+        return operations.search(query, ChatMessageDocument.class, INDEX)
+                .stream()
+                .map(SearchHit::getContent)
+                .map(mapper::toMessage)
+                .toList();
+    }
+
+    @Override
+    public void saveAll(String conversationId, List<Message> messages) {
+        Assert.hasText(conversationId, "conversationId must not be empty");
+        Assert.notNull(messages, "messages must not be null");
+
+        // Contract: replace-all semantics
+        deleteByConversationId(conversationId);
+
+        List<IndexQuery> queries = new ArrayList<>(messages.size());
+        for (int i = 0; i < messages.size(); i++) {
+            ChatMessageDocument doc = mapper.toDocument(conversationId, messages.get(i), i);
+            queries.add(new IndexQueryBuilder()
+                    .withId(doc.getId())
+                    .withObject(doc)
+                    .build());
+        }
+        operations.bulkIndex(queries, INDEX);
+        operations.indexOps(INDEX).refresh(); // read-your-writes within a conversation turn
+    }
+
+    @Override
+    public void deleteByConversationId(String conversationId) {
+        Assert.hasText(conversationId, "conversationId must not be empty");
+        Query query = NativeQuery.builder()
+                .withQuery(q -> q.term(t -> t.field("conversationId").value(conversationId)))
+                .build();
+        operations.delete(DeleteQuery.builder(query).withRefresh(true).build(),
+                ChatMessageDocument.class, INDEX);
+    }
+}
+```
+
+**Robustness notes:**
+- **Explicit refresh** after writes is essential here — Elasticsearch is near-real-time by default (~1s refresh), and without it a rapid follow-up message could read stale history.
+- **Deterministic IDs** (`conversationId-order`) make the delete+bulk-index replace operation idempotent under retries.
+- The delete-then-index pattern implements the interface's replace-all contract, but isn't atomic. For chat memory this is acceptable (worst case: one turn's history is re-written on retry), but avoid concurrent writes to the *same* conversationId — serialize per-conversation if your app allows parallel messages in one conversation.
+
+## 6. Wire it all together
+
+If a repository bean is already configured, Spring AI will use it instead of the default in-memory one, so your `@Repository` slots right in:
+
+```java
+@Configuration
+public class ChatConfig {
+
+    @Bean
+    public ChatMemory chatMemory(ElasticsearchChatMemoryRepository repository) {
+        return MessageWindowChatMemory.builder()
+                .chatMemoryRepository(repository)
+                .maxMessages(20)
+                .build();
+    }
+
+    @Bean
+    public ChatClient chatClient(ChatClient.Builder builder, ChatMemory chatMemory) {
+        return builder
+                .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+                .build();
+    }
+}
+```
+
+`MessageWindowChatMemory` maintains a window of messages up to a specified maximum size (default 20); when exceeded, older messages are evicted but system messages are preserved. Note this means the *LLM context window* is capped — and because `saveAll` replaces everything, evicted messages also disappear from Elasticsearch. If you want a **full audit history** plus a bounded LLM window, see the variant in step 8.
+
+## 7. Service layer — setting the custom context
+
+Every chat memory operation is keyed on a conversation ID; the `ChatMemory` and `ChatMemoryRepository` abstractions use this identifier to decide which conversation to read, append to, or delete, and it must always be provided explicitly.
+
+```java
+@Service
+public class ChatService {
+
+    private final ChatClient chatClient;
+
+    public ChatService(ChatClient chatClient) {
+        this.chatClient = chatClient;
+    }
+
+    public String chat(String conversationId, String userId, String tenantId, String userText) {
+        ChatContext.set(new ChatContext.ContextData(userId, tenantId, "web", "gpt-4o"));
+        try {
+            return chatClient.prompt()
+                    .user(userText)
+                    .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+                    .call()
+                    .content();
+        } finally {
+            ChatContext.clear();
+        }
+    }
+}
+```
+
+## 8. Variant: full append-only history + windowed memory
+
+If you need every message permanently retained (auditing, analytics on your custom fields), don't rely on `MessageWindowChatMemory`'s replace-all writes. Instead:
+
+1. Keep the setup above for LLM context.
+2. Add a **second, append-only index** (`chat-audit`) written by a custom advisor. The advisor chain invokes multiple advisors sequentially ordered by their `getOrder()` values, with lower values executed first:
+
+```java
+@Component
+public class AuditAdvisor implements CallAdvisor {
+
+    private final ElasticsearchOperations operations;
+    private final ChatMessageMapper mapper;
+
+    // constructor...
+
+    @Override
+    public ChatClientResponse adviseCall(ChatClientRequest request, CallAdvisorChain chain) {
+        ChatClientResponse response = chain.nextCall(request);
+
+        String conversationId = (String) request.context()
+                .getOrDefault(ChatMemory.CONVERSATION_ID, ChatMemory.DEFAULT_CONVERSATION_ID);
+
+        // append user message + assistant response to the audit index (never deleted)
+        // ... operations.save(...) into "chat-audit" with your custom fields
+
+        return response;
+    }
+
+    @Override
+    public String getName() { return "auditAdvisor"; }
+
+    @Override
+    public int getOrder() { return Ordered.LOWEST_PRECEDENCE - 100; } // runs after memory advisor
+}
+```
+
+This gives you the best of both: a bounded, fast conversation window for the model, and an immutable, richly-annotated history you can query/aggregate in Kibana by `userId`, `tenantId`, `tokenCount`, etc.
+
+## Summary of the design
+
+| Concern | Solution |
+|---|---|
+| ES persistence | Custom `ChatMemoryRepository` (framework auto-detects your bean) |
+| Custom fields | `ChatMessageDocument` + `ChatContext` holder + message metadata |
+| Ordering | Explicit `messageOrder` field, sorted on read |
+| Consistency | Explicit index refresh, deterministic doc IDs |
+| Context window | `MessageWindowChatMemory(maxMessages=20)` |
+| Full audit trail | Optional append-only advisor to a second index |
+
+One version caveat: Spring AI's message constructors/builders changed slightly between 1.0.x and 1.1.x (e.g., `UserMessage.builder()` availability), so adjust the mapper to your exact version — the repository interface itself is stable since 1.0.0.
