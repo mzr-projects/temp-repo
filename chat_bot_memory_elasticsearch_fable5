@@ -1,0 +1,377 @@
+Here's a complete, production-minded example. First, a quick note on the contract you're implementing: the `ChatMemoryRepository` interface requires four methods — `deleteByConversationId(String)`, `findByConversationId(String)`, `findConversationIds()`, and `saveAll(String, List<Message>)` — where `saveAll` **replaces** all existing messages for the given conversation ID with the provided messages. That replace semantic is the most commonly missed aspect, so the implementation below does delete-then-insert.
+
+## 1. Dependencies (`pom.xml`)
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-starter-model-openai</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+```
+
+## 2. The Elasticsearch document
+
+This covers **all** message aspects: type, text, metadata, assistant tool calls, tool responses, and ordering.
+
+```java
+package com.example.memory;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.data.annotation.Id;
+import org.springframework.data.elasticsearch.annotations.DateFormat;
+import org.springframework.data.elasticsearch.annotations.Document;
+import org.springframework.data.elasticsearch.annotations.Field;
+import org.springframework.data.elasticsearch.annotations.FieldType;
+
+@Document(indexName = "ai-chat-memory")
+public class ChatMemoryDocument {
+
+    @Id
+    private String id; // deterministic: "<conversationId>#<messageIndex>"
+
+    @Field(type = FieldType.Keyword)
+    private String conversationId;
+
+    @Field(type = FieldType.Keyword)
+    private String messageType; // USER, ASSISTANT, SYSTEM, TOOL
+
+    @Field(type = FieldType.Text)
+    private String content;
+
+    // Preserves message ordering — critical, since ES does not guarantee insert order
+    @Field(type = FieldType.Integer)
+    private int messageIndex;
+
+    @Field(type = FieldType.Date, format = DateFormat.epoch_millis)
+    private Instant createdAt;
+
+    // Stored but not indexed (arbitrary structure)
+    @Field(type = FieldType.Object, enabled = false)
+    private Map<String, Object> metadata;
+
+    // Only present on ASSISTANT messages that requested tool executions
+    @Field(type = FieldType.Object, enabled = false)
+    private List<ToolCallEntry> toolCalls;
+
+    // Only present on TOOL messages
+    @Field(type = FieldType.Object, enabled = false)
+    private List<ToolResponseEntry> toolResponses;
+
+    public record ToolCallEntry(String id, String type, String name, String arguments) {}
+    public record ToolResponseEntry(String id, String name, String responseData) {}
+
+    // getters and setters omitted for brevity — include them all
+    // (or use Lombok @Data)
+}
+```
+
+## 3. The Spring Data `ElasticsearchRepository`
+
+```java
+package com.example.memory;
+
+import java.util.List;
+import org.springframework.data.elasticsearch.repository.ElasticsearchRepository;
+
+public interface ChatMemoryDocumentRepository
+        extends ElasticsearchRepository<ChatMemoryDocument, String> {
+
+    List<ChatMemoryDocument> findByConversationIdOrderByMessageIndexAsc(String conversationId);
+
+    void deleteByConversationId(String conversationId);
+}
+```
+
+## 4. The custom `ChatMemoryRepository`
+
+This handles round-tripping of **all four Spring AI message types** (`UserMessage`, `AssistantMessage`, `SystemMessage`, `ToolResponseMessage`), including tool calls and tool responses — if you drop those, tool-calling conversations will break when reloaded from memory.
+
+```java
+package com.example.memory;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import co.elastic.clients.elasticsearch._types.aggregations.Aggregation;
+import co.elastic.clients.elasticsearch._types.aggregations.StringTermsBucket;
+
+import org.springframework.ai.chat.memory.ChatMemoryRepository;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.ToolResponseMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.data.elasticsearch.client.elc.ElasticsearchAggregations;
+import org.springframework.data.elasticsearch.client.elc.NativeQuery;
+import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
+import org.springframework.data.elasticsearch.core.SearchHits;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.Assert;
+
+public class ElasticsearchChatMemoryRepository implements ChatMemoryRepository {
+
+    private static final String CONVERSATION_ID_FIELD = "conversationId";
+    private static final String AGG_NAME = "distinct_conversations";
+
+    private final ChatMemoryDocumentRepository documentRepository;
+    private final ElasticsearchOperations operations;
+
+    public ElasticsearchChatMemoryRepository(ChatMemoryDocumentRepository documentRepository,
+                                             ElasticsearchOperations operations) {
+        this.documentRepository = documentRepository;
+        this.operations = operations;
+    }
+
+    @Override
+    public List<String> findConversationIds() {
+        // Distinct conversation IDs via a terms aggregation (efficient, no doc fetching)
+        NativeQuery query = NativeQuery.builder()
+                .withMaxResults(0)
+                .withAggregation(AGG_NAME, Aggregation.of(a -> a
+                        .terms(t -> t.field(CONVERSATION_ID_FIELD).size(10_000))))
+                .build();
+
+        SearchHits<ChatMemoryDocument> hits = operations.search(query, ChatMemoryDocument.class);
+
+        ElasticsearchAggregations aggregations = (ElasticsearchAggregations) hits.getAggregations();
+        if (aggregations == null) {
+            return List.of();
+        }
+        List<StringTermsBucket> buckets = aggregations.get(AGG_NAME)
+                .aggregation().getAggregate().sterms().buckets().array();
+
+        return buckets.stream().map(b -> b.key().stringValue()).toList();
+    }
+
+    @Override
+    public List<Message> findByConversationId(String conversationId) {
+        Assert.hasText(conversationId, "conversationId cannot be null or empty");
+        return documentRepository.findByConversationIdOrderByMessageIndexAsc(conversationId)
+                .stream()
+                .map(this::toMessage)
+                .toList();
+    }
+
+    @Override
+    public void saveAll(String conversationId, List<Message> messages) {
+        Assert.hasText(conversationId, "conversationId cannot be null or empty");
+        Assert.notNull(messages, "messages cannot be null");
+        Assert.noNullElements(messages, "messages cannot contain null elements");
+
+        // Contract: saveAll REPLACES the whole conversation.
+        // MessageWindowChatMemory relies on this to evict old messages.
+        deleteByConversationId(conversationId);
+
+        Instant now = Instant.now();
+        List<ChatMemoryDocument> docs = new ArrayList<>(messages.size());
+        for (int i = 0; i < messages.size(); i++) {
+            docs.add(toDocument(conversationId, i, messages.get(i), now));
+        }
+        documentRepository.saveAll(docs);
+    }
+
+    @Override
+    public void deleteByConversationId(String conversationId) {
+        Assert.hasText(conversationId, "conversationId cannot be null or empty");
+        documentRepository.deleteByConversationId(conversationId);
+    }
+
+    // ---------- Mapping: Spring AI Message -> ES document ----------
+
+    private ChatMemoryDocument toDocument(String conversationId, int index, Message message, Instant now) {
+        ChatMemoryDocument doc = new ChatMemoryDocument();
+        doc.setId(conversationId + "#" + index); // deterministic id -> idempotent rewrites
+        doc.setConversationId(conversationId);
+        doc.setMessageIndex(index);
+        doc.setCreatedAt(now);
+        doc.setMessageType(message.getMessageType().name());
+        doc.setContent(message.getText());
+        doc.setMetadata(sanitizeMetadata(message.getMetadata()));
+
+        if (message instanceof AssistantMessage assistant && assistant.hasToolCalls()) {
+            doc.setToolCalls(assistant.getToolCalls().stream()
+                    .map(tc -> new ChatMemoryDocument.ToolCallEntry(
+                            tc.id(), tc.type(), tc.name(), tc.arguments()))
+                    .toList());
+        }
+
+        if (message instanceof ToolResponseMessage toolResponse) {
+            doc.setToolResponses(toolResponse.getResponses().stream()
+                    .map(tr -> new ChatMemoryDocument.ToolResponseEntry(
+                            tr.id(), tr.name(), tr.responseData()))
+                    .toList());
+        }
+        return doc;
+    }
+
+    // ---------- Mapping: ES document -> Spring AI Message ----------
+
+    private Message toMessage(ChatMemoryDocument doc) {
+        MessageType type = MessageType.valueOf(doc.getMessageType());
+        Map<String, Object> metadata = doc.getMetadata() != null ? doc.getMetadata() : Map.of();
+        String text = doc.getContent() != null ? doc.getContent() : "";
+
+        return switch (type) {
+            case USER -> UserMessage.builder()
+                    .text(text)
+                    .metadata(metadata)
+                    .build();
+
+            case SYSTEM -> SystemMessage.builder()
+                    .text(text)
+                    .metadata(metadata)
+                    .build();
+
+            case ASSISTANT -> {
+                List<AssistantMessage.ToolCall> toolCalls = doc.getToolCalls() == null
+                        ? List.of()
+                        : doc.getToolCalls().stream()
+                            .map(tc -> new AssistantMessage.ToolCall(
+                                    tc.id(), tc.type(), tc.name(), tc.arguments()))
+                            .toList();
+                yield new AssistantMessage(text, metadata, toolCalls);
+            }
+
+            case TOOL -> {
+                List<ToolResponseMessage.ToolResponse> responses = doc.getToolResponses() == null
+                        ? List.of()
+                        : doc.getToolResponses().stream()
+                            .map(tr -> new ToolResponseMessage.ToolResponse(
+                                    tr.id(), tr.name(), tr.responseData()))
+                            .toList();
+                yield new ToolResponseMessage(responses, metadata);
+            }
+        };
+    }
+
+    // MessageType lives in metadata already; also strip non-serializable values defensively
+    private Map<String, Object> sanitizeMetadata(Map<String, Object> metadata) {
+        return metadata.entrySet().stream()
+                .filter(e -> e.getValue() instanceof String
+                        || e.getValue() instanceof Number
+                        || e.getValue() instanceof Boolean)
+                .collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+    }
+}
+```
+
+## 5. Configuration — the critical wiring details
+
+By default, if no other repository is already configured, Spring AI auto-configures a `ChatMemoryRepository` bean of type `InMemoryChatMemoryRepository`, so you must expose your custom implementation as a bean to override it:
+
+```java
+package com.example.config;
+
+import com.example.memory.ChatMemoryDocumentRepository;
+import com.example.memory.ElasticsearchChatMemoryRepository;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.chat.memory.ChatMemoryRepository;
+import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
+import org.springframework.data.elasticsearch.core.RefreshPolicy;
+import org.springframework.data.elasticsearch.repository.config.EnableElasticsearchRepositories;
+
+@Configuration
+@EnableElasticsearchRepositories(basePackages = "com.example.memory")
+public class ChatMemoryConfig {
+
+    @Bean
+    public ChatMemoryRepository chatMemoryRepository(ChatMemoryDocumentRepository docRepo,
+                                                     ElasticsearchOperations operations) {
+        return new ElasticsearchChatMemoryRepository(docRepo, operations);
+    }
+
+    @Bean
+    public ChatMemory chatMemory(ChatMemoryRepository chatMemoryRepository) {
+        return MessageWindowChatMemory.builder()
+                .chatMemoryRepository(chatMemoryRepository)
+                .maxMessages(20)
+                .build();
+    }
+
+    @Bean
+    public ChatClient chatClient(ChatClient.Builder builder, ChatMemory chatMemory) {
+        return builder
+                .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+                .build();
+    }
+}
+```
+
+**Important — refresh policy.** Elasticsearch is near-real-time: a document written now is not searchable until the next index refresh (default ~1s). Since memory does *read → append → write* on every request, you need immediate visibility. Extend your ES config:
+
+```java
+@Configuration
+public class ElasticsearchConfig extends ElasticsearchConfiguration {
+
+    @Override
+    public ClientConfiguration clientConfiguration() {
+        return ClientConfiguration.builder()
+                .connectedTo("localhost:9200")
+                .build();
+    }
+
+    @Override
+    protected RefreshPolicy refreshPolicy() {
+        return RefreshPolicy.IMMEDIATE; // memory reads must see previous writes
+    }
+}
+```
+
+## 6. Using it in a controller
+
+In a multi-user application, make the conversation ID unique per user (and per conversation, if a user can have more than one) so that each user's messages stay in their own conversation:
+
+```java
+@RestController
+@RequestMapping("/chat")
+public class ChatController {
+
+    private final ChatClient chatClient;
+
+    public ChatController(ChatClient chatClient) {
+        this.chatClient = chatClient;
+    }
+
+    @PostMapping("/{conversationId}")
+    public String chat(@PathVariable String conversationId, @RequestBody String prompt) {
+        return chatClient.prompt()
+                .user(prompt)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+                .call()
+                .content();
+    }
+}
+```
+
+## The "all aspects" checklist — what this example covers and why
+
+1. **Replace semantics of `saveAll`** — `ChatMemoryRepository` persists messages, while `ChatMemory` decides which messages remain useful for the next model call; `MessageWindowChatMemory` keeps only the most recent messages for each conversation. Eviction happens *through* `saveAll` writing a smaller list — if you append instead of replace, your window never shrinks.
+2. **All 4 message types** — USER, ASSISTANT, SYSTEM, TOOL round-trip correctly, including `AssistantMessage.ToolCall` and `ToolResponseMessage.ToolResponse`. Losing these corrupts tool-calling conversations mid-flight.
+3. **Metadata** persisted per message.
+4. **Ordering** — explicit `messageIndex` field with `OrderByMessageIndexAsc`, never relying on ES insertion order.
+5. **`findConversationIds`** — implemented via a terms aggregation rather than scanning all documents.
+6. **Deterministic document IDs** (`conversationId#index`) make rewrites idempotent.
+7. **Refresh policy** set to `IMMEDIATE` so the next request's read sees the previous write (trade-off: higher indexing cost; fine for chat workloads, benchmark if very high throughput).
+8. **System message preservation** — handled for you: `MessageWindowChatMemory` maintains a window of messages up to a specified maximum size, and when the number of messages exceeds the maximum, older messages are removed while preserving system messages.
+
+**Caveats worth knowing:** delete-then-insert isn't atomic (a crash mid-`saveAll` can lose a conversation's tail — acceptable for chat memory, but add a retry or write-then-delete-stale strategy if not). Also, `UserMessage` media attachments aren't persisted here; if you use multimodal inputs, add a media field (e.g., base64 + MIME type) to the document. Finally, note that chat memory refers to contextual information retained during a conversation, while chat history is the complete record of all messages — Spring AI's memory system is designed for the former; for complete audit trails, use Spring Data repositories directly (i.e., don't treat this index as your permanent audit log, since the window advisor will truncate it).
