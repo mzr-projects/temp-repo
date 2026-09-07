@@ -1,0 +1,55 @@
+public class RequireToolCallAdvisor implements BaseAdvisor {
+
+    private static final String NO_TOOL_MESSAGE =
+            "Sorry, I wasn't able to complete that using the available tools.";
+
+    @Override
+    public int getOrder() {
+        return 1000;
+    }
+
+    @Override
+    public ChatClientRequest before(ChatClientRequest request, AdvisorChain chain) {
+        return request;
+    }
+
+    @Override
+    public ChatClientResponse after(ChatClientResponse response, AdvisorChain chain) {
+        var chatResponse = response.chatResponse();
+        if (chatResponse == null || chatResponse.hasToolCalls()) {
+            return response;
+        }
+        return overrideWithCustomMessage(response);
+    }
+
+    @Override
+    public Flux<ChatClientResponse> adviseStream(ChatClientRequest request, StreamAdvisorChain chain) {
+        Flux<ChatClientResponse> responses = chain.nextStream(before(request, chain));
+
+        return new ChatClientMessageAggregator()
+                .aggregateChatClientResponse(responses, aggregated -> {}) // no-op consumer, we just need the aggregation
+                .flatMapMany(aggregated -> {
+                    var chatResponse = aggregated.chatResponse();
+                    if (chatResponse != null && chatResponse.hasToolCalls()) {
+                        return Flux.just(aggregated); // pass the real (aggregated) response through
+                    }
+                    return Flux.just(overrideWithCustomMessage(aggregated));
+                });
+    }
+
+    private ChatClientResponse overrideWithCustomMessage(ChatClientResponse response) {
+        var chatResponse = response.chatResponse();
+        AssistantMessage customMessage = new AssistantMessage(NO_TOOL_MESSAGE);
+        Generation customGeneration = new Generation(customMessage);
+
+        ChatResponse overridden = ChatResponse.builder()
+                .from(chatResponse)
+                .generations(List.of(customGeneration))
+                .build();
+
+        return ChatClientResponse.builder()
+                .from(response)
+                .chatResponse(overridden)
+                .build();
+    }
+}
