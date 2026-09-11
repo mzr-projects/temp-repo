@@ -1,0 +1,301 @@
+Good news: the JSON Patch you already compute gives you field-level paths (`/employment/0/title`), so "which section changed" is mostly a matter of **defining sections** and **grouping the diff by them**. But if you do it right you also get a big performance win: per-section hashes let you decide *which* sections changed without diffing at all, and let clients subscribe to only the sections they care about.
+
+## 1. Define the section schema
+
+Make sections explicit config, not implicit "top-level key = section" (top-level keys drift; sections are a product concept).
+
+```yaml
+snapshot:
+  sections:
+    identity:   ["/firstName", "/lastName", "/dateOfBirth", "/gender"]
+    contact:    ["/emails", "/phones"]
+    address:    ["/addresses"]
+    employment: ["/employment"]
+    education:  ["/education"]
+    social:     ["/profiles", "/website"]
+  default-section: other      # anything unmapped lands here
+```
+
+```java
+@ConfigurationProperties("snapshot")
+public record SectionSchema(Map<String, List<String>> sections, String defaultSection) {
+
+    /** Longest-prefix match: "/employment/3/title" -> "employment" */
+    public String sectionOf(String pointer) {
+        String best = defaultSection; int bestLen = -1;
+        for (var e : sections.entrySet())
+            for (String p : e.getValue())
+                if ((pointer.equals(p) || pointer.startsWith(p + "/")) && p.length() > bestLen) {
+                    best = e.getKey(); bestLen = p.length();
+                }
+        return best;
+    }
+
+    /** Extract just one section's subtree as a small object (used for hashing and diffing). */
+    public ObjectNode extract(JsonNode state, String section, ObjectMapper om) {
+        ObjectNode out = om.createObjectNode();
+        for (String p : sections.get(section)) {
+            JsonNode n = state.at(p);
+            if (!n.isMissingNode()) out.set(p, n);        // key = pointer, keeps paths stable
+        }
+        return out;
+    }
+}
+```
+
+## 2. Normalize arrays of entities → keyed maps (important for meaningful diffs)
+
+Index-based patches (`/emails/2/value`) are useless to a human and unstable if an item is removed. Before hashing/diffing, convert arrays whose elements have an id into objects keyed by that id:
+
+```java
+public final class Canonicalizer {
+    private static final List<String> ID_FIELDS = List.of("id", "uuid", "key");
+
+    public static JsonNode canonicalize(JsonNode n, ObjectMapper om) {
+        if (n.isObject()) {
+            ObjectNode o = om.createObjectNode();
+            // sorted keys → deterministic hashing
+            StreamSupport.stream(Spliterators.spliteratorUnknownSize(n.fieldNames(), 0), false)
+                .sorted().forEach(f -> o.set(f, canonicalize(n.get(f), om)));
+            return o;
+        }
+        if (n.isArray() && n.size() > 0 && n.get(0).isObject() && idField(n.get(0)) != null) {
+            String idf = idField(n.get(0));
+            ObjectNode keyed = om.createObjectNode();
+            n.forEach(el -> keyed.set(el.get(idf).asText(), canonicalize(el, om)));
+            return keyed;                                   // /emails/{id}/value
+        }
+        if (n.isArray()) {
+            ArrayNode a = om.createArrayNode();
+            n.forEach(el -> a.add(canonicalize(el, om)));
+            return a;
+        }
+        return n;
+    }
+    private static String idField(JsonNode o) {
+        return ID_FIELDS.stream().filter(o::has).findFirst().orElse(null);
+    }
+}
+```
+
+Apply this in `normalize()` (together with stripping volatile fields) — both the stored snapshot and incoming events go through it, so they're always comparable.
+
+## 3. Per-section hashes
+
+```java
+@Component @RequiredArgsConstructor
+public class SectionHasher {
+    private final SectionSchema schema; private final ObjectMapper om;
+
+    public Map<String, String> hash(JsonNode canonicalState) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (String s : schema.sections().keySet())
+            out.put(s, sha256(schema.extract(canonicalState, s, om).toString()));
+        return out;
+    }
+    public static Set<String> changed(Map<String,String> before, Map<String,String> after) {
+        return after.entrySet().stream()
+            .filter(e -> !e.getValue().equals(before.get(e.getKey())))
+            .map(Map.Entry::getKey).collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+}
+```
+
+Store these in three places:
+
+```java
+// SnapshotDoc – add:
+@Field(type = FieldType.Object) private Map<String, String> sectionHashes;   // dynamic keyword fields
+@Field(type = FieldType.Keyword) private Set<String> watchSections;          // empty = all
+```
+
+```java
+// PersonStateStore – Redis hash "pstate:{personId}" with one field per section + "v"
+public Mono<Map<String,String>> sectionHashes(String personId) {
+    return redis.opsForHash().entries("pstate:" + personId)
+        .collectMap(e -> (String) e.getKey(), e -> (String) e.getValue());
+}
+public Mono<Void> put(String personId, Map<String,String> hashes, long v) {
+    Map<String,String> m = new HashMap<>(hashes); m.put("v", Long.toString(v));
+    return redis.opsForHash().putAll("pstate:" + personId, m).then();
+}
+```
+
+## 4. Notification payload
+
+```java
+public record ChangeNotification(
+    String clientId, String personId, long version, String idempotencyKey,
+    Instant snapshotAt,
+    List<SectionChange> changes) {}
+
+public record SectionChange(
+    String section,                 // "employment"
+    List<FieldChange> fields) {}
+
+public record FieldChange(
+    String path,                    // "/employment/emp-42/title"
+    String op,                      // add | remove | replace
+    JsonNode from, JsonNode to) {}
+```
+
+Example of what the client receives:
+
+```json
+{
+  "personId": "p-123", "version": 8812,
+  "changes": [
+    { "section": "employment",
+      "fields": [
+        { "path": "/employment/emp-42/title", "op": "replace", "from": "Engineer", "to": "Staff Engineer" },
+        { "path": "/employment/emp-77",       "op": "add",     "to": { "company": "Acme", "title": "Advisor" } }
+      ]},
+    { "section": "contact",
+      "fields": [ { "path": "/emails/e-2", "op": "remove", "from": { "value": "old@x.com" } } ] }
+  ]
+}
+```
+
+## 5. Updated processor
+
+```java
+public Mono<Void> process(String personId, byte[] payload, long version) {
+    JsonNode current = normalize(om.readTree(payload));          // strip volatile + canonicalize
+    Map<String,String> curHashes = hasher.hash(current);
+
+    return personState.sectionHashes(personId)
+        .defaultIfEmpty(Map.of())
+        .flatMap(prev -> {
+            Set<String> globallyChanged = SectionHasher.changed(prev, curHashes);
+            if (globallyChanged.isEmpty()) {                     // fast path: nothing changed anywhere
+                metrics.counter("events.noop").increment();
+                return Mono.empty();
+            }
+            globallyChanged.forEach(s -> metrics.counter("sections.changed", "section", s).increment());
+            return fanOut(personId, current, curHashes, version)
+                .then(personState.put(personId, curHashes, version));
+        });
+}
+
+private Mono<Void> fanOut(String personId, JsonNode current, Map<String,String> curHashes, long version) {
+    return subscribers.clientsFor(personId).collectList()
+        .filter(l -> !l.isEmpty())
+        .flatMapMany(ids -> snapshots.mget(ids.stream().map(c -> c + ":" + personId).toList()))
+        .filter(doc -> version > doc.getLastNotifiedVersion())
+        .flatMap(doc -> {
+            // which sections changed *for this client* (vs. what they were last told)
+            Set<String> changed = SectionHasher.changed(doc.getSectionHashes(), curHashes);
+            if (doc.getWatchSections() != null && !doc.getWatchSections().isEmpty())
+                changed.retainAll(doc.getWatchSections());       // client-level section filter
+            if (changed.isEmpty()) return Mono.empty();          // e.g. only "social" changed, client doesn't care
+            return notifyAndAdvance(doc, current, curHashes, changed, version);
+        }, 32)
+        .then();
+}
+
+private Mono<Void> notifyAndAdvance(SnapshotDoc doc, JsonNode current, Map<String,String> curHashes,
+                                    Set<String> changedSections, long version) {
+    JsonNode baseline = om.valueToTree(doc.getLastNotifiedState() != null
+                                       ? doc.getLastNotifiedState() : doc.getSnapshot());
+
+    // Diff ONLY the changed sections – small inputs, no work for unchanged ones
+    List<SectionChange> changes = changedSections.stream()
+        .map(s -> new SectionChange(s, diffSection(baseline, current, s)))
+        .filter(sc -> !sc.fields().isEmpty())
+        .toList();
+    if (changes.isEmpty()) return Mono.empty();
+
+    var n = new ChangeNotification(doc.getClientId(), doc.getPersonId(), version,
+        doc.getClientId() + ":" + doc.getPersonId() + ":" + version, doc.getSnapshotAt(), changes);
+
+    return notifier.send(n)
+        .then(Mono.defer(() -> {
+            doc.setLastNotifiedState(om.convertValue(current, Map.class));
+            doc.setSectionHashes(curHashes);
+            doc.setLastNotifiedHash(overallHash(curHashes));
+            doc.setLastNotifiedVersion(version);
+            return snapshots.save(doc);
+        }))
+        .onErrorResume(OptimisticLockingFailureException.class, e -> Mono.empty())
+        .then();
+}
+
+private static final EnumSet<DiffFlags> FLAGS = EnumSet.of(
+    DiffFlags.OMIT_MOVE_OPERATION, DiffFlags.OMIT_COPY_OPERATION,
+    DiffFlags.ADD_ORIGINAL_VALUE_ON_REPLACE, DiffFlags.ADD_EXPLICIT_REMOVE_ADD_ON_REPLACE);
+
+private List<FieldChange> diffSection(JsonNode base, JsonNode cur, String section) {
+    // Diff the full docs but keep only ops that fall in this section → correct paths, cheap enough;
+    // or diff schema.extract(...) of each side if sections are large.
+    JsonNode patch = JsonDiff.asJson(base, cur, FLAGS);
+    List<FieldChange> out = new ArrayList<>();
+    for (JsonNode op : patch) {
+        String path = op.get("path").asText();
+        if (!schema.sectionOf(path).equals(section)) continue;
+        out.add(new FieldChange(path, op.get("op").asText(),
+            op.path("fromValue").isMissingNode() ? null : op.get("fromValue"),
+            op.path("value").isMissingNode()     ? null : op.get("value")));
+    }
+    return out;
+}
+```
+
+(Cache the full-doc patch once per `(doc, current)` pair rather than recomputing it per section — trivially done with a local variable; I split it above for clarity.)
+
+## 6. Bookmark API gains section subscriptions
+
+```java
+public record BookmarkRequest(Set<String> watchSections) {}   // null/empty = everything
+
+@PostMapping("/{personId}")
+public Mono<SnapshotDoc> bookmark(@PathVariable String clientId, @PathVariable String personId,
+                                  @RequestBody(required = false) BookmarkRequest req) {
+    return people.current(personId).map(state -> {
+        JsonNode canon = normalize(om.valueToTree(state));
+        SnapshotDoc d = new SnapshotDoc();
+        ...
+        d.setSectionHashes(hasher.hash(canon));
+        d.setWatchSections(req == null ? Set.of() : validate(req.watchSections()));
+        return d;
+    }).flatMap(snapshots::save).flatMap(d -> subscribers.add(clientId, personId).thenReturn(d));
+}
+
+@PatchMapping("/{personId}/watch")   // change what they watch later
+public Mono<Void> updateWatch(...) { ... }
+```
+
+And a read endpoint clients will want: **"what's different between my snapshot and now?"** — the same `diffSection` over `snapshot` (the frozen one) vs. current state, grouped by section. That's the UI's "3 sections changed since you saved" badge.
+
+## 7. Hot-person optimization (optional, ES does the filtering)
+
+For a person with 100k bookmarks, most clients don't watch the section that changed, or were already notified. Let Elasticsearch pre-filter instead of `mget`-ing everything:
+
+```json
+{
+  "query": { "bool": {
+    "filter": [ { "term": { "personId": "p-123" } } ],
+    "should": [
+      { "bool": { "must_not": { "term": { "sectionHashes.employment": "<h_emp>" } },
+                  "filter":   { "bool": { "should": [
+                      { "term": { "watchSections": "employment" } },
+                      { "bool": { "must_not": { "exists": { "field": "watchSections" } } } }
+                  ]}}}},
+      { "bool": { "must_not": { "term": { "sectionHashes.contact": "<h_contact>" } },
+                  "filter":   { ... same pattern for "contact" ... } } }
+    ],
+    "minimum_should_match": 1
+  }},
+  "_source": ["clientId", "sectionHashes", "watchSections", "lastNotifiedState", "lastNotifiedVersion"]
+}
+```
+
+Build one `should` clause per *globally changed* section (you already know that set from the Redis fast path). Only the docs that actually need a notification come back. Paginate with `search_after` on `_id` for large result sets. Since the ES refresh interval is a few seconds, a doc you just advanced may show up once more — the in-memory `changed` check in `fanOut` catches it, so this is safe.
+
+## 8. Things to decide
+
+- **Section granularity for arrays**: is adding a new job "employment changed" or do you want sub-sections like `employment.current` vs `employment.history`? The schema handles it — just add pointers with longer prefixes; longest match wins.
+- **Severity per section**: put `priority: high|normal` in the schema and let the notifier route (push vs. digest). Easy add to `SectionChange`.
+- **Renamed/moved records**: with id-keyed arrays, an entity whose id changes shows as remove + add. If your upstream doesn't have stable ids, pick a composite key (e.g. `company+startDate`) in the canonicalizer.
+- **Digesting**: if one person emits 10 events in a minute, clients get 10 notifications. If that's noisy, buffer per `(clientId, personId)` with `bufferTimeout` / a short Redis debounce and merge the section sets — the rolling baseline design makes merging trivial since you just diff baseline → latest.
+
+If you share a sample person document I can propose a concrete section schema and show what the resulting notification looks like for a realistic change.
