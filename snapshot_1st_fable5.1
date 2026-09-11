@@ -1,0 +1,339 @@
+Below is a design I'd recommend, followed by the key code. I'll flag the decisions you need to make along the way.
+
+## 1. Architecture overview
+
+```
+Kafka (people topics)
+     │  keyed by personId
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  change-detector (Spring Boot WebFlux + reactor-kafka)      │
+│                                                             │
+│  1. consume ──► 2. dedupe by content hash (person-state)    │
+│  3. fan-out lookup: personId → {clientIds}  (Redis set)     │
+│  4. mget snapshots {clientId}:{personId}  (Elasticsearch)   │
+│  5. JSON diff ──► 6. notify (WebClient + Resilience4j)      │
+│  7. update snapshot lastNotified* (optimistic concurrency)  │
+│  8. ack offset  /  on hard failure → DLT topic              │
+└─────────────────────────────────────────────────────────────┘
+     ▲                                     │
+     │ bookmark API                        ▼
+  Clients                          Notification service
+```
+
+**Key ideas that make this fast and robust**
+
+| Concern | Decision |
+|---|---|
+| Ordering | Kafka key = `personId`, process **sequentially per partition**, concurrently **across partitions**. Per-person ordering is guaranteed without locks. |
+| Cheap "no change" path | Keep a `person-state` record (last content hash + version). ~90 % of events are usually replays/no-ops; skip them before touching ES snapshots. |
+| Fan-out lookup | A **reverse index** `subs:{personId} → Set<clientId>` in Redis (or an ES `bookmarks` index with a `term` query as fallback). Do **not** scan clients' profiles per event. |
+| Snapshot storage | ES doc id = `{clientId}:{personId}`. Fetch with **mget** (one round-trip per event), update with `if_seq_no / if_primary_term` for optimistic concurrency. |
+| Diffing | JSON Patch diff (zjsonpatch) → produces exactly which fields changed; strip volatile fields (`updatedAt`, etc.) first. |
+| Notification | Non-blocking `WebClient`, Resilience4j retry + circuit breaker + bulkhead. Idempotency key = `clientId:personId:eventVersion` so redeliveries don't double-notify. |
+| At-least-once | Manual offset commit **after** the fan-out completes. Poison messages go to a DLT after N retries. |
+| Backpressure | reactor-kafka `receive()` is pull-based; `flatMap` concurrency caps in-flight work; ES/notification clients bound connection pools. |
+
+**Design decision to make:** what is the *baseline* for "change"?
+- **(A)** Baseline is fixed at snapshot time; every event is compared to it → client gets "still differs from your snapshot" repeatedly. Usually not wanted.
+- **(B)** Baseline is the *last state the client was notified about* (snapshot + rolling `lastNotifiedState`). Client gets each delta once. **This is what I implement below** — the original snapshot is kept for the client's UI, and a `lastNotifiedHash/State` is rolled forward.
+
+## 2. Dependencies
+
+```xml
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-webflux</artifactId></dependency>
+<dependency><groupId>io.projectreactor.kafka</groupId><artifactId>reactor-kafka</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-elasticsearch</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-redis-reactive</artifactId></dependency>
+<dependency><groupId>io.github.resilience4j</groupId><artifactId>resilience4j-spring-boot3</artifactId></dependency>
+<dependency><groupId>io.github.resilience4j</groupId><artifactId>resilience4j-reactor</artifactId></dependency>
+<dependency><groupId>com.flipkart.zjsonpatch</groupId><artifactId>zjsonpatch</artifactId><version>0.4.16</version></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
+<dependency><groupId>io.micrometer</groupId><artifactId>micrometer-registry-prometheus</artifactId></dependency>
+```
+
+## 3. Elasticsearch documents
+
+```java
+@Document(indexName = "person-snapshots")
+public class SnapshotDoc {
+    @Id private String id;                     // clientId:personId
+    @Field(type = FieldType.Keyword) private String clientId;
+    @Field(type = FieldType.Keyword) private String personId;
+
+    @Field(type = FieldType.Object, enabled = false)   // stored, not indexed → cheap
+    private Map<String, Object> snapshot;             // what the client froze
+    @Field(type = FieldType.Object, enabled = false)
+    private Map<String, Object> lastNotifiedState;    // rolling baseline (design B)
+
+    @Field(type = FieldType.Keyword) private String lastNotifiedHash;
+    @Field(type = FieldType.Long)    private long   lastNotifiedVersion; // event version/offset
+    @Field(type = FieldType.Date)    private Instant snapshotAt;
+
+    @Version private Long version;             // maps to seq_no/primary_term → optimistic locking
+    // getters/setters
+}
+```
+
+Index settings: `enabled: false` on the blobs keeps indexing cost near zero; you only need `clientId` / `personId` searchable. Use 1 replica, `refresh_interval: 5s` (you never search-then-read the same doc in the hot path — you `GET` by id, which is real-time).
+
+## 4. Kafka consumer pipeline
+
+```java
+@Component
+@RequiredArgsConstructor
+public class PersonChangeConsumer {
+
+    private final KafkaReceiver<String, byte[]> receiver;   // built from ReceiverOptions
+    private final ChangeProcessor processor;
+    private final DeadLetterPublisher dlt;
+    private final MeterRegistry metrics;
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void start() {
+        receiver.receive()
+            // ordering per partition, parallelism across partitions
+            .groupBy(rec -> rec.receiverOffset().topicPartition())
+            .flatMap(partition -> partition
+                    .concatMap(this::handle)          // strictly sequential inside a partition
+                    .onErrorContinue((e, o) -> metrics.counter("consumer.unexpected").increment()),
+                Integer.MAX_VALUE)                    // one lane per assigned partition
+            .retryWhen(Retry.backoff(Long.MAX_VALUE, Duration.ofSeconds(1)).maxBackoff(Duration.ofSeconds(30)))
+            .subscribe();
+    }
+
+    private Mono<Void> handle(ReceiverRecord<String, byte[]> rec) {
+        return processor.process(rec.key(), rec.value(), rec.offset())
+            .timeout(Duration.ofSeconds(30))
+            .onErrorResume(e -> dlt.publish(rec, e))          // poison → DLT, don't block partition
+            .doFinally(s -> rec.receiverOffset().acknowledge()); // at-least-once
+    }
+}
+```
+
+`ReceiverOptions` essentials:
+
+```java
+@Bean
+KafkaReceiver<String, byte[]> receiver(KafkaProperties props) {
+    Map<String, Object> cfg = new HashMap<>(props.buildConsumerProperties());
+    cfg.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+    cfg.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 500);
+    cfg.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    ReceiverOptions<String, byte[]> opts = ReceiverOptions.<String, byte[]>create(cfg)
+        .subscription(List.of("people.updated", "people.deleted"))
+        .commitInterval(Duration.ofSeconds(1))
+        .commitBatchSize(200)
+        .maxDeferredCommits(2_000);          // bounds in-flight uncommitted records
+    return KafkaReceiver.create(opts);
+}
+```
+
+## 5. Change processor (the core)
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ChangeProcessor {
+
+    private final ObjectMapper om;
+    private final PersonStateStore personState;     // Redis: hash + version per person
+    private final SubscriberIndex subscribers;      // Redis set: personId -> clientIds
+    private final SnapshotRepository snapshots;     // ES reactive
+    private final Notifier notifier;
+    private final MeterRegistry metrics;
+
+    private static final Set<String> VOLATILE = Set.of("updatedAt", "etag", "_ingestTs");
+
+    public Mono<Void> process(String personId, byte[] payload, long offset) {
+        JsonNode current = normalize(om.readTree(payload));   // strip volatile, sort keys
+        String hash = Hashing.sha256().hashBytes(current.toString().getBytes(UTF_8)).toString();
+
+        return personState.lastHash(personId)
+            .defaultIfEmpty("")
+            .flatMap(prev -> {
+                if (prev.equals(hash)) {                       // fast path: no real change
+                    metrics.counter("events.noop").increment();
+                    return Mono.empty();
+                }
+                return fanOut(personId, current, hash, offset)
+                    .then(personState.put(personId, hash, offset));
+            });
+    }
+
+    private Mono<Void> fanOut(String personId, JsonNode current, String hash, long version) {
+        return subscribers.clientsFor(personId)                // Flux<String>
+            .collectList()
+            .filter(l -> !l.isEmpty())
+            .flatMapMany(clientIds ->
+                snapshots.mget(clientIds.stream().map(c -> c + ":" + personId).toList()))
+            .filter(doc -> !hash.equals(doc.getLastNotifiedHash()))       // idempotent on redelivery
+            .filter(doc -> version > doc.getLastNotifiedVersion())        // ignore stale events
+            .flatMap(doc -> notifyAndAdvance(doc, current, hash, version), 32) // bounded fan-out
+            .then();
+    }
+
+    private Mono<Void> notifyAndAdvance(SnapshotDoc doc, JsonNode current, String hash, long version) {
+        JsonNode baseline = om.valueToTree(doc.getLastNotifiedState() != null
+                                           ? doc.getLastNotifiedState() : doc.getSnapshot());
+        JsonNode patch = JsonDiff.asJson(baseline, current);   // RFC-6902 ops
+        if (patch.isEmpty()) return Mono.empty();
+
+        ChangeNotification n = new ChangeNotification(
+            doc.getClientId(), doc.getPersonId(), version,
+            doc.getClientId() + ":" + doc.getPersonId() + ":" + version,  // idempotency key
+            patch);
+
+        return notifier.send(n)
+            .then(Mono.defer(() -> {
+                doc.setLastNotifiedState(om.convertValue(current, Map.class));
+                doc.setLastNotifiedHash(hash);
+                doc.setLastNotifiedVersion(version);
+                return snapshots.save(doc);                       // @Version → 409 on conflict
+            }))
+            .onErrorResume(OptimisticLockingFailureException.class, e -> Mono.empty()) // someone else advanced it
+            .then();
+    }
+
+    private JsonNode normalize(JsonNode n) {
+        ObjectNode o = ((ObjectNode) n).deepCopy();
+        VOLATILE.forEach(o::remove);
+        return om.readerFor(JsonNode.class)                       // ORDER_MAP_ENTRIES_BY_KEYS on the mapper
+                 .readValue(o.toString());
+    }
+}
+```
+
+Note `version` here: prefer a **business version** from the event (e.g. `person.version`/`updatedAt` epoch). Fall back to Kafka offset only if all events for a person live on one partition of one topic.
+
+## 6. Subscriber reverse index & person state (Redis)
+
+```java
+@Component @RequiredArgsConstructor
+public class SubscriberIndex {
+    private final ReactiveStringRedisTemplate redis;
+
+    public Flux<String> clientsFor(String personId) {
+        return redis.opsForSet().members("subs:" + personId);
+    }
+    // called by the bookmark API
+    public Mono<Void> add(String clientId, String personId)    { return redis.opsForSet().add("subs:" + personId, clientId).then(); }
+    public Mono<Void> remove(String clientId, String personId) { return redis.opsForSet().remove("subs:" + personId, clientId).then(); }
+}
+
+@Component @RequiredArgsConstructor
+public class PersonStateStore {
+    private final ReactiveStringRedisTemplate redis;
+    public Mono<String> lastHash(String personId) { return redis.opsForHash().<String,String>get("pstate:" + personId, "h"); }
+    public Mono<Void> put(String personId, String hash, long v) {
+        return redis.opsForHash().putAll("pstate:" + personId, Map.of("h", hash, "v", Long.toString(v))).then();
+    }
+}
+```
+
+If you'd rather avoid Redis: `SubscriberIndex` can be an ES `terms` query on `person-snapshots` (`personId = X`, `_source: [clientId]`) — the snapshot index *is* the bookmark index then. Redis is ~10× cheaper per event though; use ES as a rebuild source for the Redis sets.
+
+## 7. Snapshot creation API (bookmark)
+
+```java
+@RestController @RequestMapping("/clients/{clientId}/bookmarks") @RequiredArgsConstructor
+public class BookmarkController {
+    private final PersonReadService people;      // your source of current person state
+    private final SnapshotRepository snapshots;
+    private final SubscriberIndex subscribers;
+
+    @PostMapping("/{personId}")
+    public Mono<SnapshotDoc> bookmark(@PathVariable String clientId, @PathVariable String personId) {
+        return people.current(personId)
+            .map(state -> {
+                SnapshotDoc d = new SnapshotDoc();
+                d.setId(clientId + ":" + personId);
+                d.setClientId(clientId); d.setPersonId(personId);
+                d.setSnapshot(state); d.setLastNotifiedState(state);
+                d.setLastNotifiedHash(hashOf(state)); d.setSnapshotAt(Instant.now());
+                return d;
+            })
+            .flatMap(snapshots::save)
+            .flatMap(d -> subscribers.add(clientId, personId).thenReturn(d));  // order: ES first, then Redis
+    }
+
+    @DeleteMapping("/{personId}")
+    public Mono<Void> remove(@PathVariable String clientId, @PathVariable String personId) {
+        return subscribers.remove(clientId, personId)
+            .then(snapshots.deleteById(clientId + ":" + personId));
+    }
+}
+```
+
+`people.current(...)` — the best source is a **compacted Kafka topic** of person state materialized into Redis/ES (`person-current` index) by the same consumer, so the snapshot reflects exactly what the change detector sees.
+
+## 8. Resilient notifier
+
+```java
+@Component @RequiredArgsConstructor
+public class Notifier {
+    private final WebClient client;   // baseUrl of notification service, pooled ConnectionProvider
+    private final CircuitBreaker cb;  // resilience4j
+    private final Retry retry;
+    private final Bulkhead bulkhead;
+
+    public Mono<Void> send(ChangeNotification n) {
+        return client.post().uri("/notifications")
+            .header("Idempotency-Key", n.idempotencyKey())
+            .bodyValue(n)
+            .retrieve()
+            .onStatus(HttpStatusCode::is4xxClientError, r -> Mono.error(new NonRetryableException()))
+            .toBodilessEntity()
+            .timeout(Duration.ofSeconds(3))
+            .transformDeferred(BulkheadOperator.of(bulkhead))
+            .transformDeferred(RetryOperator.of(retry))            // exp backoff, ignore NonRetryable
+            .transformDeferred(CircuitBreakerOperator.of(cb))
+            .then();
+    }
+}
+```
+
+```yaml
+resilience4j:
+  retry.instances.notifier:
+    max-attempts: 4
+    wait-duration: 200ms
+    enable-exponential-backoff: true
+    ignore-exceptions: [com.acme.NonRetryableException]
+  circuitbreaker.instances.notifier:
+    sliding-window-size: 50
+    failure-rate-threshold: 50
+    wait-duration-in-open-state: 20s
+  bulkhead.instances.notifier:
+    max-concurrent-calls: 64
+```
+
+When the circuit is open, `notifyAndAdvance` errors → the record goes to the DLT (or better: to a `notifications.retry` topic with a delayed re-consumer), and the snapshot is **not** advanced, so nothing is lost.
+
+## 9. Dead-letter / retry
+
+```java
+@Component @RequiredArgsConstructor
+public class DeadLetterPublisher {
+    private final KafkaSender<String, byte[]> sender;
+    public Mono<Void> publish(ReceiverRecord<String, byte[]> rec, Throwable e) {
+        ProducerRecord<String, byte[]> out = new ProducerRecord<>(rec.topic() + ".DLT", rec.key(), rec.value());
+        out.headers().add("x-error", e.getClass().getName().getBytes(UTF_8))
+                     .add("x-origin-offset", Long.toString(rec.offset()).getBytes(UTF_8));
+        return sender.send(Mono.just(SenderRecord.create(out, null))).then();
+    }
+}
+```
+
+## 10. Operational checklist
+
+- **Partitions**: set the people topic to ≥ the max consumer instances × 2; parallelism = partitions.
+- **Rebalances**: use `CooperativeStickyAssignor` and keep `maxDeferredCommits` bounded so a rebalance doesn't replay thousands of records.
+- **Idempotency is layered**: content hash (skip no-ops) → `lastNotifiedHash` per client (skip redeliveries) → `Idempotency-Key` header (notification service dedupes as last line of defense).
+- **Deletes**: handle `people.deleted` (tombstone) by sending a "person removed" notification and marking the snapshot `tombstoned=true`; don't drop the doc so the client still sees their snapshot.
+- **Hot persons** (one person bookmarked by 100k clients): the `mget` should be paginated — use `search_after` on `personId` with page size 1k and stream pages into the `flatMap`; the 32-wide fan-out limit keeps the notification service safe.
+- **Rebuilding Redis**: a nightly job (or on cold start with empty Redis) scans `person-snapshots` with `_source: [clientId, personId]` and repopulates `subs:*`.
+- **Metrics to alert on**: consumer lag per partition, `events.noop` ratio, notifier CB state, DLT rate, ES `version_conflict` rate, p99 end-to-end latency (Kafka timestamp → notification ack).
+- **Testing**: Testcontainers (Kafka + ES + Redis) with a test that publishes N events for one person and asserts exactly one notification per real change, even under duplicate delivery.
+
+If you tell me the shape of the person events (single topic vs. several partial-update topics, whether they carry a version field) and roughly how many bookmarks per person you expect, I can tune the fan-out and diff strategy further — e.g. several partial topics would push me toward a Kafka Streams / KTable join to assemble full state before diffing.
