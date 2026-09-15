@@ -1,0 +1,367 @@
+Right — the "nationalCode → Redis → API" flow is just *one* business flow. The fix is to make the core pipeline **flow-agnostic** (Kafka in → deserialize → `handler.handle()` → ack/DLT) and move the Redis flow into a **reusable base class** that only the topics that need it extend. Other topics extend different bases or implement the contract directly.
+
+---
+
+## 1. Minimal core contract
+
+The pipeline only knows this:
+
+```java
+public interface TopicHandler<T> {
+
+    String topic();
+    Class<T> payloadType();
+
+    /** The whole business flow for one message. Whatever this topic needs. */
+    Mono<Void> handle(T payload, MessageContext ctx);
+
+    // consumer settings (unchanged from before)
+    default String consumerGroup() { return "ncc-" + topic().replace('.', '-'); }
+    default Map<String, Object> consumerOverrides() { return Map.of(); }
+
+    /** Optional custom deserialization (Avro, Protobuf, …). Default: Jackson JSON. */
+    default Mono<T> deserialize(byte[] raw, ObjectMapper mapper) {
+        return Mono.fromCallable(() -> mapper.readValue(raw, payloadType()));
+    }
+}
+```
+
+```java
+/** Kafka metadata every flow may need (idempotency keys, tracing, DLT headers…). */
+public record MessageContext(String topic, int partition, long offset,
+                             String key, Map<String, String> headers, Instant receivedAt) {
+
+    public static MessageContext from(ReceiverRecord<String, byte[]> rec) {
+        var h = new HashMap<String, String>();
+        rec.headers().forEach(x -> h.put(x.key(), new String(x.value(), UTF_8)));
+        return new MessageContext(rec.topic(), rec.partition(), rec.offset(), rec.key(), h, Instant.now());
+    }
+
+    /** Stable idempotency key for this exact record. */
+    public String idempotencyKey() { return topic + "-" + partition + "-" + offset; }
+}
+```
+
+The pipeline's `process()` becomes trivial and never changes again:
+
+```java
+private <T> Mono<Void> process(TopicHandler<T> handler, String groupId, ReceiverRecord<String, byte[]> rec) {
+    var ctx  = MessageContext.from(rec);
+    var tags = Tags.of("topic", rec.topic(), "group", groupId);
+    var sample = Timer.start(meters);
+
+    return handler.deserialize(rec.value(), mapper)
+        .flatMap(payload -> handler.handle(payload, ctx))
+        .timeout(props.processing().timeout())
+        .doOnSuccess(v -> meters.counter("msg.processed", tags.and("result", "ok")).increment())
+        .onErrorResume(err -> {
+            meters.counter("msg.processed", tags.and("result", "failed")).increment();
+            log.error("[{}] failed {}:{}@{}", groupId, rec.topic(), rec.partition(), rec.offset(), err);
+            return dlt.publish(rec, err);
+        })
+        .doFinally(sig -> {
+            rec.receiverOffset().acknowledge();
+            sample.stop(meters.timer("msg.latency", tags));
+        });
+}
+```
+
+---
+
+## 2. Reusable flow templates (base classes)
+
+Each common business pattern becomes an abstract class. Handlers pick the one they need and fill in the blanks.
+
+### 2.1 The Redis-lookup flow (what we built so far)
+
+```java
+@RequiredArgsConstructor
+public abstract class NationalCodeLookupHandler<T> implements TopicHandler<T> {
+
+    protected final NationalCodeLookup lookup;
+
+    protected abstract String extractNationalCode(T payload);
+    protected abstract Mono<Void> onMatchedEntry(T payload, String nationalCode, RedisEntry entry, MessageContext ctx);
+
+    protected Mono<Void> onNoMatch(T payload, String nationalCode, MessageContext ctx) { return Mono.empty(); }
+    protected boolean accepts(RedisEntry entry) { return true; }
+    protected int entryConcurrency() { return 8; }
+    protected FailurePolicy failurePolicy() { return FailurePolicy.TRY_ALL_THEN_FAIL; }
+
+    /** Override for a batched call instead of per-entry fan-out. */
+    protected Mono<Void> onMatch(T payload, String nc, List<RedisEntry> entries, MessageContext ctx) {
+        return EntryFanOut.run(entries.stream().filter(this::accepts).toList(),
+                               e -> onMatchedEntry(payload, nc, e, ctx),
+                               entryConcurrency(), failurePolicy());
+    }
+
+    @Override
+    public final Mono<Void> handle(T payload, MessageContext ctx) {
+        String nc = extractNationalCode(payload);
+        if (nc == null || nc.isBlank()) return Mono.error(new InvalidMessageException("nationalCode missing"));
+
+        return lookup.findAll(nc)
+                .collectList()
+                .flatMap(entries -> entries.isEmpty()
+                        ? onNoMatch(payload, nc, ctx)
+                        : onMatch(payload, nc, entries, ctx));
+    }
+}
+```
+
+### 2.2 A "call an API directly" flow – no Redis at all
+
+```java
+@RequiredArgsConstructor
+public abstract class DirectApiHandler<T, R> implements TopicHandler<T> {
+
+    protected final ResilientApiClient api;
+
+    protected abstract String apiName();                 // resilience4j instance name
+    protected abstract String uri(T payload);
+    protected abstract R toRequest(T payload, MessageContext ctx);
+    protected boolean shouldCall(T payload) { return true; }   // cheap in-memory filter
+
+    @Override
+    public Mono<Void> handle(T payload, MessageContext ctx) {
+        if (!shouldCall(payload)) return Mono.empty();
+        return api.post(apiName(), uri(payload), toRequest(payload, ctx),
+                        Map.of("Idempotency-Key", ctx.idempotencyKey()));
+    }
+}
+```
+
+### 2.3 A "write to Redis" flow – the topic that *populates* the cache others read
+
+```java
+@RequiredArgsConstructor
+public abstract class RedisWriterHandler<T> implements TopicHandler<T> {
+
+    protected final ReactiveStringRedisTemplate redis;
+
+    protected abstract String key(T payload);
+    protected abstract String value(T payload);
+    protected Duration ttl() { return Duration.ofDays(30); }
+
+    @Override
+    public Mono<Void> handle(T payload, MessageContext ctx) {
+        return redis.opsForValue().set(key(payload), value(payload), ttl()).then();
+    }
+}
+```
+
+### 2.4 A "route to another topic" flow
+
+```java
+@RequiredArgsConstructor
+public abstract class ForwardingHandler<T> implements TopicHandler<T> {
+
+    protected final KafkaSender<String, byte[]> sender;
+    protected final ObjectMapper mapper;
+
+    protected abstract String targetTopic(T payload);
+    protected Object transform(T payload) { return payload; }
+
+    @Override
+    public Mono<Void> handle(T payload, MessageContext ctx) {
+        return Mono.fromCallable(() -> mapper.writeValueAsBytes(transform(payload)))
+            .map(bytes -> SenderRecord.create(new ProducerRecord<>(targetTopic(payload), ctx.key(), bytes), null))
+            .flatMap(r -> sender.send(Mono.just(r)).then());
+    }
+}
+```
+
+You'll add more templates as new *patterns* show up — but that's rare; most new topics fit an existing template.
+
+---
+
+## 3. Concrete handlers – each topic picks its flow
+
+```java
+// Topic 1: needs Redis lookup + per-entry API calls
+@Component
+public class LoanRequestHandler extends NationalCodeLookupHandler<LoanRequestEvent> {
+    private final ResilientApiClient api;
+
+    public LoanRequestHandler(NationalCodeLookup lookup, ResilientApiClient api) { super(lookup); this.api = api; }
+
+    @Override public String topic() { return "loan.requests"; }
+    @Override public Class<LoanRequestEvent> payloadType() { return LoanRequestEvent.class; }
+    @Override protected String extractNationalCode(LoanRequestEvent p) { return p.applicant().nationalCode(); }
+    @Override protected boolean accepts(RedisEntry e) { return e.key().startsWith("customer:"); }
+
+    @Override
+    protected Mono<Void> onMatchedEntry(LoanRequestEvent p, String nc, RedisEntry e, MessageContext ctx) {
+        return api.post("loan-api", "/loans/flag", new FlagRequest(p.requestId(), nc, e.key(), e.value()),
+                        Map.of("Idempotency-Key", ctx.idempotencyKey() + ":" + e.key()));
+    }
+}
+```
+
+```java
+// Topic 2: no Redis – just forward to an API
+@Component
+public class PaymentEventHandler extends DirectApiHandler<PaymentEvent, PaymentNotification> {
+
+    public PaymentEventHandler(ResilientApiClient api) { super(api); }
+
+    @Override public String topic() { return "payments.completed"; }
+    @Override public Class<PaymentEvent> payloadType() { return PaymentEvent.class; }
+    @Override protected String apiName() { return "payment-api"; }
+    @Override protected String uri(PaymentEvent p) { return "/payments/" + p.paymentId() + "/notify"; }
+    @Override protected boolean shouldCall(PaymentEvent p) { return p.amount().compareTo(BigDecimal.valueOf(1000)) > 0; }
+    @Override protected PaymentNotification toRequest(PaymentEvent p, MessageContext ctx) {
+        return new PaymentNotification(p.paymentId(), p.nationalCode(), p.amount());
+    }
+}
+```
+
+```java
+// Topic 3: populates Redis for the others
+@Component
+public class CustomerProfileHandler extends RedisWriterHandler<CustomerProfileEvent> {
+
+    public CustomerProfileHandler(ReactiveStringRedisTemplate redis) { super(redis); }
+
+    @Override public String topic() { return "customer.profiles"; }
+    @Override public Class<CustomerProfileEvent> payloadType() { return CustomerProfileEvent.class; }
+    @Override protected String key(CustomerProfileEvent p) { return "customer:" + p.nationalCode(); }
+    @Override protected String value(CustomerProfileEvent p) { return p.toJson(); }
+}
+```
+
+```java
+// Topic 4: fully custom flow – implement the interface directly
+@Component
+@RequiredArgsConstructor
+public class FraudAlertHandler implements TopicHandler<FraudAlert> {
+    private final ReactiveStringRedisTemplate redis;
+    private final ResilientApiClient api;
+    private final KafkaSender<String, byte[]> sender;
+
+    @Override public String topic() { return "fraud.alerts"; }
+    @Override public Class<FraudAlert> payloadType() { return FraudAlert.class; }
+
+    @Override
+    public Mono<Void> handle(FraudAlert a, MessageContext ctx) {
+        // 1. block the customer in Redis, 2. call API, 3. emit an audit event – all in one flow
+        return redis.opsForValue().set("blocked:" + a.nationalCode(), "1", Duration.ofHours(24))
+            .then(api.post("fraud-api", "/fraud/block", a, Map.of("Idempotency-Key", ctx.idempotencyKey())))
+            .then(forward("audit.events", ctx.key(), a));
+    }
+}
+```
+
+---
+
+## 4. Optional: composable steps for mix-and-match flows
+
+If flows start to overlap heavily ("lookup Redis **and then** forward **and then** call API"), add a tiny step abstraction instead of more base classes:
+
+```java
+@FunctionalInterface
+public interface Step<T> {
+    Mono<T> apply(T payload, MessageContext ctx);       // returns (possibly enriched) payload
+
+    default Step<T> then(Step<T> next) {
+        return (p, ctx) -> apply(p, ctx).flatMap(out -> next.apply(out, ctx));
+    }
+    static <T> Step<T> when(Predicate<T> cond, Step<T> step) {
+        return (p, ctx) -> cond.test(p) ? step.apply(p, ctx) : Mono.just(p);
+    }
+}
+```
+
+Reusable steps as beans:
+
+```java
+@Component @RequiredArgsConstructor
+public class Steps {
+    private final NationalCodeLookup lookup;
+    private final ResilientApiClient api;
+
+    public <T extends HasNationalCode & HasEntries<T>> Step<T> redisLookup() {
+        return (p, ctx) -> lookup.findAll(p.nationalCode()).collectList().map(p::withEntries);
+    }
+    public <T> Step<T> callApi(String name, Function<T, String> uri, BiFunction<T, MessageContext, ?> body) {
+        return (p, ctx) -> api.post(name, uri.apply(p), body.apply(p, ctx),
+                                    Map.of("Idempotency-Key", ctx.idempotencyKey())).thenReturn(p);
+    }
+    public <T> Step<T> forward(String topic, Function<T, ?> transform) { /* KafkaSender */ }
+}
+```
+
+Then a handler is a one-liner composition:
+
+```java
+@Component
+public class KycUpdateHandler implements TopicHandler<KycUpdate> {
+    private final Step<KycUpdate> flow;
+
+    public KycUpdateHandler(Steps s) {
+        this.flow = s.<KycUpdate>redisLookup()
+                     .then(Step.when(p -> !p.entries().isEmpty(),
+                                     s.callApi("kyc-api", p -> "/kyc/refresh", (p, ctx) -> p)))
+                     .then(s.forward("kyc.processed", p -> p));
+    }
+
+    @Override public String topic() { return "kyc.updates"; }
+    @Override public Class<KycUpdate> payloadType() { return KycUpdate.class; }
+    @Override public Mono<Void> handle(KycUpdate p, MessageContext ctx) { return flow.apply(p, ctx).then(); }
+}
+```
+
+Use base classes for the 80 % case and steps for the odd combinations — both satisfy the same `TopicHandler` contract, so the pipeline doesn't care.
+
+---
+
+## 5. Guardrails worth adding
+
+**Startup validation** – fail fast if a handler is misconfigured:
+
+```java
+@Component
+@RequiredArgsConstructor
+public class HandlerValidator implements ApplicationRunner {
+    private final TopicHandlerRegistry registry;
+    @Override public void run(ApplicationArguments args) {
+        if (registry.all().isEmpty()) throw new IllegalStateException("No TopicHandler beans found – nothing to consume");
+        registry.all().forEach(h -> Assert.hasText(h.topic(), h.getClass() + " has empty topic()"));
+    }
+}
+```
+
+**Per-handler metrics tag** – tag with the flow type so dashboards show "redis-lookup vs direct-api" behaviour:
+
+```java
+default String flowType() { return getClass().getSimpleName(); }
+// in pipeline: tags.and("flow", handler.flowType())
+```
+
+**Per-handler timeout** – a Redis-scanning flow may need more time than a direct API call:
+
+```java
+default Duration processingTimeout() { return null; }   // null → app.processing.timeout
+// pipeline: .timeout(Optional.ofNullable(handler.processingTimeout()).orElse(props.processing().timeout()))
+```
+
+---
+
+### Resulting layering
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Kafka ingestion pipeline  (generic: receive → deserialize →  │
+│  handle → ack/DLT; one KafkaReceiver + group per topic)       │
+├──────────────────────────────────────────────────────────────┤
+│  TopicHandler<T>  (contract: topic, payloadType, handle)      │
+├───────────────┬───────────────┬───────────────┬──────────────┤
+│ NationalCode  │ DirectApi     │ RedisWriter   │ Forwarding / │
+│ LookupHandler │ Handler       │ Handler       │ Step chains  │
+├───────────────┴───────────────┴───────────────┴──────────────┤
+│  Ports: NationalCodeLookup, ResilientApiClient, KafkaSender,  │
+│  ReactiveStringRedisTemplate                                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Adding a new business is still **one `@Component`** — you just choose which row of the third layer it sits on. The Redis lookup is now an opt-in capability rather than something every topic pays for.
