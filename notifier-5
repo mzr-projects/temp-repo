@@ -1,0 +1,225 @@
+`EntryFanOut` is a small **utility class I introduced two answers ago** (in the "call the REST API for each `RedisEntry`" response). It's not a Spring or Reactor class — it's your own helper that encapsulates the "**run one async action per Redis entry, with bounded concurrency and a chosen failure policy**" logic, so the base class and every handler don't have to re-implement it.
+
+Here it is again, complete and self-contained, plus exactly how `NationalCodeLookupHandler` uses it.
+
+---
+
+## 1. What problem it solves
+
+Inside `NationalCodeLookupHandler.onMatch(...)` you have a `List<RedisEntry>` and need to call `onMatchedEntry(...)` for each. Doing that naively:
+
+```java
+Flux.fromIterable(entries).flatMap(e -> onMatchedEntry(payload, nc, e, ctx)).then();
+```
+
+has three problems: unbounded parallelism, fail-fast semantics (first error cancels the rest, even though some calls already succeeded), and no visibility into *which* entries failed. `EntryFanOut` fixes all three in one place.
+
+---
+
+## 2. The code
+
+```java
+package com.example.ncc.core.fanout;
+
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.util.List;
+import java.util.function.Function;
+
+/** Runs one reactive action per RedisEntry with bounded concurrency and a failure policy. */
+@Slf4j
+public final class EntryFanOut {
+
+    private EntryFanOut() {}
+
+    public enum FailurePolicy {
+        /** First error cancels remaining calls and fails the message. */
+        FAIL_FAST,
+        /** Attempt every entry; if any failed, fail the message with details of the failed ones. */
+        TRY_ALL_THEN_FAIL,
+        /** Attempt every entry; log failures; never fail the message. */
+        BEST_EFFORT
+    }
+
+    public static Mono<Void> run(List<RedisEntry> entries,
+                                 Function<RedisEntry, Mono<Void>> action,
+                                 int concurrency,
+                                 FailurePolicy policy) {
+
+        if (entries == null || entries.isEmpty()) {
+            return Mono.empty();
+        }
+
+        return switch (policy) {
+
+            case FAIL_FAST -> Flux.fromIterable(entries)
+                    .flatMap(action, concurrency)
+                    .then();
+
+            case BEST_EFFORT -> Flux.fromIterable(entries)
+                    .flatMap(e -> action.apply(e)
+                            .doOnError(t -> log.warn("Entry action failed (best-effort) key={}", e.key(), t))
+                            .onErrorResume(t -> Mono.empty()), concurrency)
+                    .then();
+
+            case TRY_ALL_THEN_FAIL -> Flux.fromIterable(entries)
+                    .flatMap(e -> action.apply(e)
+                            .thenReturn(EntryResult.ok(e))
+                            .onErrorResume(t -> Mono.just(EntryResult.failed(e, t))), concurrency)
+                    .collectList()
+                    .flatMap(results -> {
+                        List<EntryResult> failed = results.stream().filter(EntryResult::isFailure).toList();
+                        return failed.isEmpty()
+                                ? Mono.<Void>empty()
+                                : Mono.error(new PartialFailureException(entries.size(), failed));
+                    });
+        };
+    }
+}
+```
+
+Supporting types:
+
+```java
+/** Outcome of the action for one entry. */
+public record EntryResult(RedisEntry entry, Throwable error) {
+    public static EntryResult ok(RedisEntry e)                  { return new EntryResult(e, null); }
+    public static EntryResult failed(RedisEntry e, Throwable t) { return new EntryResult(e, t); }
+    public boolean isFailure() { return error != null; }
+}
+```
+
+```java
+/** Thrown by TRY_ALL_THEN_FAIL when at least one entry action failed. */
+@Getter
+public class PartialFailureException extends RuntimeException {
+
+    private final int total;
+    private final List<EntryResult> failed;
+
+    public PartialFailureException(int total, List<EntryResult> failed) {
+        super(failed.size() + "/" + total + " entry actions failed: "
+                + failed.stream().map(f -> f.entry().key()).collect(Collectors.joining(",")));
+        this.total = total;
+        this.failed = failed;
+    }
+
+    /** Handy for the DLT header so a replay tool can re-run only these keys. */
+    public List<String> failedKeys() {
+        return failed.stream().map(f -> f.entry().key()).toList();
+    }
+}
+```
+
+---
+
+## 3. How `NationalCodeLookupHandler` uses it
+
+```java
+@RequiredArgsConstructor
+public abstract class NationalCodeLookupHandler<T> implements TopicHandler<T> {
+
+    protected final NationalCodeLookup lookup;
+
+    // ---- what each concrete handler fills in ----
+    protected abstract String extractNationalCode(T payload);
+    protected abstract Mono<Void> onMatchedEntry(T payload, String nationalCode, RedisEntry entry, MessageContext ctx);
+
+    // ---- knobs with sensible defaults ----
+    protected boolean accepts(RedisEntry entry)                    { return true; }
+    protected int entryConcurrency()                               { return 8; }
+    protected EntryFanOut.FailurePolicy failurePolicy()            { return EntryFanOut.FailurePolicy.TRY_ALL_THEN_FAIL; }
+    protected Mono<Void> onNoMatch(T payload, String nc, MessageContext ctx) { return Mono.empty(); }
+
+    /** Default: fan out one onMatchedEntry call per entry. Override for a single batched call. */
+    protected Mono<Void> onMatch(T payload, String nc, List<RedisEntry> entries, MessageContext ctx) {
+        List<RedisEntry> relevant = entries.stream().filter(this::accepts).toList();
+
+        return EntryFanOut.run(
+                relevant,
+                entry -> onMatchedEntry(payload, nc, entry, ctx),   // the action
+                entryConcurrency(),                                 // max parallel calls per message
+                failurePolicy());                                   // what to do on partial failure
+    }
+
+    @Override
+    public final Mono<Void> handle(T payload, MessageContext ctx) {
+        String nc = extractNationalCode(payload);
+        if (nc == null || nc.isBlank()) {
+            return Mono.error(new InvalidMessageException("nationalCode missing"));
+        }
+        return lookup.findAll(nc)
+                .collectList()
+                .flatMap(entries -> entries.isEmpty()
+                        ? onNoMatch(payload, nc, ctx)
+                        : onMatch(payload, nc, entries, ctx));
+    }
+}
+```
+
+Flow for one message:
+
+```
+handle()
+ └─ lookup.findAll(nc)  ──► [entry1, entry2, entry3]
+     └─ onMatch()
+         └─ EntryFanOut.run(entries, e -> onMatchedEntry(...), 8, TRY_ALL_THEN_FAIL)
+              ├─ onMatchedEntry(entry1) ─► API ✔
+              ├─ onMatchedEntry(entry2) ─► API ✘
+              └─ onMatchedEntry(entry3) ─► API ✔
+              → all three attempted, then Mono.error(PartialFailureException("1/3 failed: entry2Key"))
+                → pipeline sends the record to DLT with x-failed-keys header
+```
+
+---
+
+## 4. Using the failure detail in the DLT publisher
+
+Since `PartialFailureException` knows which keys failed, expose that in the dead-letter record:
+
+```java
+public Mono<Void> publish(ReceiverRecord<String, byte[]> rec, Throwable err) {
+    var out = new ProducerRecord<>(rec.topic() + ".DLT", rec.key(), rec.value());
+    out.headers().add("x-error", err.toString().getBytes(UTF_8));
+    out.headers().add("x-origin-offset", String.valueOf(rec.offset()).getBytes(UTF_8));
+    if (err instanceof PartialFailureException pfe) {
+        out.headers().add("x-failed-keys", String.join(",", pfe.failedKeys()).getBytes(UTF_8));
+    }
+    return sender.send(Mono.just(SenderRecord.create(out, null))).then()
+                 .onErrorResume(e -> Mono.empty());
+}
+```
+
+---
+
+## 5. Quick unit test (so you trust the policies)
+
+```java
+@Test
+void tryAllThenFail_attemptsEveryEntry_thenFails() {
+    var calls = new CopyOnWriteArrayList<String>();
+    var entries = List.of(new RedisEntry("a", "1"), new RedisEntry("b", "2"), new RedisEntry("c", "3"));
+
+    Function<RedisEntry, Mono<Void>> action = e -> {
+        calls.add(e.key());
+        return e.key().equals("b") ? Mono.error(new RuntimeException("boom")) : Mono.empty();
+    };
+
+    StepVerifier.create(EntryFanOut.run(entries, action, 4, FailurePolicy.TRY_ALL_THEN_FAIL))
+        .expectErrorSatisfies(t -> {
+            assertThat(t).isInstanceOf(PartialFailureException.class);
+            assertThat(((PartialFailureException) t).failedKeys()).containsExactly("b");
+        })
+        .verify();
+
+    assertThat(calls).containsExactlyInAnyOrder("a", "b", "c");   // c was still attempted
+}
+```
+
+---
+
+### In one sentence
+
+`EntryFanOut` = "for each `RedisEntry`, run this `Mono<Void>` action, at most *n* in parallel, and handle partial failures according to *policy*" — a single, tested place for that logic so `NationalCodeLookupHandler` (and any future handler) just calls `EntryFanOut.run(...)` instead of hand-rolling `flatMap`/`onErrorResume` chains.
