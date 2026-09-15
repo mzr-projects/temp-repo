@@ -1,0 +1,296 @@
+Good call — a separate consumer group per topic gives you **independent offsets, independent rebalances, and fault isolation** (a lagging or failing topic never affects the others). The only architectural change is: instead of one `KafkaReceiver` subscribed to all topics, the pipeline spins up **one `KafkaReceiver` per handler**, each with its own `group.id`.
+
+Here's the updated design.
+
+---
+
+## 1. Extend the SPI with per-topic consumer settings
+
+```java
+public interface TopicHandler<T> {
+
+    String topic();
+    Class<T> payloadType();
+    String extractNationalCode(T payload);
+    Mono<Void> onMatch(T payload, String nationalCode);
+    default Mono<Void> onNoMatch(T payload, String nationalCode) { return Mono.empty(); }
+
+    /** Consumer group for this topic. Default: derived from topic name; can be overridden in YAML. */
+    default String consumerGroup() {
+        return "ncc-" + topic().replace('.', '-');
+    }
+
+    /** Optional Kafka consumer property overrides for this topic only (e.g. auto.offset.reset). */
+    default Map<String, Object> consumerOverrides() {
+        return Map.of();
+    }
+}
+```
+
+Handlers can set it explicitly:
+
+```java
+@Component
+@RequiredArgsConstructor
+public class LoanRequestHandler implements TopicHandler<LoanRequestEvent> {
+    private final ResilientApiClient api;
+
+    @Override public String topic()          { return "loan.requests"; }
+    @Override public String consumerGroup()  { return "loan-national-code-checker"; }
+    @Override public Map<String, Object> consumerOverrides() {
+        return Map.of(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
+                      ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 200);
+    }
+    // ... rest unchanged
+}
+```
+
+---
+
+## 2. Make it overridable from configuration (ops-friendly)
+
+So group IDs / concurrency can be changed per environment without a code change:
+
+```java
+@ConfigurationProperties("app")
+@Validated
+public record AppProperties(
+        Kafka kafka,
+        Map<String, ConsumerSettings> consumers,   // keyed by topic name
+        Redis redis, Api api, Processing processing) {
+
+    public record Kafka(@Min(1) int defaultPartitionConcurrency) {}
+
+    public record ConsumerSettings(
+            String groupId,                       // null -> use handler default
+            Integer partitionConcurrency,         // null -> app.kafka.default-partition-concurrency
+            Boolean enabled,                      // null -> true; allows disabling one topic
+            Map<String, String> properties) {     // raw kafka consumer overrides
+        public boolean isEnabled() { return enabled == null || enabled; }
+    }
+
+    public ConsumerSettings consumerFor(String topic) {
+        return consumers == null ? null : consumers.get(topic);
+    }
+    public record Redis(@NotBlank String keyPrefix, Duration timeout) {}
+    public record Api(@NotBlank String baseUrl, Duration timeout) {}
+    public record Processing(Duration timeout) {}
+}
+```
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      # NOTE: no group-id here anymore – it's per topic
+      auto-offset-reset: earliest
+      max-poll-records: 500
+
+app:
+  kafka.default-partition-concurrency: 16
+  consumers:
+    loan.requests:
+      group-id: loan-ncc-prod
+      partition-concurrency: 32
+    card.issued:
+      group-id: card-ncc-prod
+      properties:
+        max.poll.records: "100"
+    kyc.updates:
+      enabled: false          # pause a whole business without redeploying
+```
+
+Resolution order: **YAML override → handler `consumerGroup()` → derived default**.
+
+---
+
+## 3. A factory that builds `ReceiverOptions` per handler
+
+```java
+@Component
+@RequiredArgsConstructor
+public class ReceiverOptionsFactory {
+
+    private final KafkaProperties bootProps;   // spring.kafka.* (bootstrap servers, security, etc.)
+    private final AppProperties app;
+
+    public ResolvedConsumer resolve(TopicHandler<?> handler) {
+        var override = app.consumerFor(handler.topic());
+
+        String groupId = override != null && override.groupId() != null
+                ? override.groupId() : handler.consumerGroup();
+
+        int concurrency = override != null && override.partitionConcurrency() != null
+                ? override.partitionConcurrency() : app.kafka().defaultPartitionConcurrency();
+
+        boolean enabled = override == null || override.isEnabled();
+
+        Map<String, Object> cfg = new HashMap<>(bootProps.buildConsumerProperties());
+        cfg.putAll(handler.consumerOverrides());                       // handler-level
+        if (override != null && override.properties() != null) {
+            cfg.putAll(override.properties());                          // YAML-level wins
+        }
+        // non-negotiable settings for the reactive pipeline
+        cfg.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        cfg.put(ConsumerConfig.CLIENT_ID_CONFIG, groupId + "-" + hostName());
+        cfg.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        cfg.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        cfg.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
+
+        var options = ReceiverOptions.<String, byte[]>create(cfg)
+                .subscription(List.of(handler.topic()))
+                .commitInterval(Duration.ofSeconds(1))
+                .commitBatchSize(100)
+                .addAssignListener(p -> log.info("[{}] assigned {}", groupId, p))
+                .addRevokeListener(p -> log.info("[{}] revoked {}", groupId, p));
+
+        return new ResolvedConsumer(handler.topic(), groupId, concurrency, enabled, options);
+    }
+
+    public record ResolvedConsumer(String topic, String groupId, int concurrency,
+                                   boolean enabled, ReceiverOptions<String, byte[]> options) {}
+
+    private static String hostName() {
+        try { return InetAddress.getLocalHost().getHostName(); } catch (Exception e) { return "unknown"; }
+    }
+}
+```
+
+---
+
+## 4. Pipeline: one independent reactive stream per topic/group
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class KafkaIngestionPipeline implements SmartLifecycle {
+
+    private final TopicHandlerRegistry registry;
+    private final ReceiverOptionsFactory optionsFactory;
+    private final NationalCodeLookup lookup;
+    private final ObjectMapper mapper;
+    private final DeadLetterPublisher dlt;
+    private final AppProperties props;
+    private final MeterRegistry meters;
+
+    private final Map<String, Disposable> streams = new ConcurrentHashMap<>();
+
+    @Override
+    public void start() {
+        registry.all().forEach(handler -> {
+            var rc = optionsFactory.resolve(handler);
+            if (!rc.enabled()) {
+                log.warn("Consumer for topic={} is disabled by configuration", rc.topic());
+                return;
+            }
+            streams.put(rc.topic(), startStream(handler, rc));
+            log.info("Started consumer topic={} group={} concurrency={}", rc.topic(), rc.groupId(), rc.concurrency());
+        });
+    }
+
+    private <T> Disposable startStream(TopicHandler<T> handler, ReceiverOptionsFactory.ResolvedConsumer rc) {
+        return KafkaReceiver.create(rc.options())
+            .receive()
+            .groupBy(rec -> rec.receiverOffset().topicPartition())
+            .flatMap(partition -> partition.concatMap(rec -> process(handler, rc.groupId(), rec)), rc.concurrency())
+            // each stream self-heals independently – a broker hiccup on one group doesn't touch the others
+            .retryWhen(Retry.backoff(Long.MAX_VALUE, Duration.ofSeconds(1)).maxBackoff(Duration.ofSeconds(30))
+                    .doBeforeRetry(s -> log.error("[{}] stream failed, restarting", rc.groupId(), s.failure())))
+            .subscribeOn(Schedulers.boundedElastic())   // isolates each receiver's poll loop
+            .subscribe(
+                v -> {},
+                e -> log.error("[{}] stream terminated fatally", rc.groupId(), e),
+                () -> log.info("[{}] stream completed", rc.groupId()));
+    }
+
+    private <T> Mono<Void> process(TopicHandler<T> handler, String groupId, ReceiverRecord<String, byte[]> rec) {
+        var tags = Tags.of("topic", rec.topic(), "group", groupId);
+        var sample = Timer.start(meters);
+
+        return Mono.fromCallable(() -> mapper.readValue(rec.value(), handler.payloadType()))
+            .flatMap(payload -> {
+                String nc = handler.extractNationalCode(payload);
+                if (nc == null || nc.isBlank()) return Mono.error(new InvalidMessageException("nationalCode missing"));
+                return lookup.exists(nc)
+                    .flatMap(exists -> exists ? handler.onMatch(payload, nc) : handler.onNoMatch(payload, nc));
+            })
+            .timeout(props.processing().timeout())
+            .doOnSuccess(v -> meters.counter("msg.processed", tags.and("result", "ok")).increment())
+            .onErrorResume(err -> {
+                meters.counter("msg.processed", tags.and("result", "failed")).increment();
+                log.error("[{}] failed topic={} partition={} offset={}", groupId, rec.topic(), rec.partition(), rec.offset(), err);
+                return dlt.publish(rec, err);
+            })
+            .doFinally(sig -> {
+                rec.receiverOffset().acknowledge();
+                sample.stop(meters.timer("msg.latency", tags));
+            });
+    }
+
+    /** Operational hooks – stop/start a single business at runtime (expose via an Actuator endpoint if you like). */
+    public void stopTopic(String topic)  { Optional.ofNullable(streams.remove(topic)).ifPresent(Disposable::dispose); }
+    public void startTopic(String topic) {
+        if (streams.containsKey(topic)) return;
+        var handler = registry.forTopic(topic);
+        streams.put(topic, startStream(handler, optionsFactory.resolve(handler)));
+    }
+
+    @Override public void stop()       { streams.values().forEach(Disposable::dispose); streams.clear(); }
+    @Override public boolean isRunning(){ return !streams.isEmpty(); }
+    @Override public int getPhase()    { return Integer.MAX_VALUE - 100; } // start after Redis/WebClient beans, stop early
+}
+```
+
+Add `all()` to the registry:
+
+```java
+public Collection<TopicHandler<?>> all() { return handlers.values(); }
+```
+
+---
+
+## 5. Per-group health indicator (so you see which business is sick)
+
+```java
+@Component
+@RequiredArgsConstructor
+public class ConsumerStreamsHealth implements ReactiveHealthIndicator {
+    private final KafkaIngestionPipeline pipeline;
+    private final TopicHandlerRegistry registry;
+
+    @Override
+    public Mono<Health> health() {
+        var details = new LinkedHashMap<String, Object>();
+        boolean allUp = true;
+        for (var h : registry.all()) {
+            boolean running = pipeline.isTopicRunning(h.topic());
+            details.put(h.topic(), running ? "UP" : "DOWN");
+            allUp &= running;
+        }
+        return Mono.just((allUp ? Health.up() : Health.down()).withDetails(details).build());
+    }
+}
+```
+
+(`isTopicRunning` = `streams.containsKey(topic) && !streams.get(topic).isDisposed()`.)
+
+---
+
+## 6. What you gain with one group per topic
+
+| Property | Effect |
+|---|---|
+| **Independent offsets / lag** | Kafka lag metrics (`kafka_consumergroup_lag`) are per business → clear alerting |
+| **Independent rebalances** | Scaling pods or a slow topic only rebalances *that* group |
+| **Fault isolation** | `retryWhen` restarts a single stream; other topics keep flowing |
+| **Per-topic tuning** | `max.poll.records`, `auto.offset.reset`, concurrency, or even a different cluster via `bootstrap.servers` override |
+| **Selective pause/replay** | Reset offsets or `enabled: false` for one business only (`kafka-consumer-groups --reset-offsets --group loan-ncc-prod`) |
+| **Security** | ACLs can be granted per group per topic |
+
+### Two things to watch
+1. **Thread footprint** — each `KafkaReceiver` runs its own poll loop, so N topics = N consumer threads. Fine for dozens; if you ever reach hundreds, group topics with identical SLAs under a shared group instead.
+2. **Naming** — keep group IDs stable across deployments (never derive them from hostname or a random suffix), otherwise you'll reprocess from `auto.offset.reset` on every deploy. The `CLIENT_ID` (not group) is where the hostname goes, as shown above.
+
+Everything else from the previous design (handlers, Redis lookup, resilient API client, DLT, ordering per partition) stays exactly the same.
