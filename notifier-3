@@ -1,0 +1,208 @@
+In Redis a "keys containing X" lookup is a **pattern match**, so the reactive way is `SCAN MATCH *<nationalCode>*` (never `KEYS` — it blocks the whole Redis server) and then fetch the values in batches with `MGET`. Below is the implementation, the pipeline/SPI changes it implies, and — importantly — a note on why you'll want an index for this at production throughput.
+
+---
+
+## 1. Updated port: return key/value pairs, not a boolean
+
+```java
+public record RedisEntry(String key, String value) {}
+
+public interface NationalCodeLookup {
+    /** All Redis entries whose key contains the national code. Empty flux = no match. */
+    Flux<RedisEntry> findAll(String nationalCode);
+}
+```
+
+## 2. `RedisNationalCodeLookup` with SCAN + batched MGET
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class RedisNationalCodeLookup implements NationalCodeLookup {
+
+    private final ReactiveStringRedisTemplate redis;
+    private final AppProperties props;
+
+    @Override
+    public Flux<RedisEntry> findAll(String nationalCode) {
+        String pattern = props.redis().keyPattern().replace("{nc}", escapeGlob(nationalCode)); // e.g. "*{nc}*"
+
+        ScanOptions options = ScanOptions.scanOptions()
+                .match(pattern)
+                .count(props.redis().scanCount())      // hint per SCAN round-trip, e.g. 1000
+                .build();
+
+        return redis.scan(options)                                   // Flux<String> of matching keys, cursor handled for you
+                .buffer(props.redis().mgetBatchSize())               // e.g. 100 keys per MGET
+                .concatMap(keys -> redis.opsForValue().multiGet(keys)
+                        .flatMapMany(values -> Flux.range(0, keys.size())
+                                .filter(i -> values.get(i) != null)  // key expired/deleted between SCAN and MGET
+                                .map(i -> new RedisEntry(keys.get(i), values.get(i)))))
+                .timeout(props.redis().timeout())
+                .doOnError(e -> log.warn("Redis lookup failed for nationalCode={}", nationalCode, e));
+    }
+
+    /** nationalCode is normally digits, but never let user data inject glob metacharacters. */
+    private static String escapeGlob(String s) {
+        StringBuilder sb = new StringBuilder(s.length() + 4);
+        for (char c : s.toCharArray()) {
+            if (c == '*' || c == '?' || c == '[' || c == ']' || c == '\\') sb.append('\\');
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+}
+```
+
+Config additions:
+
+```java
+public record Redis(@NotBlank String keyPattern,   // "*{nc}*"  or narrower e.g. "customer:*:{nc}:*"
+                    @Min(10) int scanCount,
+                    @Min(1) int mgetBatchSize,
+                    Duration timeout) {}
+```
+
+```yaml
+app:
+  redis:
+    key-pattern: "*{nc}*"
+    scan-count: 1000
+    mget-batch-size: 100
+    timeout: 2s          # SCAN over a big keyspace takes longer than a single GET
+```
+
+### If the matching keys are not all plain strings
+
+`MGET` only works for string values. If some keys hold hashes/sets/lists, dispatch on type instead:
+
+```java
+private Mono<RedisEntry> read(String key) {
+    return redis.type(key).flatMap(type -> switch (type) {
+        case STRING -> redis.opsForValue().get(key)
+                            .map(v -> new RedisEntry(key, v));
+        case HASH   -> redis.opsForHash().entries(key).collectMap(e -> (String) e.getKey(), e -> (String) e.getValue())
+                            .map(m -> new RedisEntry(key, toJson(m)));
+        case SET    -> redis.opsForSet().members(key).collectList()
+                            .map(l -> new RedisEntry(key, toJson(l)));
+        case LIST   -> redis.opsForList().range(key, 0, -1).collectList()
+                            .map(l -> new RedisEntry(key, toJson(l)));
+        default     -> Mono.empty();
+    });
+}
+
+// then: redis.scan(options).flatMap(this::read, props.redis().mgetBatchSize())
+```
+
+(Slower — one `TYPE` + one read per key — so only use this variant if you truly have mixed types.)
+
+---
+
+## 3. SPI and pipeline changes
+
+The handler now receives the matched entries, since that's usually what the business API needs:
+
+```java
+public interface TopicHandler<T> {
+    // ...unchanged...
+    Mono<Void> onMatch(T payload, String nationalCode, List<RedisEntry> entries);
+    default Mono<Void> onNoMatch(T payload, String nationalCode) { return Mono.empty(); }
+}
+```
+
+```java
+// in KafkaIngestionPipeline.process(...)
+return lookup.findAll(nc)
+        .collectList()
+        .flatMap(entries -> entries.isEmpty()
+                ? handler.onNoMatch(payload, nc)
+                : handler.onMatch(payload, nc, entries));
+```
+
+Example handler usage:
+
+```java
+@Override
+public Mono<Void> onMatch(LoanRequestEvent p, String nc, List<RedisEntry> entries) {
+    var body = Map.of(
+        "requestId", p.requestId(),
+        "nationalCode", nc,
+        "profiles", entries.stream().map(RedisEntry::value).toList()   // or parse each value to a DTO
+    );
+    return api.post("loan-api", "/loans/flag", body);
+}
+```
+
+If a handler only cares about certain keys, it can filter on `entry.key()` (e.g. `startsWith("customer:")`) — the pattern stays generic in config.
+
+---
+
+## 4. ⚠️ Performance: SCAN is a full keyspace walk
+
+`SCAN MATCH *X*` does **not** use an index; Redis iterates the whole keyspace and filters. Cost per message ≈ `totalKeys / scanCount` round-trips. With 10 M keys and `count=1000` that's ~10 000 round-trips **per Kafka message**, which will not keep up with any real topic.
+
+How to make it O(1) while keeping the same `NationalCodeLookup` contract:
+
+### Option A — Narrow the pattern (cheap win, still O(N))
+If keys follow a convention like `customer:{nc}:profile`, `loan:{nc}:limit`, use `key-pattern: "*:{nc}:*"` — fewer false matches but SCAN still scans everything. Only OK for small keyspaces (< ~100 k keys) or low message rates.
+
+### Option B — Direct MGET on known key templates (O(1), no SCAN)
+If the set of key shapes is finite, list them and skip SCAN entirely:
+
+```yaml
+app.redis.key-templates:
+  - "customer:{nc}"
+  - "loan:{nc}:limit"
+  - "blacklist:{nc}"
+```
+
+```java
+public Flux<RedisEntry> findAll(String nc) {
+    List<String> keys = props.redis().keyTemplates().stream().map(t -> t.replace("{nc}", nc)).toList();
+    return redis.opsForValue().multiGet(keys)
+        .flatMapMany(vals -> Flux.range(0, keys.size())
+            .filter(i -> vals.get(i) != null)
+            .map(i -> new RedisEntry(keys.get(i), vals.get(i))));
+}
+```
+
+### Option C — Secondary index SET (O(1), truly "any key containing nc")
+Whoever writes the data also does `SADD idx:nc:{nc} <actualKey>`. Lookup becomes:
+
+```java
+public Flux<RedisEntry> findAll(String nc) {
+    return redis.opsForSet().members("idx:nc:" + nc)
+        .collectList()
+        .filter(keys -> !keys.isEmpty())
+        .flatMapMany(keys -> redis.opsForValue().multiGet(keys)
+            .flatMapMany(vals -> Flux.range(0, keys.size())
+                .filter(i -> vals.get(i) != null)
+                .map(i -> new RedisEntry(keys.get(i), vals.get(i)))));
+}
+```
+
+If you don't control the writer, run a one-off backfill job (SCAN the whole keyspace once, `SADD` into the index) and keep it current with Redis keyspace notifications (`notify-keyspace-events "KEA"` → subscribe to `__keyevent@0__:set` / `:del` via `ReactiveRedisMessageListenerContainer`).
+
+### Option D — Redis Stack / RediSearch
+`FT.SEARCH` on a TAG field for the national code gives indexed lookups with no custom index maintenance — worth it if you're already on Redis Stack.
+
+---
+
+## 5. Recommendation
+
+Keep the **SCAN implementation as a fallback / dev profile** (it's the only thing that literally satisfies "all keys containing the code" against an unknown keyspace), and plug in **Option B or C** as the primary implementation behind the same `NationalCodeLookup` interface — nothing in the pipeline or handlers changes when you swap them:
+
+```java
+@Bean
+@ConditionalOnProperty(name = "app.redis.lookup-strategy", havingValue = "scan")
+NationalCodeLookup scanLookup(...) { return new RedisNationalCodeLookup(...); }
+
+@Bean
+@ConditionalOnProperty(name = "app.redis.lookup-strategy", havingValue = "index", matchIfMissing = true)
+NationalCodeLookup indexLookup(...) { return new IndexedNationalCodeLookup(...); }
+```
+
+One more thing: for Redis **Cluster**, `ReactiveStringRedisTemplate.scan` with Lettuce fans out across master nodes automatically, but `MGET` requires all keys in one hash slot — replace the `multiGet` with `Flux.fromIterable(keys).flatMap(k -> redis.opsForValue().get(k).map(v -> new RedisEntry(k, v)), 32)` in that environment.
+
+If you tell me the actual key naming convention in your Redis (and roughly how many keys), I can tell you which option fits and give you that exact implementation.
