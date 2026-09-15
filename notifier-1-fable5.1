@@ -1,0 +1,409 @@
+Below is a practical architecture plus a working skeleton for a **fully reactive** Spring Boot app that consumes from many Kafka topics, extracts `nationalCode` from heterogeneous payloads, checks Redis, and triggers a business API — designed so adding a new topic/business is just adding one class.
+
+---
+
+## 1. Stack (all non-blocking)
+
+| Concern | Choice | Why |
+|---|---|---|
+| Runtime | Spring Boot + **WebFlux** (Netty) | No servlet thread-per-request |
+| Kafka | **reactor-kafka** (`KafkaReceiver`) | Backpressure, manual ack, partition-ordered processing. (`@KafkaListener` is blocking – avoid) |
+| Redis | **Spring Data Redis Reactive** (Lettuce) | `ReactiveStringRedisTemplate` |
+| Outbound HTTP | **WebClient** | Reactive HTTP client |
+| Resilience | **Resilience4j** reactor operators | Retry, circuit breaker, timeouts, bulkhead |
+| Observability | Micrometer + Actuator | Metrics, health, tracing |
+
+Dependencies (`pom.xml`):
+
+```xml
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-webflux</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-redis-reactive</artifactId></dependency>
+<dependency><groupId>org.springframework.kafka</groupId><artifactId>spring-kafka</artifactId></dependency>
+<dependency><groupId>io.projectreactor.kafka</groupId><artifactId>reactor-kafka</artifactId></dependency>
+<dependency><groupId>io.github.resilience4j</groupId><artifactId>resilience4j-spring-boot3</artifactId></dependency>
+<dependency><groupId>io.github.resilience4j</groupId><artifactId>resilience4j-reactor</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-validation</artifactId></dependency>
+```
+
+---
+
+## 2. Core design: one generic pipeline + pluggable per-topic handlers
+
+```
+Kafka (topics A,B,C…) ──► KafkaReceiver ──► route by topic ──► TopicHandler<T>
+                                                                  ├─ deserialize(T)
+                                                                  ├─ extractNationalCode(T)
+                                          Redis EXISTS ◄──────────┤
+                                                                  ├─ onMatch(T)  ──► WebClient ► API
+                                                                  └─ onNoMatch(T)
+                                          ack offset / DLT on failure
+```
+
+The **pipeline is written once**; the only thing that varies per business is a `TopicHandler` implementation.
+
+### 2.1 The extension point (SPI)
+
+```java
+public interface TopicHandler<T> {
+
+    /** Kafka topic this handler owns. */
+    String topic();
+
+    /** Payload type for deserialization. */
+    Class<T> payloadType();
+
+    /** Each topic has a different shape – the handler knows where the national code lives. */
+    String extractNationalCode(T payload);
+
+    /** Business action when nationalCode exists in Redis (e.g. call an API). */
+    Mono<Void> onMatch(T payload, String nationalCode);
+
+    /** Optional hook when it does not exist. Default: do nothing. */
+    default Mono<Void> onNoMatch(T payload, String nationalCode) {
+        return Mono.empty();
+    }
+}
+```
+
+### 2.2 Handler registry (auto-discovers all handlers)
+
+```java
+@Component
+public class TopicHandlerRegistry {
+
+    private final Map<String, TopicHandler<?>> handlers;
+
+    public TopicHandlerRegistry(List<TopicHandler<?>> discovered) {
+        this.handlers = discovered.stream()
+            .collect(Collectors.toUnmodifiableMap(TopicHandler::topic, h -> h,
+                (a, b) -> { throw new IllegalStateException("Duplicate handler for topic " + a.topic()); }));
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> TopicHandler<T> forTopic(String topic) {
+        var h = (TopicHandler<T>) handlers.get(topic);
+        if (h == null) throw new IllegalStateException("No handler registered for topic " + topic);
+        return h;
+    }
+
+    public Set<String> topics() { return handlers.keySet(); }
+}
+```
+
+Adding a new business = **add one `@Component` implementing `TopicHandler`**; the app automatically subscribes to that topic.
+
+---
+
+## 3. Reactive ports (Redis + API)
+
+```java
+public interface NationalCodeLookup {
+    Mono<Boolean> exists(String nationalCode);
+}
+
+@Component
+@RequiredArgsConstructor
+public class RedisNationalCodeLookup implements NationalCodeLookup {
+
+    private final ReactiveStringRedisTemplate redis;
+    private final AppProperties props;
+
+    @Override
+    public Mono<Boolean> exists(String nationalCode) {
+        // Use hasKey if each code is a key; use opsForSet().isMember(...) if stored in a SET
+        return redis.hasKey(props.redis().keyPrefix() + nationalCode)
+                .timeout(props.redis().timeout())
+                .defaultIfEmpty(false);
+    }
+}
+```
+
+Generic API client with resilience baked in, so handlers stay thin:
+
+```java
+@Component
+@RequiredArgsConstructor
+public class ResilientApiClient {
+
+    private final WebClient webClient;
+    private final CircuitBreakerRegistry cbRegistry;
+    private final RetryRegistry retryRegistry;
+
+    public <B> Mono<Void> post(String name, String uri, B body) {
+        return webClient.post().uri(uri)
+                .bodyValue(body)
+                .retrieve()
+                .onStatus(HttpStatusCode::is4xxClientError,
+                        r -> r.bodyToMono(String.class).map(NonRetryableException::new))
+                .onStatus(HttpStatusCode::is5xxServerError,
+                        r -> r.bodyToMono(String.class).map(RetryableException::new))
+                .toBodilessEntity()
+                .then()
+                .transformDeferred(CircuitBreakerOperator.of(cbRegistry.circuitBreaker(name)))
+                .transformDeferred(RetryOperator.of(retryRegistry.retry(name)));
+    }
+}
+```
+
+---
+
+## 4. A concrete business handler (example)
+
+```java
+public record LoanRequestEvent(String requestId, Applicant applicant, BigDecimal amount) {
+    public record Applicant(String nationalCode, String fullName) {}
+}
+
+@Component
+@RequiredArgsConstructor
+public class LoanRequestHandler implements TopicHandler<LoanRequestEvent> {
+
+    private final ResilientApiClient api;
+
+    @Override public String topic() { return "loan.requests"; }
+    @Override public Class<LoanRequestEvent> payloadType() { return LoanRequestEvent.class; }
+
+    @Override
+    public String extractNationalCode(LoanRequestEvent p) {
+        return p.applicant().nationalCode();   // nested here...
+    }
+
+    @Override
+    public Mono<Void> onMatch(LoanRequestEvent p, String nationalCode) {
+        return api.post("loan-api", "/loans/flag", Map.of("requestId", p.requestId(), "nationalCode", nationalCode));
+    }
+}
+```
+
+A second topic where the code lives at the top level and a *different* API is called:
+
+```java
+public record CardIssueEvent(String nationalCode, String cardType) {}
+
+@Component
+@RequiredArgsConstructor
+public class CardIssueHandler implements TopicHandler<CardIssueEvent> {
+    private final ResilientApiClient api;
+    @Override public String topic() { return "card.issued"; }
+    @Override public Class<CardIssueEvent> payloadType() { return CardIssueEvent.class; }
+    @Override public String extractNationalCode(CardIssueEvent p) { return p.nationalCode(); }   // ...flat here
+    @Override public Mono<Void> onMatch(CardIssueEvent p, String nc) {
+        return api.post("card-api", "/cards/notify", p);
+    }
+}
+```
+
+---
+
+## 5. The generic reactive pipeline
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class KafkaIngestionPipeline implements SmartLifecycle {
+
+    private final ReceiverOptions<String, byte[]> baseReceiverOptions;
+    private final TopicHandlerRegistry registry;
+    private final NationalCodeLookup lookup;
+    private final ObjectMapper mapper;
+    private final DeadLetterPublisher dlt;
+    private final AppProperties props;
+    private final MeterRegistry meters;
+
+    private Disposable subscription;
+
+    @Override
+    public void start() {
+        var options = baseReceiverOptions.subscription(registry.topics());
+
+        subscription = KafkaReceiver.create(options)
+            .receive()
+            // preserve ordering per partition, parallelism across partitions
+            .groupBy(rec -> rec.receiverOffset().topicPartition())
+            .flatMap(partition -> partition.concatMap(this::process), props.kafka().partitionConcurrency())
+            // if the receiver itself dies (broker down etc.) – restart with backoff
+            .retryWhen(Retry.backoff(Long.MAX_VALUE, Duration.ofSeconds(1)).maxBackoff(Duration.ofSeconds(30))
+                    .doBeforeRetry(s -> log.error("Kafka stream failed, restarting", s.failure())))
+            .subscribe();
+    }
+
+    private Mono<Void> process(ReceiverRecord<String, byte[]> rec) {
+        TopicHandler<Object> handler = registry.forTopic(rec.topic());
+        var sample = Timer.start(meters);
+
+        return Mono.fromCallable(() -> mapper.readValue(rec.value(), handler.payloadType()))
+            .flatMap(payload -> {
+                String nc = handler.extractNationalCode(payload);
+                if (nc == null || nc.isBlank()) {
+                    return Mono.error(new InvalidMessageException("nationalCode missing"));
+                }
+                return lookup.exists(nc)
+                    .flatMap(exists -> exists ? handler.onMatch(payload, nc) : handler.onNoMatch(payload, nc));
+            })
+            .timeout(props.processing().timeout())
+            .doOnSuccess(v -> meters.counter("msg.processed", "topic", rec.topic(), "result", "ok").increment())
+            .onErrorResume(err -> {
+                meters.counter("msg.processed", "topic", rec.topic(), "result", "failed").increment();
+                log.error("Failed record topic={} partition={} offset={}", rec.topic(), rec.partition(), rec.offset(), err);
+                return dlt.publish(rec, err);      // poison pill -> DLT, never block the partition
+            })
+            // ack ALWAYS (after success or after DLT) so the consumer never stalls
+            .doFinally(sig -> {
+                rec.receiverOffset().acknowledge();
+                sample.stop(meters.timer("msg.latency", "topic", rec.topic()));
+            });
+    }
+
+    @Override public void stop() { if (subscription != null) subscription.dispose(); }
+    @Override public boolean isRunning() { return subscription != null && !subscription.isDisposed(); }
+}
+```
+
+Dead-letter publisher (reactive sender):
+
+```java
+@Component
+@RequiredArgsConstructor
+public class DeadLetterPublisher {
+    private final KafkaSender<String, byte[]> sender;
+
+    public Mono<Void> publish(ReceiverRecord<String, byte[]> rec, Throwable err) {
+        var out = new ProducerRecord<>(rec.topic() + ".DLT", rec.key(), rec.value());
+        out.headers().add("x-error", err.toString().getBytes(UTF_8));
+        out.headers().add("x-origin-offset", String.valueOf(rec.offset()).getBytes(UTF_8));
+        return sender.send(Mono.just(SenderRecord.create(out, null))).then()
+                     .onErrorResume(e -> Mono.empty()); // last resort: log & ack, don't stall
+    }
+}
+```
+
+---
+
+## 6. Configuration
+
+```java
+@Configuration
+public class KafkaConfig {
+
+    @Bean
+    ReceiverOptions<String, byte[]> receiverOptions(KafkaProperties boot, AppProperties app) {
+        Map<String, Object> cfg = new HashMap<>(boot.buildConsumerProperties());
+        cfg.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        cfg.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        cfg.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class); // per-topic decoding in handler
+        return ReceiverOptions.<String, byte[]>create(cfg)
+                .commitInterval(Duration.ofSeconds(1))
+                .commitBatchSize(100);
+    }
+
+    @Bean
+    KafkaSender<String, byte[]> kafkaSender(KafkaProperties boot) {
+        Map<String, Object> cfg = new HashMap<>(boot.buildProducerProperties());
+        cfg.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        cfg.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class);
+        return KafkaSender.create(SenderOptions.create(cfg));
+    }
+
+    @Bean
+    WebClient webClient(WebClient.Builder builder, AppProperties app) {
+        var http = HttpClient.create()
+                .responseTimeout(app.api().timeout())
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 2000);
+        return builder.baseUrl(app.api().baseUrl())
+                .clientConnector(new ReactorClientHttpConnector(http)).build();
+    }
+}
+```
+
+```java
+@ConfigurationProperties("app")
+@Validated
+public record AppProperties(Kafka kafka, Redis redis, Api api, Processing processing) {
+    public record Kafka(@Min(1) int partitionConcurrency) {}
+    public record Redis(@NotBlank String keyPrefix, Duration timeout) {}
+    public record Api(@NotBlank String baseUrl, Duration timeout) {}
+    public record Processing(Duration timeout) {}
+}
+```
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: national-code-checker
+      auto-offset-reset: earliest
+      max-poll-records: 500
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+app:
+  kafka.partition-concurrency: 16
+  redis:
+    key-prefix: "nc:"
+    timeout: 300ms
+  api:
+    base-url: http://business-api
+    timeout: 3s
+  processing.timeout: 10s
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 50
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 20s
+        ignore-exceptions: [com.example.NonRetryableException]
+  retry:
+    configs:
+      default:
+        max-attempts: 3
+        wait-duration: 500ms
+        enable-exponential-backoff: true
+        retry-exceptions: [com.example.RetryableException, java.io.IOException, java.util.concurrent.TimeoutException]
+        ignore-exceptions: [com.example.NonRetryableException]
+
+management:
+  endpoints.web.exposure.include: health,metrics,prometheus
+  health.redis.enabled: true
+```
+
+---
+
+## 7. Robustness checklist (what the design above gives you)
+
+- **Backpressure end-to-end** – `KafkaReceiver` only polls as fast as downstream (Redis + API) consumes.
+- **Ordering per partition, parallelism across partitions** – `groupBy(partition).concatMap`.
+- **No poison-pill stalls** – every record is acknowledged; failures go to `<topic>.DLT` with error headers.
+- **Manual, batched offset commits** – no at-most-once loss from auto-commit.
+- **Circuit breaker + retry + timeout** on the downstream API; 4xx is not retried, 5xx/timeouts are.
+- **Self-healing consumer** – `retryWhen` restarts the stream on broker failures.
+- **Idempotency** – you get at-least-once; make `onMatch` idempotent (e.g. pass `requestId`/offset as an idempotency key to the API, or `SETNX` a processed-marker in Redis).
+- **Graceful shutdown** – `SmartLifecycle.stop()` disposes the subscription so in-flight records finish and offsets commit.
+- **Observability** – per-topic counters/latency, Actuator health for Kafka/Redis, Prometheus.
+- **Type safety per topic** – bytes are decoded only in the handler that knows the schema; switch to Avro/Schema Registry per handler without touching the pipeline.
+
+---
+
+## 8. Extending for future businesses
+
+| Need | Change |
+|---|---|
+| New topic with new payload | Add one `TopicHandler<T>` `@Component` – nothing else |
+| Different lookup (e.g. DB instead of Redis) | New `NationalCodeLookup` implementation |
+| Multiple actions on match | Compose in `onMatch`: `Mono.when(apiA, apiB)` or `apiA.then(apiB)` |
+| Message filtering/enrichment before lookup | Add a `default Mono<T> preProcess(T)` hook to the SPI |
+| Handler needs its own consumer group/config | Give `TopicHandler` an optional `ConsumerOverrides` method and create one `KafkaReceiver` per group in the pipeline |
+| Transactional exactly-once | Switch to `receiveExactlyOnce()` + `KafkaSender` transactions (only if the "API" can be replaced by a Kafka output) |
+
+### Testing tips
+- Use **Testcontainers** (Kafka + Redis) with `@SpringBootTest` and `StepVerifier`.
+- Unit test each handler in isolation (they're plain classes returning `Mono`).
+- Enable **BlockHound** in tests to guarantee nothing blocks on Netty/Reactor threads.
+
+If you tell me which serialization you use (JSON vs Avro/Protobuf) and whether the Redis data is keys, a set, or hashes, I can tailor the `NationalCodeLookup` and deserialization part precisely.
