@@ -1,0 +1,220 @@
+Since each key is now a **hash** (`HSET key field value`) holding multiple records, the lookup changes from "get the string value of each key" to "get **every field/value** of each matching hash". Here's the adapted model, lookup, writer, and the small ripple effects on handlers.
+
+---
+
+## 1. Model: an entry is now `key + field + value`
+
+```java
+/** One record inside a Redis hash: HGET key field → value. */
+public record RedisEntry(String key, String field, String value) {
+
+    /** Convenience when values are JSON. */
+    public <R> R as(ObjectMapper mapper, Class<R> type) {
+        try { return mapper.readValue(value, type); }
+        catch (IOException e) { throw new InvalidMessageException("Bad JSON in " + key + "#" + field, e); }
+    }
+
+    /** Stable id for idempotency keys / DLT headers. */
+    public String id() { return key + "#" + field; }
+}
+```
+
+```java
+public interface NationalCodeLookup {
+    /** Every hash record (key, field, value) belonging to this national code. Empty flux = no match. */
+    Flux<RedisEntry> findAll(String nationalCode);
+}
+```
+
+---
+
+## 2. Lookup: find the hash keys, then read all their fields
+
+Two sub-steps, each pluggable:
+
+1. **Which keys?** — `SCAN MATCH *{nc}*` (generic, O(N)) **or** a fixed list of key templates (`customer:{nc}`, `loan:{nc}` → O(1)).
+2. **Read the hash** — `HGETALL` (`entries()`) for normal-sized hashes, or `HSCAN` (`scan()`) if a hash can hold thousands of fields.
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class RedisHashNationalCodeLookup implements NationalCodeLookup {
+
+    private final ReactiveStringRedisTemplate redis;
+    private final AppProperties props;
+
+    @Override
+    public Flux<RedisEntry> findAll(String nc) {
+        return resolveKeys(nc)
+                .flatMap(this::readHash, props.redis().keyConcurrency())   // HGETALL per key, a few in parallel
+                .timeout(props.redis().timeout())
+                .doOnError(e -> log.warn("Redis hash lookup failed nationalCode={}", nc, e));
+    }
+
+    // ---------- step 1: which keys ----------
+    private Flux<String> resolveKeys(String nc) {
+        var cfg = props.redis();
+        if (cfg.keyTemplates() != null && !cfg.keyTemplates().isEmpty()) {
+            // O(1): known key shapes → check existence only
+            return Flux.fromIterable(cfg.keyTemplates())
+                    .map(t -> t.replace("{nc}", nc))
+                    .filterWhen(redis::hasKey);
+        }
+        // fallback: keyspace scan for keys containing the national code
+        var options = ScanOptions.scanOptions()
+                .match(cfg.keyPattern().replace("{nc}", escapeGlob(nc)))
+                .count(cfg.scanCount())
+                .build();
+        return redis.scan(options)
+                .filterWhen(k -> redis.type(k).map(DataType.HASH::equals));   // ignore non-hash keys
+    }
+
+    // ---------- step 2: read all records of one hash ----------
+    private Flux<RedisEntry> readHash(String key) {
+        ReactiveHashOperations<String, String, String> hash = redis.opsForHash();
+
+        Flux<Map.Entry<String, String>> fields = props.redis().hscan()
+                ? hash.scan(key, ScanOptions.scanOptions().count(props.redis().scanCount()).build())  // HSCAN, incremental
+                : hash.entries(key);                                                                 // HGETALL, one round-trip
+
+        return fields.map(e -> new RedisEntry(key, e.getKey(), e.getValue()));
+    }
+
+    private static String escapeGlob(String s) {
+        var sb = new StringBuilder(s.length() + 4);
+        for (char c : s.toCharArray()) {
+            if (c == '*' || c == '?' || c == '[' || c == ']' || c == '\\') sb.append('\\');
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+}
+```
+
+Config:
+
+```java
+public record Redis(
+        List<String> keyTemplates,     // preferred: ["customer:{nc}", "loan:{nc}"]
+        String keyPattern,             // fallback: "*{nc}*"
+        @Min(10) int scanCount,
+        @Min(1) int keyConcurrency,
+        boolean hscan,                 // true if hashes can be large
+        Duration timeout) {}
+```
+
+```yaml
+app:
+  redis:
+    key-templates: ["customer:{nc}", "loan:{nc}"]   # remove this list to fall back to SCAN
+    key-pattern: "*{nc}*"
+    scan-count: 1000
+    key-concurrency: 4
+    hscan: false
+    timeout: 2s
+```
+
+### Variant: national code is the **field**, not the key
+
+If instead you write `opsForHash().put("customers", nationalCode, json)` — i.e. one big hash keyed by business, national code as field — the lookup is a direct `HGET` per hash:
+
+```java
+@Override
+public Flux<RedisEntry> findAll(String nc) {
+    return Flux.fromIterable(props.redis().hashKeys())          // ["customers", "loans", "blacklist"]
+            .flatMap(key -> redis.<String, String>opsForHash().get(key, nc)
+                    .map(v -> new RedisEntry(key, nc, v)), 4);
+}
+```
+
+And if the field merely *contains* the code (`"0012345678:2024-01"`), use `hash.scan(key, ScanOptions.scanOptions().match("*" + nc + "*").build())` per hash key. Both variants satisfy the same `NationalCodeLookup` interface, so nothing else changes.
+
+---
+
+## 3. Writer flow: `RedisWriterHandler` becomes hash-based
+
+```java
+@RequiredArgsConstructor
+public abstract class RedisHashWriterHandler<T> implements TopicHandler<T> {
+
+    protected final ReactiveStringRedisTemplate redis;
+
+    protected abstract String key(T payload);      // e.g. "customer:" + nationalCode
+    protected abstract String field(T payload);    // e.g. recordId / account number
+    protected abstract String value(T payload);    // usually JSON
+    protected Duration ttl() { return null; }      // null = no expiry
+
+    @Override
+    public Mono<Void> handle(T payload, MessageContext ctx) {
+        String key = key(payload);
+        Mono<Boolean> put = redis.<String, String>opsForHash().put(key, field(payload), value(payload));
+        return ttl() == null ? put.then()
+                             : put.then(redis.expire(key, ttl())).then();   // TTL is per key, not per field
+    }
+}
+```
+
+`HSET` is naturally idempotent (same field → same value), so this flow needs no extra dedup — a redelivery just rewrites the same record.
+
+---
+
+## 4. Ripple effects on the lookup flow
+
+`NationalCodeLookupHandler`, `EntryFanOut`, and the concrete handlers keep working; only the places that identify an entry should use `id()` (key + field) instead of `key()`:
+
+```java
+// concrete handler – one API call per hash record
+@Override
+protected Mono<Void> onMatchedEntry(LoanRequestEvent p, String nc, RedisEntry e, MessageContext ctx) {
+    CustomerRecord rec = e.as(mapper, CustomerRecord.class);
+    return api.post("loan-api", "/loans/flag",
+            new FlagRequest(p.requestId(), nc, rec),
+            Map.of("Idempotency-Key", handlerDedupKey(p, ctx) + ":" + e.id()));   // unique per record
+}
+
+// filter on key, field, or value
+@Override protected boolean accepts(RedisEntry e) {
+    return e.key().startsWith("customer:") && !e.field().startsWith("archived:");
+}
+```
+
+```java
+// PartialFailureException – report which records failed
+public List<String> failedIds() { return failed.stream().map(f -> f.entry().id()).toList(); }
+// DLT header: x-failed-entries = "customer:0012345678#acc-1,loan:0012345678#L-77"
+```
+
+If a handler prefers **one API call per hash key** (all records of a customer in one request) rather than per field, group first:
+
+```java
+@Override
+protected Mono<Void> onMatch(LoanRequestEvent p, String nc, List<RedisEntry> entries, MessageContext ctx) {
+    Map<String, List<RedisEntry>> byKey = entries.stream().collect(groupingBy(RedisEntry::key));
+    return Flux.fromIterable(byKey.entrySet())
+            .flatMap(kv -> api.post("loan-api", "/loans/flag-batch",
+                    new BatchFlagRequest(p.requestId(), nc, kv.getKey(),
+                            kv.getValue().stream().map(RedisEntry::value).toList()),
+                    Map.of("Idempotency-Key", handlerDedupKey(p, ctx) + ":" + kv.getKey())), entryConcurrency())
+            .then();
+}
+```
+
+---
+
+## 5. Two practical notes
+
+- **`ReactiveStringRedisTemplate` serializes hash fields/values as strings** — matches `opsForHash().put(key, String, String)`. If your writer uses `ReactiveRedisTemplate<String, Object>` with a JSON serializer, use the *same* template bean in the lookup, otherwise you'll read raw serialized bytes.
+- **Cluster**: `HGETALL`/`HSCAN`/`HGET` are single-key commands, so everything above is cluster-safe with no `MGET` cross-slot concerns. `SCAN` fans out across masters automatically with Lettuce.
+
+Quick sanity test against your data:
+
+```bash
+redis-cli HSET customer:0012345678 acc-1 '{"iban":"IR..","status":"ACTIVE"}'
+redis-cli HSET customer:0012345678 acc-2 '{"iban":"IR..","status":"CLOSED"}'
+redis-cli HGETALL customer:0012345678
+```
+
+→ `findAll("0012345678")` emits two `RedisEntry(customer:0012345678, acc-1, …)` / `(…, acc-2, …)`, and `LoanRequestHandler` fires one API call per record (or one per key with the batched override).
+
+If you share the exact `put(key, field, value)` shape you use — what goes in the key and what in the field — I can set `key-templates` and the `accepts` filter to match precisely.
