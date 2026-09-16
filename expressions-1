@@ -1,0 +1,31 @@
+GET my-index/_search
+{
+  "size": 0,
+  "query": {
+    "term": { "nationalCode": "1234567890" }
+  },
+  "aggs": {
+    "distinct_mobile_count": {
+      "cardinality": {
+        "field": "mobile",
+        "precision_threshold": 40000
+      }
+    },
+    "mobiles": {
+      "composite": {
+        "size": 100,
+        "sources": [
+          { "mobile": { "terms": { "field": "mobile", "order": "asc" } } }
+        ]
+      },
+      "aggs": {
+        "sources": {
+          "terms": { "field": "source", "size": 20 }
+        },
+        "last_seen": {
+          "max": { "field": "@timestamp" }
+        }
+      }
+    }
+  }
+}
