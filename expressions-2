@@ -1,0 +1,207 @@
+This is a fairly common pattern, and the two things that will bite you at this scale are (1) the 10,000-hit `from/size` limit and (2) trying to hand 50,000 rows to the UI in one response. Here's a design that handles both.
+
+## 1. Mapping assumptions
+
+Make sure the fields you filter/sort/aggregate on are `keyword`/`date` (doc values), not `text`:
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "phoneNumber":   { "type": "keyword" },
+      "expression":    { "type": "keyword" },
+      "dataSource":    { "type": "keyword" },
+      "insertionDate": { "type": "date" }
+    }
+  }
+}
+```
+
+**Strongly recommended:** since every query is "all docs for one phone", index with `routing = phoneNumber`. Then each query hits a single shard instead of fanning out across all shards of a 2B-doc index. If you can't reindex, skip the `.routing(...)` calls below and it still works — just slower.
+
+## 2. Split it into two calls
+
+- **Summary** (count, last expression, per-dataSource breakdown) → one aggregation query, `size: 0`. Cheap, one round trip.
+- **All expressions** → paginated with **PIT + `search_after`**. The UI uses infinite scroll / "load more". Never `from/size` past 10k, and don't raise `max_result_window`.
+
+## 3. DTOs
+
+```java
+public record ExpressionDoc(
+        String phoneNumber,
+        String expression,
+        String dataSource,
+        Instant insertionDate) {}
+
+public record DataSourceStats(
+        String dataSource,
+        long count,
+        ExpressionDoc lastExpression) {}
+
+public record PhoneSummary(
+        String phoneNumber,
+        long totalExpressions,
+        ExpressionDoc lastExpression,
+        List<DataSourceStats> byDataSource) {}
+
+public record ExpressionPage(
+        List<ExpressionDoc> items,
+        String pitId,                 // pass back on next request
+        List<String> searchAfter,     // pass back on next request
+        boolean hasMore) {}
+```
+
+## 4. Service (Elasticsearch Java API Client)
+
+Dependency: `co.elastic.clients:elasticsearch-java` (or via `spring-boot-starter-data-elasticsearch`, which auto-configures an `ElasticsearchClient` bean).
+
+```java
+@Service
+@RequiredArgsConstructor
+public class PhoneExpressionService {
+
+    private static final String INDEX = "phone-expressions";
+    private static final String KEEP_ALIVE = "2m";
+
+    private final ElasticsearchClient client;
+
+    // ---------- Summary: total, last expression, per-dataSource ----------
+    public PhoneSummary getSummary(String phone) throws IOException {
+
+        SearchResponse<ExpressionDoc> resp = client.search(s -> s
+                .index(INDEX)
+                .routing(phone)                       // remove if not using routing
+                .size(0)
+                .trackTotalHits(t -> t.enabled(true)) // exact count, not capped at 10k
+                .query(q -> q.term(t -> t.field("phoneNumber").value(phone)))
+                .aggregations("last", a -> a.topHits(th -> th
+                        .size(1)
+                        .sort(so -> so.field(f -> f.field("insertionDate").order(SortOrder.Desc)))))
+                .aggregations("byDataSource", a -> a
+                        .terms(t -> t.field("dataSource").size(200))
+                        .aggregations("last", sa -> sa.topHits(th -> th
+                                .size(1)
+                                .sort(so -> so.field(f -> f.field("insertionDate").order(SortOrder.Desc)))))),
+                ExpressionDoc.class);
+
+        long total = resp.hits().total() != null ? resp.hits().total().value() : 0;
+
+        ExpressionDoc last = firstTopHit(resp.aggregations().get("last").topHits());
+
+        List<DataSourceStats> perSource = resp.aggregations().get("byDataSource")
+                .sterms().buckets().array().stream()
+                .map(b -> new DataSourceStats(
+                        b.key().stringValue(),
+                        b.docCount(),
+                        firstTopHit(b.aggregations().get("last").topHits())))
+                .toList();
+
+        return new PhoneSummary(phone, total, last, perSource);
+    }
+
+    private ExpressionDoc firstTopHit(TopHitsAggregate th) {
+        return th.hits().hits().stream()
+                .findFirst()
+                .map(h -> h.source().to(ExpressionDoc.class))
+                .orElse(null);
+    }
+
+    // ---------- Paged list: PIT + search_after ----------
+    public ExpressionPage getExpressions(String phone,
+                                         int pageSize,
+                                         @Nullable String pitId,
+                                         @Nullable List<String> searchAfter) throws IOException {
+
+        String pit = (pitId != null) ? pitId
+                : client.openPointInTime(p -> p
+                        .index(INDEX)
+                        .routing(phone)                 // remove if not using routing
+                        .keepAlive(k -> k.time(KEEP_ALIVE)))
+                  .id();
+
+        SearchResponse<ExpressionDoc> resp = client.search(s -> {
+            s.pit(p -> p.id(pit).keepAlive(k -> k.time(KEEP_ALIVE)))  // no .index() with PIT
+             .size(pageSize)
+             .trackTotalHits(t -> t.enabled(false))
+             .query(q -> q.term(t -> t.field("phoneNumber").value(phone)))
+             .sort(so -> so.field(f -> f.field("insertionDate").order(SortOrder.Desc)));
+             // PIT adds _shard_doc as tiebreaker automatically
+            if (searchAfter != null && !searchAfter.isEmpty()) {
+                s.searchAfter(searchAfter.stream().map(FieldValue::of).toList());
+            }
+            return s;
+        }, ExpressionDoc.class);
+
+        List<Hit<ExpressionDoc>> hits = resp.hits().hits();
+        List<ExpressionDoc> items = hits.stream().map(Hit::source).toList();
+
+        boolean hasMore = hits.size() == pageSize;
+        List<String> next = hasMore
+                ? hits.get(hits.size() - 1).sort().stream().map(FieldValue::_toJsonString).toList()
+                : null;
+
+        if (!hasMore) {
+            closePit(resp.pitId());
+        }
+        return new ExpressionPage(items, hasMore ? resp.pitId() : null, next, hasMore);
+    }
+
+    public void closePit(String pitId) {
+        if (pitId == null) return;
+        try {
+            client.closePointInTime(c -> c.id(pitId));
+        } catch (IOException ignored) { }
+    }
+
+    // ---------- Server-side full stream (e.g. CSV export) ----------
+    public void forEachExpression(String phone, Consumer<ExpressionDoc> consumer) throws IOException {
+        ExpressionPage page = getExpressions(phone, 5000, null, null);
+        while (true) {
+            page.items().forEach(consumer);
+            if (!page.hasMore()) break;
+            page = getExpressions(phone, 5000, page.pitId(), page.searchAfter());
+        }
+    }
+}
+```
+
+## 5. Controller
+
+```java
+@RestController
+@RequestMapping("/api/phones/{phone}")
+@RequiredArgsConstructor
+public class PhoneExpressionController {
+
+    private final PhoneExpressionService service;
+
+    @GetMapping("/summary")
+    public PhoneSummary summary(@PathVariable String phone) throws IOException {
+        return service.getSummary(phone);
+    }
+
+    @GetMapping("/expressions")
+    public ExpressionPage expressions(@PathVariable String phone,
+                                      @RequestParam(defaultValue = "100") int size,
+                                      @RequestParam(required = false) String pitId,
+                                      @RequestParam(required = false) List<String> searchAfter) throws IOException {
+        return service.getExpressions(phone, Math.min(size, 1000), pitId, searchAfter);
+    }
+
+    @DeleteMapping("/expressions/pit/{pitId}")
+    public void closePit(@PathVariable String pitId) {
+        service.closePit(pitId);
+    }
+}
+```
+
+UI flow: call `/summary` once for the header (count, last seen, per-source chips), then `/expressions` repeatedly, echoing back `pitId` + `searchAfter` until `hasMore == false`. If the user navigates away, call the DELETE endpoint (or just let the 2-minute keep-alive expire).
+
+## Notes / gotchas
+
+- **Why PIT instead of scroll?** Scroll is meant for one server-side consumer; PIT + `search_after` is stateless per request and is the recommended approach for deep paging in ES 7.10+/8.x.
+- **`track_total_hits: true`** is only in the summary query. It's cheap there because the term filter already narrows to ~50k docs; keep it `false` on the paged query.
+- **Sort tiebreaker:** with a PIT, ES appends `_shard_doc` automatically, so ties on `insertionDate` won't skip/duplicate rows. Without a PIT you'd need to add `_id`/a unique field to the sort yourself.
+- **If insertion order matters more than date** (e.g., `insertionDate` can have duplicates or be back-dated), sort on a monotonic field like a sequence id instead.
+- **Payload size:** add `.source(sf -> sf.filter(f -> f.includes("expression","dataSource","insertionDate")))` if the docs have extra fields you don't need in the UI.
+- **Terms agg `size(200)`:** set it to a bit above your real number of distinct `dataSource` values so you don't get truncated buckets.
