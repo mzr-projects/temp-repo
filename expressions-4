@@ -1,0 +1,311 @@
+Here's the same service rewritten to build the query JSON yourself, call Elasticsearch over plain HTTP, and map the response into your own objects. I'm using Spring's `RestClient` (Spring 6.1 / Boot 3.2+) — **not** Elastic's `org.elasticsearch.client.RestClient`, watch the import. A `RestTemplate` variant is noted at the end.
+
+## 1. HTTP client config
+
+```java
+@Configuration
+public class ElasticConfig {
+
+    @Bean
+    public RestClient elasticRestClient(@Value("${elastic.url}") String url,           // e.g. https://es-host:9200
+                                        @Value("${elastic.username}") String user,
+                                        @Value("${elastic.password}") String pass) {
+        return RestClient.builder()
+                .baseUrl(url)
+                .defaultHeaders(h -> {
+                    h.setBasicAuth(user, pass);
+                    h.setContentType(MediaType.APPLICATION_JSON);
+                    h.setAccept(List.of(MediaType.APPLICATION_JSON));
+                })
+                .defaultStatusHandler(HttpStatusCode::isError, (req, res) -> {
+                    String body = new String(res.getBody().readAllBytes(), StandardCharsets.UTF_8);
+                    throw new ElasticException(res.getStatusCode().value(), body);
+                })
+                .build();
+    }
+}
+
+public class ElasticException extends RuntimeException {
+    public ElasticException(int status, String body) { super("ES " + status + ": " + body); }
+}
+```
+
+## 2. Response models (what ES returns)
+
+```java
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record EsSearchResponse(
+        @JsonProperty("pit_id") String pitId,
+        EsHits hits,
+        JsonNode aggregations) {}          // aggs are heterogenous -> keep as tree, map below
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record EsHits(EsTotal total, List<EsHit> hits) {}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record EsTotal(long value, String relation) {}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record EsHit(
+        @JsonProperty("_id") String id,
+        @JsonProperty("_source") ExpressionDoc source,
+        List<JsonNode> sort) {}            // search_after cursor, echoed back as-is
+
+public record EsPitResponse(String id) {}
+```
+
+Your domain DTOs (`ExpressionDoc`, `NumberType`, `DataSourceStats`, `PhoneSummary`) stay as in the previous answer. `ExpressionPage` changes only in the cursor type:
+
+```java
+public record ExpressionPage(
+        List<ExpressionDoc> items,
+        String pitId,
+        List<JsonNode> searchAfter,        // e.g. [1726000000000, 4711]
+        boolean hasMore) {}
+
+public record ExpressionPageRequest(
+        String number,
+        NumberType type,                   // nullable
+        Integer size,
+        String pitId,                      // nullable on first call
+        List<JsonNode> searchAfter) {}     // nullable on first call
+```
+
+## 3. Query factory (builds the request JSON)
+
+```java
+@Component
+@RequiredArgsConstructor
+public class EsQueryFactory {
+
+    private static final String KEEP_ALIVE = "2m";
+    private final ObjectMapper om;
+
+    // ---- discriminating query: phone vs mobile vs unknown ----
+    public ObjectNode numberQuery(String number, @Nullable NumberType type) {
+        ObjectNode q = om.createObjectNode();
+        if (type != null) {
+            q.putObject("term").put(type == NumberType.MOBILE ? "mobile" : "phone", number);
+            return q;
+        }
+        ObjectNode bool = q.putObject("bool");
+        ArrayNode should = bool.putArray("should");
+        should.addObject().putObject("term").put("phone", number);
+        should.addObject().putObject("term").put("mobile", number);
+        bool.put("minimum_should_match", 1);
+        return q;
+    }
+
+    // ---- summary: count + last + byType + byDataSource ----
+    public ObjectNode summaryQuery(String number, @Nullable NumberType type) {
+        ObjectNode root = om.createObjectNode();
+        root.put("size", 0);
+        root.put("track_total_hits", true);
+        root.set("query", numberQuery(number, type));
+
+        ObjectNode aggs = root.putObject("aggs");
+        aggs.set("last", lastTopHit());
+
+        ObjectNode byType = aggs.putObject("byType").putObject("filters").putObject("filters");
+        byType.putObject("PHONE").putObject("exists").put("field", "phone");
+        byType.putObject("MOBILE").putObject("exists").put("field", "mobile");
+
+        ObjectNode byDs = aggs.putObject("byDataSource");
+        byDs.putObject("terms").put("field", "dataSource").put("size", 200);
+        byDs.putObject("aggs").set("last", lastTopHit());
+        return root;
+    }
+
+    private ObjectNode lastTopHit() {
+        ObjectNode agg = om.createObjectNode();
+        ObjectNode th = agg.putObject("top_hits");
+        th.put("size", 1);
+        th.putArray("sort").addObject().putObject("insertionDate").put("order", "desc");
+        return agg;
+    }
+
+    // ---- one page via PIT + search_after ----
+    public ObjectNode pageQuery(String number, @Nullable NumberType type, int size,
+                                String pitId, @Nullable List<JsonNode> searchAfter) {
+        ObjectNode root = om.createObjectNode();
+        root.put("size", size);
+        root.put("track_total_hits", false);
+        root.set("query", numberQuery(number, type));
+        root.putArray("sort").addObject().putObject("insertionDate").put("order", "desc");
+        root.putObject("pit").put("id", pitId).put("keep_alive", KEEP_ALIVE);
+        root.putArray("_source").add("phone").add("mobile").add("expression")
+                                .add("dataSource").add("insertionDate");
+        if (searchAfter != null && !searchAfter.isEmpty()) {
+            root.putArray("search_after").addAll(searchAfter);
+        }
+        return root;
+    }
+
+    public ObjectNode closePitBody(String pitId) {
+        return om.createObjectNode().put("id", pitId);
+    }
+}
+```
+
+What the summary body looks like on the wire, for reference:
+
+```json
+{
+  "size": 0, "track_total_hits": true,
+  "query": { "bool": { "should": [ {"term":{"phone":"..."}}, {"term":{"mobile":"..."}} ], "minimum_should_match": 1 } },
+  "aggs": {
+    "last":   { "top_hits": { "size": 1, "sort": [ { "insertionDate": { "order": "desc" } } ] } },
+    "byType": { "filters": { "filters": { "PHONE": {"exists":{"field":"phone"}}, "MOBILE": {"exists":{"field":"mobile"}} } } },
+    "byDataSource": { "terms": { "field": "dataSource", "size": 200 },
+                      "aggs": { "last": { "top_hits": { "size": 1, "sort": [ { "insertionDate": { "order": "desc" } } ] } } } }
+  }
+}
+```
+
+## 4. Service (REST calls + mapping to objects)
+
+```java
+@Service
+@RequiredArgsConstructor
+public class PhoneExpressionService {
+
+    private static final String INDEX = "phone-expressions";
+    private static final String KEEP_ALIVE = "2m";
+
+    private final RestClient es;            // org.springframework.web.client.RestClient
+    private final EsQueryFactory queries;
+    private final ObjectMapper om;
+
+    // ---------------- Summary ----------------
+    public PhoneSummary getSummary(String number, @Nullable NumberType type) {
+
+        EsSearchResponse resp = es.post()
+                .uri("/{index}/_search?routing={r}", INDEX, number)   // drop routing param if not used
+                .body(queries.summaryQuery(number, type))
+                .retrieve()
+                .body(EsSearchResponse.class);
+
+        long total = resp.hits() != null && resp.hits().total() != null
+                ? resp.hits().total().value() : 0L;
+
+        JsonNode aggs = resp.aggregations();
+        ExpressionDoc last = firstTopHit(aggs.path("last"));
+
+        JsonNode typeBuckets = aggs.path("byType").path("buckets");
+        long mobileCount = typeBuckets.path("MOBILE").path("doc_count").asLong();
+        long phoneCount  = typeBuckets.path("PHONE").path("doc_count").asLong();
+        NumberType resolved = mobileCount > 0 ? NumberType.MOBILE
+                            : phoneCount  > 0 ? NumberType.PHONE
+                            : type;
+
+        List<DataSourceStats> perSource = new ArrayList<>();
+        for (JsonNode b : aggs.path("byDataSource").path("buckets")) {
+            perSource.add(new DataSourceStats(
+                    b.path("key").asText(),
+                    b.path("doc_count").asLong(),
+                    firstTopHit(b.path("last"))));
+        }
+
+        return new PhoneSummary(number, resolved, total, last, perSource);
+    }
+
+    private ExpressionDoc firstTopHit(JsonNode topHitsAgg) {
+        JsonNode hits = topHitsAgg.path("hits").path("hits");
+        if (!hits.isArray() || hits.isEmpty()) return null;
+        return om.convertValue(hits.get(0).path("_source"), ExpressionDoc.class);
+    }
+
+    // ---------------- Paged expressions ----------------
+    public ExpressionPage getExpressions(ExpressionPageRequest req) {
+
+        int size = req.size() == null ? 100 : Math.min(req.size(), 1000);
+        String pit = req.pitId() != null ? req.pitId() : openPit(req.number());
+
+        EsSearchResponse resp = es.post()
+                .uri("/_search")                                       // no index in path when using PIT
+                .body(queries.pageQuery(req.number(), req.type(), size, pit, req.searchAfter()))
+                .retrieve()
+                .body(EsSearchResponse.class);
+
+        List<EsHit> hits = resp.hits() == null ? List.of() : resp.hits().hits();
+        List<ExpressionDoc> items = hits.stream().map(EsHit::source).toList();
+
+        boolean hasMore = hits.size() == size;
+        List<JsonNode> next = hasMore ? hits.get(hits.size() - 1).sort() : null;
+
+        if (!hasMore) closePit(resp.pitId());
+
+        return new ExpressionPage(items, hasMore ? resp.pitId() : null, next, hasMore);
+    }
+
+    private String openPit(String number) {
+        EsPitResponse r = es.post()
+                .uri("/{index}/_pit?keep_alive={ka}&routing={r}", INDEX, KEEP_ALIVE, number)
+                .retrieve()
+                .body(EsPitResponse.class);
+        return r.id();
+    }
+
+    public void closePit(@Nullable String pitId) {
+        if (pitId == null) return;
+        try {
+            es.method(HttpMethod.DELETE)          // delete() has no body(), so use method()
+              .uri("/_pit")
+              .body(queries.closePitBody(pitId))
+              .retrieve()
+              .toBodilessEntity();
+        } catch (RuntimeException ignored) { /* best effort; PIT expires anyway */ }
+    }
+
+    // ---------------- Full server-side iteration (export etc.) ----------------
+    public void forEachExpression(String number, @Nullable NumberType type, Consumer<ExpressionDoc> consumer) {
+        ExpressionPage page = getExpressions(new ExpressionPageRequest(number, type, 1000, null, null));
+        while (true) {
+            page.items().forEach(consumer);
+            if (!page.hasMore()) break;
+            page = getExpressions(new ExpressionPageRequest(number, type, 1000, page.pitId(), page.searchAfter()));
+        }
+    }
+}
+```
+
+## 5. Controller
+
+```java
+@RestController
+@RequestMapping("/api/numbers")
+@RequiredArgsConstructor
+public class PhoneExpressionController {
+
+    private final PhoneExpressionService service;
+
+    @GetMapping("/{number}/summary")
+    public PhoneSummary summary(@PathVariable String number,
+                                @RequestParam(required = false) NumberType type) {
+        return service.getSummary(number, type);
+    }
+
+    // POST because the search_after cursor is a JSON array (mixed number types)
+    @PostMapping("/expressions")
+    public ExpressionPage expressions(@RequestBody ExpressionPageRequest req) {
+        return service.getExpressions(req);
+    }
+
+    @DeleteMapping("/expressions/pit")
+    public void closePit(@RequestParam String pitId) {
+        service.closePit(pitId);
+    }
+}
+```
+
+UI flow: `GET /summary` once → `POST /expressions` with `{number, type, size}` → keep posting back the returned `pitId` + `searchAfter` untouched until `hasMore == false`.
+
+## Notes
+
+- **Endpoints used:** `POST /{index}/_search`, `POST /{index}/_pit?keep_alive=2m`, `POST /_search` (with `pit` in body), `DELETE /_pit` (with `{"id": ...}` body). All plain JSON, no client library.
+- **`insertionDate` → `Instant`:** Spring Boot registers `JavaTimeModule` automatically, so ISO-8601 strings or epoch millis in `_source` both deserialize. If your dates are stored in a custom format, add `@JsonFormat(pattern = "...")` on the field.
+- **Why `JsonNode` for aggregations:** aggregation responses vary by type; mapping them by path is simpler and less brittle than modelling every shape. Hits are fully typed.
+- **Why keep `sort` as `List<JsonNode>`:** the cursor contains a date (epoch millis) and `_shard_doc` (long). Passing it back verbatim avoids any type/format conversion issues.
+- **RestTemplate instead of RestClient** (older Spring): replace each call with
+  `restTemplate.postForObject(url, new HttpEntity<>(body, headers), EsSearchResponse.class)` and for close-PIT use `restTemplate.exchange(url, HttpMethod.DELETE, new HttpEntity<>(body, headers), Void.class)`.
+- **Security:** if your cluster uses API keys instead of basic auth, swap `setBasicAuth` for `h.set("Authorization", "ApiKey " + encodedKey)`.
