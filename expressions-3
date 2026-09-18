@@ -1,0 +1,156 @@
+Got it — so each document carries **either** a `phone` field **or** a `mobile` field (never both), and you want the service to (a) query the right one and (b) tell the UI which kind it is. Here's how to adjust the previous design.
+
+## 1. Mapping
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "phone":         { "type": "keyword", "copy_to": "number" },
+      "mobile":        { "type": "keyword", "copy_to": "number" },
+      "number":        { "type": "keyword" },
+      "expression":    { "type": "keyword" },
+      "dataSource":    { "type": "keyword" },
+      "insertionDate": { "type": "date" }
+    }
+  }
+}
+```
+
+- `copy_to: number` gives you one field to query when the caller doesn't know the type. Optional — if you can't reindex, use the `bool/should` variant below instead.
+- Type is derived from which field **exists**, so you don't need an extra `numberType` field (though adding one at index time is the cleanest long-term option).
+
+## 2. Enum + DTO
+
+```java
+public enum NumberType { PHONE, MOBILE }
+
+public record ExpressionDoc(
+        String phone,
+        String mobile,
+        String expression,
+        String dataSource,
+        Instant insertionDate) {
+
+    @JsonProperty("numberType")
+    public NumberType numberType() {
+        return mobile != null ? NumberType.MOBILE : NumberType.PHONE;
+    }
+
+    @JsonProperty("number")
+    public String number() {
+        return mobile != null ? mobile : phone;
+    }
+}
+
+public record PhoneSummary(
+        String number,
+        NumberType numberType,          // resolved type
+        long totalExpressions,
+        ExpressionDoc lastExpression,
+        List<DataSourceStats> byDataSource) {}
+```
+
+## 3. Query builder — discriminate by type
+
+```java
+private Query numberQuery(String number, @Nullable NumberType type) {
+    if (type == NumberType.PHONE)  return TermQuery.of(t -> t.field("phone").value(number))._toQuery();
+    if (type == NumberType.MOBILE) return TermQuery.of(t -> t.field("mobile").value(number))._toQuery();
+
+    // type unknown -> match either field
+    // Option A (with copy_to "number"):
+    // return TermQuery.of(t -> t.field("number").value(number))._toQuery();
+
+    // Option B (no reindex needed):
+    return BoolQuery.of(b -> b
+            .should(s -> s.term(t -> t.field("phone").value(number)))
+            .should(s -> s.term(t -> t.field("mobile").value(number)))
+            .minimumShouldMatch("1"))._toQuery();
+}
+```
+
+Routing still works: use the number string as the routing value regardless of which field it lands in.
+
+## 4. Summary — add a per-type breakdown
+
+```java
+public PhoneSummary getSummary(String number, @Nullable NumberType type) throws IOException {
+
+    SearchResponse<ExpressionDoc> resp = client.search(s -> s
+            .index(INDEX)
+            .routing(number)
+            .size(0)
+            .trackTotalHits(t -> t.enabled(true))
+            .query(numberQuery(number, type))
+            .aggregations("last", a -> a.topHits(th -> th.size(1)
+                    .sort(so -> so.field(f -> f.field("insertionDate").order(SortOrder.Desc)))))
+            .aggregations("byType", a -> a.filters(f -> f
+                    .keyed(true)
+                    .filters(fs -> fs.keyed(Map.of(
+                            "PHONE",  ExistsQuery.of(e -> e.field("phone"))._toQuery(),
+                            "MOBILE", ExistsQuery.of(e -> e.field("mobile"))._toQuery())))))
+            .aggregations("byDataSource", a -> a
+                    .terms(t -> t.field("dataSource").size(200))
+                    .aggregations("last", sa -> sa.topHits(th -> th.size(1)
+                            .sort(so -> so.field(f -> f.field("insertionDate").order(SortOrder.Desc)))))),
+            ExpressionDoc.class);
+
+    long total = resp.hits().total() != null ? resp.hits().total().value() : 0;
+    ExpressionDoc last = firstTopHit(resp.aggregations().get("last").topHits());
+
+    // resolve type: whichever bucket has docs (only one should)
+    Map<String, FiltersBucket> typeBuckets = resp.aggregations().get("byType").filters().buckets().keyed();
+    NumberType resolved = typeBuckets.get("MOBILE").docCount() > 0 ? NumberType.MOBILE
+                        : typeBuckets.get("PHONE").docCount()  > 0 ? NumberType.PHONE
+                        : type; // no hits -> echo back what caller asked
+
+    List<DataSourceStats> perSource = resp.aggregations().get("byDataSource")
+            .sterms().buckets().array().stream()
+            .map(b -> new DataSourceStats(b.key().stringValue(), b.docCount(),
+                    firstTopHit(b.aggregations().get("last").topHits())))
+            .toList();
+
+    return new PhoneSummary(number, resolved, total, last, perSource);
+}
+```
+
+If the same digits could theoretically exist as both a phone and a mobile, both buckets will be non-zero — in that case return both counts to the UI (e.g. `Map<NumberType, Long> countByType`) and let the user pick, or require `type` to be explicit.
+
+## 5. Paged list — just swap in the query
+
+```java
+public ExpressionPage getExpressions(String number, @Nullable NumberType type, int pageSize,
+                                     @Nullable String pitId, @Nullable List<String> searchAfter) throws IOException {
+    // ... same as before, replace the .query(...) line with:
+    //     .query(numberQuery(number, type))
+    // each ExpressionDoc already exposes numberType() for the UI
+}
+```
+
+## 6. Controller
+
+```java
+@GetMapping("/api/numbers/{number}/summary")
+public PhoneSummary summary(@PathVariable String number,
+                            @RequestParam(required = false) NumberType type) throws IOException {
+    return service.getSummary(number, type);
+}
+
+@GetMapping("/api/numbers/{number}/expressions")
+public ExpressionPage expressions(@PathVariable String number,
+                                  @RequestParam(required = false) NumberType type,
+                                  @RequestParam(defaultValue = "100") int size,
+                                  @RequestParam(required = false) String pitId,
+                                  @RequestParam(required = false) List<String> searchAfter) throws IOException {
+    return service.getExpressions(number, type, Math.min(size, 1000), pitId, searchAfter);
+}
+```
+
+Spring converts `?type=MOBILE` to the enum automatically. If the UI already knows the type (e.g. separate "phone" / "mobile" search boxes), always pass it — a single `term` on one field is cheaper than the `bool/should`, and you skip the `byType` resolution entirely.
+
+## Quick notes
+
+- **`exists` vs `numberType` field:** `exists` on a keyword field is fast (it uses doc values / norms), and scoped to ~50k docs it's negligible. But if you ever need to *aggregate across all numbers* by type, index an explicit `numberType` keyword instead.
+- **Normalisation:** make sure phone and mobile are stored in the same format (e.g. E.164, no spaces/dashes) or the `term` queries won't match. If they're not, add a `normalizer` on both keyword fields or clean the input in the service before querying.
+- **`copy_to` caveat:** `number` is only populated for docs indexed *after* the mapping change — existing 2B docs won't have it without a reindex/update-by-query, so use Option B until then.
