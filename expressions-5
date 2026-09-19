@@ -1,0 +1,113 @@
+Even better — then no runtime field or reindex is needed. `max`, `sort`, and `search_after` all work natively on a `date` field, so the query is simply this:
+
+## Final query
+
+```json
+GET my-index/_search
+{
+  "size": 0,
+  "timeout": "30s",
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "nationalCode": "1234567890" } }
+      ]
+    }
+  },
+  "aggs": {
+    "distinct_mobile_count": {
+      "cardinality": { "field": "mobile", "precision_threshold": 40000 }
+    },
+    "mobiles": {
+      "terms": {
+        "field": "mobile",
+        "size": 65000,
+        "shard_size": 65000,
+        "execution_hint": "map",
+        "order": { "latest_insert": "desc" }
+      },
+      "aggs": {
+        "latest_insert": { "max": { "field": "insertDateVal" } },
+        "data_sources": {
+          "terms": { "field": "dataSource", "size": 20 }
+        },
+        "page": { "bucket_sort": { "from": 0, "size": 100 } }
+      }
+    }
+  }
+}
+```
+
+What each piece does:
+
+| Part | Purpose |
+|---|---|
+| `bool.filter` on `nationalCode` | Restricts the doc set (≤ 50k) — no scoring |
+| `execution_hint: "map"` | Avoids building global ordinals for the high‑cardinality `mobile` field → fixes the timeout / 500 |
+| `terms` on `mobile` | One bucket per **distinct** mobile; `doc_count` = how many times it repeated |
+| `latest_insert` (`max`) | Newest `insertDateVal` for that mobile — the sort key |
+| `order: latest_insert desc` | Newest mobiles first (`asc` for oldest first) |
+| `data_sources` | Which `dataSource` values that mobile came from, with counts |
+| `bucket_sort` | Pagination: page N → `"from": N * 100` |
+| `cardinality` | Total distinct mobiles for the national code (exact up to 40k, ~<1% error beyond) |
+
+## Response shape
+
+```json
+"aggregations": {
+  "distinct_mobile_count": { "value": 3120 },
+  "mobiles": {
+    "buckets": [
+      {
+        "key": "09121110001",
+        "doc_count": 4,
+        "latest_insert": { "value": 1758265200000, "value_as_string": "2026-09-19T07:00:00.000Z" },
+        "data_sources": {
+          "buckets": [
+            { "key": "CRM",     "doc_count": 3 },
+            { "key": "Billing", "doc_count": 1 }
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+`value_as_string` uses the field's date `format`, so you get a readable date without extra work.
+
+## Optional extras
+
+**Earliest date as well** (e.g. "first seen"):
+
+```json
+"first_insert": { "min": { "field": "insertDateVal" } }
+```
+
+**Latest date per dataSource** — put a `max` inside `data_sources`:
+
+```json
+"data_sources": {
+  "terms": { "field": "dataSource", "size": 20 },
+  "aggs": { "latest": { "max": { "field": "insertDateVal" } } }
+}
+```
+
+**Restrict to a date range** — add to the filter:
+
+```json
+{ "range": { "insertDateVal": { "gte": "2026-01-01", "lt": "2026-10-01" } } }
+```
+
+**Filter by dataSource:**
+
+```json
+{ "terms": { "dataSource": ["CRM", "Billing"] } }
+```
+
+## Two things to verify
+
+1. **Accuracy with multiple shards.** Ordering buckets by a sub‑aggregation (`latest_insert`) is computed per shard and merged; with `shard_size` = `size` = 65000 every shard returns all its buckets, so the result is exact as long as a national code has fewer than 65k distinct mobiles. If your index has many shards, consider `routing` on `nationalCode` — it makes this query hit one shard only and dramatically faster.
+2. **`search.max_buckets`** (default 65,536). The `terms` buckets plus the nested `data_sources` buckets count toward this limit. If you get `too_many_buckets_exception`, either reduce `data_sources.size` (e.g. to the real number of sources you have, say 5–10) or raise the cluster setting: `PUT _cluster/settings { "persistent": { "search.max_buckets": 200000 } }`.
+
+If the collapse-based variant (real documents rather than buckets) is preferable for your client code, the one from my previous message (Fix C) works unchanged with a `date` field too — just remember it's limited to `from`/`size` ≤ 10,000.
