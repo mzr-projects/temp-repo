@@ -1,0 +1,207 @@
+That's expected behaviour of the current design, not a Redpanda problem. In Kafka/Redpanda a **group member = one consumer instance** (one `KafkaConsumer` object). Our pipeline creates exactly **one `KafkaReceiver` per topic per JVM**, so with one running app you get one member that owns *all* partitions of that topic. The parallelism you have is *inside* that member (`groupBy(partition)`), which Redpanda Console can't see.
+
+You get more members in one of two ways — and usually you want both:
+
+| Way | Members | Gives you |
+|---|---|---|
+| **A. Run more app instances** (pods/replicas) | 1 per instance per topic | HA + horizontal scaling — the "real" answer |
+| **B. Several consumers per topic inside one JVM** (`consumer-count`) | N per instance per topic | Isolation of poll loops, finer partition spread, and multiple members even on a single box |
+
+Remember: **members > partitions = idle members**. With 6 partitions, 3 replicas × 2 consumers = 6 members, one partition each — a good fit.
+
+---
+
+## 1. Add `consumerCount` to the SPI and config
+
+```java
+public interface TopicHandler<T> {
+    // ...
+    /** Number of KafkaConsumer instances (group members) this JVM starts for the topic. */
+    default int consumerCount() { return 1; }
+}
+```
+
+```java
+public record ConsumerSettings(
+        String groupId,
+        Integer partitionConcurrency,
+        Integer consumerCount,          // NEW – overrides handler.consumerCount()
+        Boolean enabled,
+        Map<String, String> properties) { /* … */ }
+```
+
+```yaml
+app:
+  consumers:
+    loan.requests:
+      group-id: loan-ncc-prod
+      consumer-count: 3         # 3 members from this JVM
+      partition-concurrency: 8
+    card.issued:
+      group-id: card-ncc-prod
+      consumer-count: 2
+```
+
+---
+
+## 2. Factory: one `ReceiverOptions` **per member**, with unique IDs
+
+Each member needs its own `client.id` (for metrics/logs) and — if you use static membership — its own **unique** `group.instance.id`. Two members with the same `group.instance.id` fence each other out, and you'd see exactly the "1 member" symptom.
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class ReceiverOptionsFactory {
+
+    private final KafkaProperties bootProps;
+    private final AppProperties app;
+    private final InstanceIdentity identity;     // stable per pod, see §4
+
+    public ResolvedConsumer resolve(TopicHandler<?> handler) {
+        var o = app.consumerFor(handler.topic());
+
+        String groupId   = o != null && o.groupId() != null ? o.groupId() : handler.consumerGroup();
+        int concurrency  = o != null && o.partitionConcurrency() != null ? o.partitionConcurrency() : app.kafka().defaultPartitionConcurrency();
+        int count        = o != null && o.consumerCount() != null ? o.consumerCount() : handler.consumerCount();
+        boolean enabled  = o == null || o.isEnabled();
+
+        Map<String, Object> base = new HashMap<>(bootProps.buildConsumerProperties());
+        base.putAll(handler.consumerOverrides());
+        if (o != null && o.properties() != null) base.putAll(o.properties());
+        base.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        base.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        base.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        base.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
+        base.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, CooperativeStickyAssignor.class.getName());
+
+        List<ReceiverOptions<String, byte[]>> members = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            Map<String, Object> cfg = new HashMap<>(base);
+            String memberId = groupId + "-" + identity.id() + "-" + i;         // unique per member
+            cfg.put(ConsumerConfig.CLIENT_ID_CONFIG, memberId);
+            if (identity.isStable()) {                                          // StatefulSet / fixed hostnames only
+                cfg.put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, memberId);
+            }
+            members.add(ReceiverOptions.<String, byte[]>create(cfg)
+                    .subscription(List.of(handler.topic()))
+                    .commitInterval(Duration.ofMillis(200))
+                    .commitBatchSize(10)
+                    .maxDeferredCommits(concurrency * 10)
+                    .addAssignListener(p -> log.info("[{}] assigned {}", memberId, p))
+                    .addRevokeListener(p -> log.info("[{}] revoked {}", memberId, p)));
+        }
+        return new ResolvedConsumer(handler.topic(), groupId, concurrency, enabled, members);
+    }
+
+    public record ResolvedConsumer(String topic, String groupId, int concurrency, boolean enabled,
+                                   List<ReceiverOptions<String, byte[]>> members) {}
+}
+```
+
+---
+
+## 3. Pipeline: start N receivers per topic, one `Disposable` per topic
+
+```java
+private <T> Disposable startStream(TopicHandler<T> handler, ResolvedConsumer rc) {
+    var composite = Disposables.composite();
+
+    for (int i = 0; i < rc.members().size(); i++) {
+        var options  = rc.members().get(i);
+        var memberId = (String) options.consumerProperty(ConsumerConfig.CLIENT_ID_CONFIG);
+
+        Disposable d = KafkaReceiver.create(options)
+            .receive()
+            .groupBy(rec -> rec.receiverOffset().topicPartition())
+            .flatMap(part -> part.concatMap(rec -> process(handler, rc.groupId(), rec)), rc.concurrency())
+            .retryWhen(Retry.backoff(Long.MAX_VALUE, Duration.ofSeconds(1)).maxBackoff(Duration.ofSeconds(30))
+                    .doBeforeRetry(s -> log.error("[{}] stream failed, restarting", memberId, s.failure())))
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe(v -> {}, e -> log.error("[{}] terminated", memberId, e));
+
+        composite.add(d);
+        log.info("Started member {} for topic={} group={}", memberId, rc.topic(), rc.groupId());
+    }
+    return composite;
+}
+```
+
+Everything else (`process`, idempotency store, DLT, ack semantics) is untouched — each member is just another instance of the same stream. `stopTopic()` disposes the composite, stopping all members of that topic at once.
+
+---
+
+## 4. Stable identity for static membership
+
+```java
+@Component
+public class InstanceIdentity {
+    private final String id;
+    private final boolean stable;
+
+    public InstanceIdentity(@Value("${app.instance-id:}") String configured) {
+        if (!configured.isBlank()) { id = configured; stable = true; }          // e.g. from StatefulSet ordinal
+        else { id = UUID.randomUUID().toString().substring(0, 8); stable = false; }
+    }
+    public String id() { return id; }
+    public boolean isStable() { return stable; }
+}
+```
+
+```yaml
+# k8s StatefulSet – pod name is national-code-checker-0, -1, -2 …
+env:
+  - name: APP_INSTANCE_ID
+    valueFrom: { fieldRef: { fieldPath: metadata.name } }
+```
+
+Rule: **`group.instance.id` only when the identity survives restarts**. For a plain Deployment or local runs, leave it off (random `client.id` only) — otherwise every restart with a *different* id keeps the old, dead member in the group until `session.timeout.ms`, and two pods that accidentally share an id fence each other.
+
+---
+
+## 5. Verify in Redpanda
+
+```bash
+# members, their client ids, and partition assignment
+rpk group describe loan-ncc-prod
+
+# partitions available to spread over
+rpk topic describe loan.requests
+```
+
+Expected with 1 JVM, `consumer-count: 3`, 6 partitions:
+
+```
+GROUP        loan-ncc-prod
+STATE        Stable
+MEMBERS      3
+TOPIC          PARTITION  ...  CLIENT-ID
+loan.requests  0,1        ...  loan-ncc-prod-a1b2c3d4-0
+loan.requests  2,3        ...  loan-ncc-prod-a1b2c3d4-1
+loan.requests  4,5        ...  loan-ncc-prod-a1b2c3d4-2
+```
+
+Scale to 2 JVMs → 6 members, one partition each. Add a 7th and it sits idle until you raise the partition count (`rpk topic add-partitions loan.requests --num 6`).
+
+---
+
+## 6. If you run several app instances and *still* see 1 member
+
+Check in this order:
+
+1. **Different group IDs per instance** — a previous version derived the group from the hostname or you have `spring.kafka.consumer.group-id` set differently per env. Both instances must resolve to the same `group-id`. `rpk group list` will show two groups if this is the problem.
+2. **Same `group.instance.id` on both instances** — the newer one replaces the older (the old one logs `FencedInstanceIdException`). Fix identity per §4.
+3. **Second instance can't reach the broker** — wrong `advertised listener` for Docker (`localhost:9092` inside a container points at itself). Look for `Connection to node -1 could not be established` in its logs.
+4. **Topic has 1 partition** — a second member joins but gets nothing; Console still shows 2 members, so if you see 1 this isn't it, but it's the next thing you'll hit.
+5. **Handler disabled** via `app.consumers.<topic>.enabled: false` on one profile.
+
+---
+
+### Rule of thumb for sizing
+
+```
+members(total) = replicas × consumer-count   ≤ partitions
+in-flight per member ≈ partition-concurrency (only matters when a member owns > 1 partition)
+```
+
+Start with `consumer-count: 1` and scale **replicas** for HA; use `consumer-count > 1` when a single pod must own many partitions and you want independent poll loops (so one slow partition's poll can't delay the others' heartbeats).
