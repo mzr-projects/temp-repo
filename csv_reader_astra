@@ -1,0 +1,1186 @@
+Yes—but **saving the last filename/line locally and enabling Kafka idempotence is not sufficient for exactly-once behavior**.
+
+The essential design is:
+
+> **Write the JSON records and their file checkpoint in the same Kafka transaction.**
+
+That removes the failure window between “Kafka received the data” and “the application saved its progress.” Kafka transactions and `read_committed` consumers provide the primitives needed for this design. They do not automatically make downstream database writes or API calls exactly once. ([kafka.apache.org](https://kafka.apache.org/41/design/design/?utm_source=openai))
+
+Below is a production-oriented Spring Boot implementation, with explicit operating assumptions. I cannot honestly certify untested code as production-ready for your environment; the failure tests and deployment requirements at the end are part of making it production-ready.
+
+## 1. Architecture and guarantees
+
+```text
+CSV directory
+    │
+    │ periodic discovery
+    ▼
+CSV parser
+    │
+    │ prepare a bounded batch of JSON records
+    ▼
+Kafka transaction
+    ├── JSON records → csv.events
+    └── checkpoint   → csv.checkpoints.orders
+               │
+               └── commit both, or neither
+```
+
+A checkpoint is maintained **per file**, not just for the “last file”:
+
+```json
+{
+  "version": 1,
+  "sourceId": "orders-directory",
+  "fileName": "orders-000123.csv",
+  "sha256": "e362...",
+  "nextRecord": 1500,
+  "completed": false
+}
+```
+
+`nextRecord: 1500` means that data records `0` through `1499` are committed.
+
+### Required operating contract
+
+This implementation assumes:
+
+1. **Files are immutable once published.**
+   - Write to `filename.csv.part`.
+   - Close and durably publish it using an atomic rename to `filename.csv`.
+   - The application ignores `.part` files.
+2. **Published filenames are unique and never reused.**
+3. **Files remain accessible until their completion checkpoint is committed.**
+4. **One active worker owns this directory/source.**
+   - Its Kafka transactional ID is stable across restarts.
+   - Do not assign a new transactional ID on every deployment.
+5. **The checkpoint topic is dedicated to this source**, has exactly one partition, and is never deleted or recreated.
+6. **Consumers use `isolation.level=read_committed`.**
+7. CSV files use UTF-8, a header row, and a consistent CSV dialect.
+
+These are correctness requirements, not optional tuning settings.
+
+**Record number, not physical line number:** quoted CSV fields can contain newlines. Apache Commons CSV explicitly distinguishes CSV records from physical lines. ([commons.apache.org](https://commons.apache.org/proper/commons-csv/apidocs/org/apache/commons/csv/CSVRecord.html?utm_source=openai))
+
+### What “exactly once” means here
+
+Under that contract:
+
+- A source record may be read and converted more than once after failures.
+- It appears **once as a committed event in Kafka**.
+- Aborted transaction records are not exposed to `read_committed` consumers.
+- A consumer can still reread a committed event after its own failure. Exactly-once downstream side effects require their own transactional or idempotent design. ([kafka.apache.org](https://kafka.apache.org/41/design/design/?utm_source=openai))
+
+---
+
+## 2. Dependencies
+
+The example uses Java 21, Spring Boot 4.1.1, Jackson 3, and Commons CSV 1.14.1. These are explicit example pins, not a claim that every dependency is the newest available patch. Boot 4 uses Jackson 3 by default. ([docs.spring.io](https://docs.spring.io/spring-boot/reference/web/index.html?utm_source=openai))
+
+I intentionally use the native Kafka producer inside Spring Boot. This gives the application direct ownership of **one producer with one fixed transactional ID**, without a transaction-producer pool.
+
+### `pom.xml`
+
+```xml
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="
+           http://maven.apache.org/POM/4.0.0
+           https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.1</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>csv-kafka-ingestor</artifactId>
+    <version>1.0.0</version>
+
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-csv</artifactId>
+            <version>1.14.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+---
+
+## 3. Configuration
+
+### `application.yml`
+
+```yaml
+spring:
+  application:
+    name: csv-kafka-ingestor
+
+  task:
+    scheduling:
+      pool:
+        size: 1
+
+ingest:
+  directory: ${CSV_DIRECTORY:/data/incoming}
+
+  # Must remain stable across restarts and deployments.
+  source-id: orders-directory
+
+  output-topic: csv.events
+
+  # Dedicated to this source. Exactly one partition.
+  checkpoint-topic: csv.checkpoints.orders
+
+  batch-rows: 500
+
+  # Soft batch target. A batch may exceed it by one record.
+  batch-bytes: 4194304
+
+  # Maximum serialized JSON event size.
+  max-record-bytes: 262144
+
+  scan-delay: 2s
+  recovery-timeout: 5m
+
+  kafka:
+    "[bootstrap.servers]": ${KAFKA_BOOTSTRAP_SERVERS}
+
+    # Supply through deployment secrets.
+    "[security.protocol]": SASL_SSL
+    "[sasl.mechanism]": SCRAM-SHA-512
+    "[sasl.jaas.config]": ${KAFKA_JAAS_CONFIG}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,csvSource
+
+server:
+  shutdown: graceful
+```
+
+For local development, use a separate profile with `security.protocol=PLAINTEXT` and remove the SASL settings.
+
+The custom readiness indicator below becomes unhealthy when ingestion stops. Spring Boot supports custom health indicators and configurable health groups. ([docs.spring.io](https://docs.spring.io/spring-boot/api/java/org/springframework/boot/health/contributor/HealthIndicator.html))
+
+---
+
+## 4. Application and configuration classes
+
+Put the following classes in `com.example.ingest`.
+
+### `IngestApplication.java`
+
+```java
+package com.example.ingest;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling
+@EnableConfigurationProperties(IngestProperties.class)
+public class IngestApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(IngestApplication.class, args);
+    }
+}
+```
+
+### `IngestProperties.java`
+
+```java
+package com.example.ingest;
+
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Map;
+import java.util.Objects;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+@ConfigurationProperties(prefix = "ingest")
+public record IngestProperties(
+        Path directory,
+        String sourceId,
+        String outputTopic,
+        String checkpointTopic,
+        int batchRows,
+        long batchBytes,
+        int maxRecordBytes,
+        Duration recoveryTimeout,
+        Map<String, String> kafka
+) {
+    public IngestProperties {
+        Objects.requireNonNull(directory, "ingest.directory is required");
+        Objects.requireNonNull(sourceId, "ingest.source-id is required");
+        Objects.requireNonNull(outputTopic, "ingest.output-topic is required");
+        Objects.requireNonNull(checkpointTopic,
+                "ingest.checkpoint-topic is required");
+        Objects.requireNonNull(recoveryTimeout,
+                "ingest.recovery-timeout is required");
+        Objects.requireNonNull(kafka, "ingest.kafka is required");
+
+        if (!sourceId.matches("[A-Za-z0-9._-]+")) {
+            throw new IllegalArgumentException("Invalid source-id");
+        }
+        if (outputTopic.isBlank()
+                || checkpointTopic.isBlank()
+                || outputTopic.equals(checkpointTopic)) {
+            throw new IllegalArgumentException(
+                    "Output and checkpoint topics must be distinct");
+        }
+        if (batchRows <= 0 || batchBytes <= 0 || maxRecordBytes <= 0) {
+            throw new IllegalArgumentException("Batch limits must be positive");
+        }
+        if (recoveryTimeout.isNegative() || recoveryTimeout.isZero()) {
+            throw new IllegalArgumentException(
+                    "Recovery timeout must be positive");
+        }
+        if (!kafka.containsKey("bootstrap.servers")) {
+            throw new IllegalArgumentException(
+                    "Kafka bootstrap.servers is required");
+        }
+
+        directory = directory.toAbsolutePath().normalize();
+        kafka = Map.copyOf(kafka);
+    }
+}
+```
+
+### `Checkpoint.java`
+
+```java
+package com.example.ingest;
+
+public record Checkpoint(
+        int version,
+        String sourceId,
+        String fileName,
+        String sha256,
+        long nextRecord,
+        boolean completed
+) {
+}
+```
+
+### `OutgoingRecord.java`
+
+```java
+package com.example.ingest;
+
+public record OutgoingRecord(String key, String json) {
+}
+```
+
+---
+
+## 5. Transactional Kafka writer and checkpoint recovery
+
+Two details are particularly important:
+
+1. Call `initTransactions()` **before recovering checkpoints**. It resolves transactions from the previous producer instance with the same transactional ID and fences older producer instances. ([kafka.apache.org](https://kafka.apache.org/40/javadoc/org/apache/kafka/clients/producer/KafkaProducer?utm_source=openai))
+2. Do not assume that one empty consumer poll means checkpoint recovery is complete. A `read_committed` consumer is constrained by the last stable offset. This implementation writes a committed recovery marker and reads the checkpoint partition until it observes that marker. ([kafka.apache.org](https://kafka.apache.org/40/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html))
+
+The recovery marker is an implementation choice that establishes an explicit recovery boundary.
+
+### `KafkaJournal.java`
+
+```java
+package com.example.ingest;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+
+import tools.jackson.databind.json.JsonMapper;
+
+public final class KafkaJournal implements AutoCloseable {
+
+    private static final String BARRIER_KEY = "__recovery_barrier";
+    private static final String FILE_PREFIX = "file:";
+
+    private final IngestProperties config;
+    private final JsonMapper json;
+    private final KafkaProducer<String, String> producer;
+
+    // Accessed only by the ingestion thread.
+    private final Map<String, Checkpoint> checkpoints = new HashMap<>();
+
+    public KafkaJournal(IngestProperties config, JsonMapper json) {
+        this.config = config;
+        this.json = json;
+
+        Map<String, Object> properties = commonProperties();
+
+        properties.put(
+                ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+                StringSerializer.class
+        );
+        properties.put(
+                ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+                StringSerializer.class
+        );
+
+        // Fixed logical-source identity, NOT a random instance UUID.
+        properties.put(
+                ProducerConfig.TRANSACTIONAL_ID_CONFIG,
+                "csv-ingest-v1-" + config.sourceId()
+        );
+
+        properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        properties.put(ProducerConfig.ACKS_CONFIG, "all");
+        properties.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
+        properties.put(
+                ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION,
+                5
+        );
+
+        properties.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "zstd");
+        properties.put(ProducerConfig.LINGER_MS_CONFIG, 5);
+
+        properties.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30_000);
+        properties.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120_000);
+        properties.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 120_000);
+        properties.put(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG, 180_000);
+
+        this.producer = new KafkaProducer<>(properties);
+    }
+
+    public void initialize() throws Exception {
+        validateTopics();
+
+        // Resolve/fence the old producer BEFORE restoring source progress.
+        producer.initTransactions();
+
+        String barrier = UUID.randomUUID().toString();
+
+        producer.beginTransaction();
+        producer.send(new ProducerRecord<>(
+                config.checkpointTopic(),
+                0,
+                BARRIER_KEY,
+                barrier
+        ));
+        producer.commitTransaction();
+
+        restoreUntil(barrier);
+    }
+
+    public Checkpoint checkpoint(String fileName) {
+        return checkpoints.get(fileName);
+    }
+
+    public Collection<Checkpoint> checkpoints() {
+        return List.copyOf(checkpoints.values());
+    }
+
+    public void commit(
+            List<OutgoingRecord> records,
+            Checkpoint checkpoint
+    ) {
+        // Serialize before starting the transaction.
+        String checkpointJson = json.writeValueAsString(checkpoint);
+
+        producer.beginTransaction();
+
+        for (OutgoingRecord record : records) {
+            producer.send(new ProducerRecord<>(
+                    config.outputTopic(),
+                    record.key(),
+                    record.json()
+            ));
+        }
+
+        producer.send(new ProducerRecord<>(
+                config.checkpointTopic(),
+                0,
+                FILE_PREFIX + checkpoint.fileName(),
+                checkpointJson
+        ));
+
+        // This also waits for pending sends and surfaces send failures.
+        producer.commitTransaction();
+
+        // Update local progress ONLY after successful commit.
+        checkpoints.put(checkpoint.fileName(), checkpoint);
+    }
+
+    private void restoreUntil(String expectedBarrier) {
+        Map<String, Object> properties = commonProperties();
+
+        properties.put(
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+                StringDeserializer.class
+        );
+        properties.put(
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+                StringDeserializer.class
+        );
+        properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        properties.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+        properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
+        properties.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, false);
+        properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 1000);
+        properties.put(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 60_000);
+
+        TopicPartition partition =
+                new TopicPartition(config.checkpointTopic(), 0);
+
+        long started = System.nanoTime();
+        long timeoutNanos = config.recoveryTimeout().toNanos();
+
+        try (KafkaConsumer<String, String> consumer =
+                     new KafkaConsumer<>(properties)) {
+
+            // Manual assignment: no group subscription or group commits.
+            consumer.assign(List.of(partition));
+            consumer.seekToBeginning(List.of(partition));
+
+            while (System.nanoTime() - started < timeoutNanos) {
+                var records = consumer.poll(Duration.ofMillis(500));
+
+                for (var record : records) {
+                    if (BARRIER_KEY.equals(record.key())) {
+                        if (expectedBarrier.equals(record.value())) {
+                            return;
+                        }
+                        continue;
+                    }
+
+                    if (record.key() == null
+                            || !record.key().startsWith(FILE_PREFIX)
+                            || record.value() == null) {
+                        throw new IllegalStateException(
+                                "Unexpected checkpoint record or tombstone"
+                        );
+                    }
+
+                    Checkpoint checkpoint =
+                            json.readValue(record.value(), Checkpoint.class);
+
+                    validateCheckpoint(record.key(), checkpoint);
+                    checkpoints.put(checkpoint.fileName(), checkpoint);
+                }
+            }
+        }
+
+        throw new IllegalStateException(
+                "Checkpoint recovery timed out before reaching its barrier"
+        );
+    }
+
+    private void validateCheckpoint(String key, Checkpoint checkpoint) {
+        if (checkpoint.version() != 1
+                || !config.sourceId().equals(checkpoint.sourceId())
+                || checkpoint.fileName() == null
+                || checkpoint.fileName().isBlank()
+                || checkpoint.sha256() == null
+                || !checkpoint.sha256().matches("[0-9a-f]{64}")
+                || checkpoint.nextRecord() < 0
+                || !key.equals(FILE_PREFIX + checkpoint.fileName())) {
+            throw new IllegalStateException("Invalid checkpoint");
+        }
+
+        // Only direct children of the configured directory are supported.
+        var resolved = config.directory()
+                .resolve(checkpoint.fileName())
+                .normalize();
+
+        if (!config.directory().equals(resolved.getParent())) {
+            throw new IllegalStateException(
+                    "Checkpoint contains an invalid filename"
+            );
+        }
+    }
+
+    private void validateTopics() throws Exception {
+        try (Admin admin = Admin.create(commonProperties())) {
+            var topics = admin.describeTopics(List.of(
+                    config.outputTopic(),
+                    config.checkpointTopic()
+            )).allTopicNames().get(30, TimeUnit.SECONDS);
+
+            if (topics.get(config.checkpointTopic()).partitions().size() != 1) {
+                throw new IllegalStateException(
+                        "Checkpoint topic must have exactly one partition"
+                );
+            }
+
+            ConfigResource resource = new ConfigResource(
+                    ConfigResource.Type.TOPIC,
+                    config.checkpointTopic()
+            );
+
+            var topicConfig = admin.describeConfigs(List.of(resource))
+                    .all()
+                    .get(30, TimeUnit.SECONDS)
+                    .get(resource);
+
+            String cleanupPolicy =
+                    topicConfig.get("cleanup.policy").value();
+
+            if (!"compact".equals(cleanupPolicy.trim())) {
+                throw new IllegalStateException(
+                        "Checkpoint topic must use cleanup.policy=compact"
+                );
+            }
+        }
+    }
+
+    private Map<String, Object> commonProperties() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.putAll(config.kafka());
+        return properties;
+    }
+
+    @Override
+    public void close() {
+        producer.close(Duration.ofSeconds(10));
+    }
+}
+```
+
+**Error policy:** if a transaction operation throws, this application stops ingestion rather than reusing its in-memory position. After restart, it resolves the previous transaction and recovers authoritative progress from Kafka.
+
+That includes an ambiguous `commitTransaction()` result: the application must not assume “exception means nothing committed.” Kafka documents both transaction initialization recovery and commit behavior. ([kafka.apache.org](https://kafka.apache.org/40/javadoc/org/apache/kafka/clients/producer/KafkaProducer?utm_source=openai))
+
+---
+
+## 6. CSV discovery, conversion, and resumable processing
+
+This implementation:
+
+- Rescans the directory periodically.
+- Does not depend on filesystem watch notifications.
+- Keeps checkpoints for all files.
+- Handles quoted fields, embedded newlines, and an optional UTF-8 BOM.
+- Rejects missing/duplicate headers and inconsistent row widths.
+- Hashes each newly opened/resumed file.
+- Skips already committed records when resuming.
+- Prepares JSON before opening a Kafka transaction.
+- Stops on malformed input instead of silently skipping data.
+
+### `CsvSource.java`
+
+```java
+package com.example.ingest;
+
+import java.io.IOException;
+import java.io.PushbackReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import jakarta.annotation.PreDestroy;
+
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
+import org.apache.commons.csv.DuplicateHeaderMode;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.springframework.boot.health.contributor.Health;
+import org.springframework.boot.health.contributor.HealthIndicator;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import tools.jackson.databind.json.JsonMapper;
+
+@Component("csvSource")
+public class CsvSource implements HealthIndicator {
+
+    private static final Logger log =
+            LoggerFactory.getLogger(CsvSource.class);
+
+    private static final CSVFormat CSV_FORMAT =
+            CSVFormat.RFC4180.builder()
+                    .setHeader()
+                    .setSkipHeaderRecord(true)
+                    .setAllowMissingColumnNames(false)
+                    .setDuplicateHeaderMode(DuplicateHeaderMode.DISALLOW)
+                    .setIgnoreEmptyLines(false)
+                    .get();
+
+    private final IngestProperties config;
+    private final JsonMapper json;
+
+    private final Counter committedRecords;
+    private final Counter committedTransactions;
+    private final Counter failures;
+
+    private KafkaJournal journal;
+
+    private volatile boolean stopping;
+    private volatile boolean initialized;
+    private volatile Throwable failure;
+
+    public CsvSource(
+            IngestProperties config,
+            JsonMapper json,
+            MeterRegistry metrics
+    ) {
+        this.config = config;
+        this.json = json;
+
+        this.committedRecords =
+                metrics.counter("csv.ingest.records.committed");
+        this.committedTransactions =
+                metrics.counter("csv.ingest.transactions.committed");
+        this.failures =
+                metrics.counter("csv.ingest.failures");
+    }
+
+    @Scheduled(fixedDelayString = "${ingest.scan-delay:2s}")
+    public synchronized void scan() {
+        if (stopping || failure != null) {
+            return;
+        }
+
+        try {
+            if (!Files.isDirectory(config.directory())) {
+                throw new IOException(
+                        "Input directory is unavailable: " + config.directory()
+                );
+            }
+
+            if (journal == null) {
+                journal = new KafkaJournal(config, json);
+                journal.initialize();
+                initialized = true;
+
+                log.info("Recovered checkpoints for source={}",
+                        config.sourceId());
+            }
+
+            verifyUnfinishedFilesExist();
+
+            List<Path> files;
+            try (var stream = Files.list(config.directory())) {
+                files = stream
+                        .filter(path ->
+                                path.getFileName().toString().endsWith(".csv"))
+                        .filter(path -> Files.isRegularFile(
+                                path, LinkOption.NOFOLLOW_LINKS))
+                        .sorted()
+                        .toList();
+            }
+
+            for (Path file : files) {
+                if (stopping) {
+                    return;
+                }
+
+                String name = file.getFileName().toString();
+                Checkpoint checkpoint = journal.checkpoint(name);
+
+                if (checkpoint != null && checkpoint.completed()) {
+                    continue;
+                }
+
+                processFile(file, checkpoint);
+            }
+
+        } catch (Exception exception) {
+            // Fail closed. Do not restart from possibly stale local state.
+            failure = exception;
+            failures.increment();
+
+            log.error(
+                    "CSV ingestion stopped. Restart only after resolving "
+                    + "the failure; recovery will use Kafka checkpoints.",
+                    exception
+            );
+
+            closeJournal();
+        }
+    }
+
+    private void processFile(
+            Path file,
+            Checkpoint previous
+    ) throws Exception {
+
+        String fileName = file.getFileName().toString();
+        String sha256 = sha256(file);
+
+        if (previous != null && !sha256.equals(previous.sha256())) {
+            throw new IllegalStateException(
+                    "Previously checkpointed file changed: " + fileName
+            );
+        }
+
+        long nextRecord = previous == null ? 0 : previous.nextRecord();
+
+        String fileId = config.sourceId() + ":" +
+                Base64.getUrlEncoder()
+                        .withoutPadding()
+                        .encodeToString(
+                                fileName.getBytes(StandardCharsets.UTF_8)
+                        );
+
+        try (PushbackReader reader = openUtf8(file);
+             CSVParser parser = CSV_FORMAT.parse(reader)) {
+
+            List<String> headers = parser.getHeaderNames();
+
+            if (headers.isEmpty()
+                    || headers.stream().anyMatch(String::isBlank)) {
+                throw new IllegalStateException(
+                        "Missing or blank CSV headers: " + fileName
+                );
+            }
+
+            var iterator = parser.iterator();
+
+            // Resume by logical CSV record, not by physical line.
+            for (long skipped = 0; skipped < nextRecord; skipped++) {
+                if (stopping) {
+                    return;
+                }
+
+                if (!iterator.hasNext()) {
+                    throw new IllegalStateException(
+                            "Checkpoint is beyond EOF: " + fileName
+                    );
+                }
+
+                iterator.next();
+            }
+
+            while (!stopping) {
+                List<OutgoingRecord> batch =
+                        new ArrayList<>(config.batchRows());
+
+                long batchBytes = 0;
+
+                while (batch.size() < config.batchRows()
+                        && batchBytes < config.batchBytes()
+                        && iterator.hasNext()) {
+
+                    CSVRecord csv = iterator.next();
+
+                    if (!csv.isConsistent()) {
+                        throw new IllegalStateException(
+                                "Column count mismatch: file=" + fileName
+                                + ", record=" + nextRecord
+                        );
+                    }
+
+                    Map<String, String> data = new LinkedHashMap<>();
+
+                    for (int column = 0; column < headers.size(); column++) {
+                        data.put(headers.get(column), csv.get(column));
+                    }
+
+                    String eventId = fileId + ":" + nextRecord;
+
+                    Map<String, Object> event = new LinkedHashMap<>();
+                    event.put("schemaVersion", 1);
+                    event.put("eventId", eventId);
+                    event.put("sourceId", config.sourceId());
+                    event.put("fileName", fileName);
+                    event.put("fileSha256", sha256);
+                    event.put("recordIndex", nextRecord);
+                    event.put("data", data);
+
+                    String payload = json.writeValueAsString(event);
+
+                    int recordBytes = payload
+                            .getBytes(StandardCharsets.UTF_8).length;
+
+                    if (recordBytes > config.maxRecordBytes()) {
+                        throw new IllegalStateException(
+                                "JSON event exceeds configured limit: file="
+                                + fileName + ", record=" + nextRecord
+                        );
+                    }
+
+                    batch.add(new OutgoingRecord(eventId, payload));
+                    batchBytes += recordBytes;
+                    nextRecord++;
+                }
+
+                boolean completed = !iterator.hasNext();
+
+                if (stopping) {
+                    // Prepared but uncommitted records will be reread.
+                    return;
+                }
+
+                Checkpoint checkpoint = new Checkpoint(
+                        1,
+                        config.sourceId(),
+                        fileName,
+                        sha256,
+                        nextRecord,
+                        completed
+                );
+
+                // Also handles header-only files: zero records + completed.
+                journal.commit(batch, checkpoint);
+
+                committedRecords.increment(batch.size());
+                committedTransactions.increment();
+
+                log.info(
+                        "Committed file={} nextRecord={} completed={} rows={}",
+                        fileName,
+                        nextRecord,
+                        completed,
+                        batch.size()
+                );
+
+                if (completed) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private void verifyUnfinishedFilesExist() {
+        for (Checkpoint checkpoint : journal.checkpoints()) {
+            if (checkpoint.completed()) {
+                continue;
+            }
+
+            Path file = config.directory().resolve(checkpoint.fileName());
+
+            if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IllegalStateException(
+                        "Unfinished source file is missing: "
+                        + checkpoint.fileName()
+                );
+            }
+        }
+    }
+
+    private static PushbackReader openUtf8(Path file) throws IOException {
+        PushbackReader reader = new PushbackReader(
+                Files.newBufferedReader(file, StandardCharsets.UTF_8),
+                1
+        );
+
+        try {
+            int first = reader.read();
+
+            if (first != -1 && first != '\uFEFF') {
+                reader.unread(first);
+            }
+
+            return reader;
+        } catch (IOException | RuntimeException exception) {
+            reader.close();
+            throw exception;
+        }
+    }
+
+    private String sha256(Path file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+
+        try (var input = Files.newInputStream(file)) {
+            byte[] buffer = new byte[64 * 1024];
+
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                if (stopping) {
+                    throw new IOException("Stopping while hashing file");
+                }
+
+                digest.update(buffer, 0, count);
+            }
+        }
+
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    @Override
+    public Health health() {
+        Throwable currentFailure = failure;
+
+        if (currentFailure != null) {
+            return Health.down()
+                    .withDetail("state", "FAILED")
+                    .withDetail(
+                            "errorType",
+                            currentFailure.getClass().getSimpleName()
+                    )
+                    .build();
+        }
+
+        if (!initialized || stopping) {
+            return Health.outOfService()
+                    .withDetail("state", stopping ? "STOPPING" : "RECOVERING")
+                    .build();
+        }
+
+        return Health.up()
+                .withDetail("sourceId", config.sourceId())
+                .build();
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        stopping = true;
+
+        // Let the owner finish/exit its current bounded transaction.
+        synchronized (this) {
+            closeJournal();
+        }
+    }
+
+    private void closeJournal() {
+        if (journal == null) {
+            return;
+        }
+
+        try {
+            journal.close();
+        } catch (Exception closeFailure) {
+            log.warn("Error closing Kafka producer", closeFailure);
+        } finally {
+            journal = null;
+        }
+    }
+}
+```
+
+### Example output
+
+Input:
+
+```csv
+order_id,customer,amount
+101,Alice,19.95
+102,Bob,42.00
+```
+
+Output event:
+
+```json
+{
+  "schemaVersion": 1,
+  "eventId": "orders-directory:b3JkZXJzLTAwMDEyMy5jc3Y:0",
+  "sourceId": "orders-directory",
+  "fileName": "orders-000123.csv",
+  "fileSha256": "e362...",
+  "recordIndex": 0,
+  "data": {
+    "order_id": "101",
+    "customer": "Alice",
+    "amount": "19.95"
+  }
+}
+```
+
+CSV values intentionally remain strings. Add explicit schema-based conversion if `amount` must be a decimal, dates must be validated, and so on.
+
+---
+
+## 7. Kafka topic setup
+
+Provision the topics through infrastructure automation, not implicitly from the application.
+
+Example for a three-broker environment:
+
+```bash
+kafka-topics.sh \
+  --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" \
+  --command-config admin.properties \
+  --create \
+  --topic csv.events \
+  --partitions 6 \
+  --replication-factor 3 \
+  --config min.insync.replicas=2 \
+  --config unclean.leader.election.enable=false
+
+kafka-topics.sh \
+  --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" \
+  --command-config admin.properties \
+  --create \
+  --topic csv.checkpoints.orders \
+  --partitions 1 \
+  --replication-factor 3 \
+  --config cleanup.policy=compact \
+  --config retention.ms=-1 \
+  --config retention.bytes=-1 \
+  --config min.insync.replicas=2 \
+  --config unclean.leader.election.enable=false
+```
+
+The checkpoint topic must use **`compact`, not `compact,delete`**. Compaction retains the latest value for each key; adding deletion retention can remove the state needed to prevent reprocessing. Do not tombstone completed-file checkpoints while those file identities might reappear. ([kafka.apache.org](https://kafka.apache.org/40/generated/topic_config.html?utm_source=openai))
+
+Also require:
+
+- Broker-side automatic topic creation disabled.
+- Transaction-state topic replication appropriate for production.
+- `transaction.max.timeout.ms` at least `180000` for the example configuration.
+- ACLs restricting checkpoint writes and the transactional ID to this application.
+- Output-topic retention matched to your downstream recovery requirements.
+
+Kafka validates producer transaction timeouts against the broker maximum, and its production transaction defaults assume replicated transaction state. ([kafka.apache.org](https://kafka.apache.org/26/configuration/producer-configs/?utm_source=openai))
+
+### Downstream consumers
+
+For a Spring Kafka consumer:
+
+```yaml
+spring:
+  kafka:
+    consumer:
+      properties:
+        isolation.level: read_committed
+```
+
+Without this, consumers can see records from aborted transactions. ([kafka.apache.org](https://kafka.apache.org/41/design/design/?utm_source=openai))
+
+---
+
+## 8. Failure behavior
+
+The following is the intended behavior of this implementation:
+
+| Failure point | Recovery behavior |
+|---|---|
+| Before a transaction starts | Reread the uncommitted batch |
+| During event publishing | Previous checkpoint remains authoritative unless the transaction committed |
+| After sending events but before sending checkpoint | Transaction cannot commit a valid batch through this code path |
+| During commit, outcome unknown | Stop; restart, initialize transactions, and recover checkpoint |
+| After commit but before updating the local map | Kafka checkpoint already contains the progress |
+| After final commit but before the next scan | Completed-file checkpoint prevents reprocessing |
+| New file appears after a directory scan | Discovered on a subsequent scan |
+| Incomplete file disappears | Stop and report unhealthy |
+| Resumed file has different contents | Stop and report unhealthy |
+| Malformed CSV | Stop without advancing past the failed batch |
+
+### Important deployment decisions
+
+**Restart supervision**
+
+The code deliberately fails closed and exposes unhealthy readiness; it does **not** automatically restart itself.
+
+Configure your supervisor to restart a failed ingestion worker with backoff, or provide an operational restart procedure. For Kubernetes, readiness alone does not restart containers; if you use the custom indicator in a restart probe, allow sufficient startup/recovery time and avoid restart storms during Kafka outages.
+
+**Single active owner**
+
+Run one active instance for this source. Kafka fencing protects against stale producers, but it is not a complete leader-election or availability strategy. Two supervisors continually restarting competing instances can repeatedly fence one another. Stable transactional IDs are what enable cross-instance transaction recovery and fencing. ([kafka.apache.org](https://kafka.apache.org/40/javadoc/org/apache/kafka/clients/producer/KafkaProducer?utm_source=openai))
+
+**Input publication**
+
+Do not infer readiness from “file size has not changed for five seconds.” Make atomic publication part of the upstream contract. Hashing detects changes between processing attempts; it is not protection against a writer mutating a file concurrently during processing.
+
+**Malformed records**
+
+The example stops rather than silently losing data. If you need a dead-letter topic, publish the rejected logical record and its checkpoint advancement **in the same transaction**. Structural CSV corruption may make locating the next record unsafe, so that usually requires file-level quarantine.
+
+**Resource limits**
+
+The batch limits bound retained serialized events, but the parser must first materialize each CSV record. For untrusted input, use parser-level field/column limits or enforce those limits at the trusted publishing boundary. The JSON-size check alone is not a defense against a malicious multi-gigabyte field.
+
+**Large directories and files**
+
+This reference keeps one checkpoint per file in memory and lists/sorts the directory. For millions of files, use directory sharding and a disk-backed state index.
+
+Recovery currently hashes the file and reparses committed records. This is correct but can be slow for very large files. Optimize with parser-aware byte-offset checkpoints only after preserving encoding, header, and multiline-record correctness.
+
+**Ordering**
+
+The example keys Kafka events by `eventId`, distributing records across partitions. If you require per-file ordering, use `fileId` as the Kafka key and retain `eventId` in the payload.
+
+### Required failure tests before deployment
+
+Run integration tests against real Kafka, including:
+
+1. Kill the JVM midway through a batch.
+2. Kill it immediately after broker commit but before local state update.
+3. Interrupt the network during `commitTransaction()`.
+4. Restart with the same transactional ID.
+5. Start an overlapping instance and verify fencing.
+6. Add a file whose name sorts before existing files.
+7. Test embedded newlines, BOMs, duplicate headers, invalid UTF-8, and oversized records.
+8. Remove or modify an unfinished file.
+9. Recover after checkpoint-topic compaction.
+10. Consume with `read_committed` and assert every expected `eventId` appears exactly once.
+
+**The key recommendation is to make Kafka—not a local text file or a separately committed database row—the authoritative checkpoint store, and commit each checkpoint atomically with its output records.**
