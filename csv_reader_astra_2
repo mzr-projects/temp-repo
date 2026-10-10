@@ -1,0 +1,593 @@
+Yes. **You can store the file checkpoint in PostgreSQL**, but preserving your exactly-once requirement means changing the architecture—not simply replacing the Kafka checkpoint write with a SQL update.
+
+My recommendation is:
+
+> **Atomically save the JSON events and the checkpoint in PostgreSQL, then publish the events using a transactional outbox and Debezium.**
+
+## 1. Why a direct PostgreSQL checkpoint is not enough
+
+This approach is unsafe:
+
+```java
+sendRecordsToKafka();
+saveCheckpointToPostgres();
+```
+
+If Kafka commits and the application crashes before PostgreSQL commits, the application resends those records after restarting.
+
+Reversing the order risks skipping records instead.
+
+Spring can synchronize database and Kafka transactions, but they still commit separately; Spring explicitly documents the possibility that the second commit fails after the first succeeds. **`@Transactional` does not make PostgreSQL and Kafka one atomic transaction.** ([docs.spring.io](https://docs.spring.io/spring-kafka/reference/kafka/transactions.html))
+
+## 2. Recommended architecture
+
+```mermaid
+flowchart LR
+    F["Immutable CSV files"] --> S["Spring Boot reader"]
+
+    subgraph PG["One PostgreSQL transaction"]
+        O["Insert JSON events into outbox"]
+        C["Update file checkpoint"]
+    end
+
+    S --> O
+    S --> C
+    O --> D["Debezium + Kafka Connect"]
+    D --> K["Kafka topic"]
+```
+
+Your application now does this:
+
+```text
+Read CSV batch
+    ↓
+BEGIN PostgreSQL transaction
+    Insert JSON events into outbox
+    Update that file's checkpoint
+COMMIT
+```
+
+It **does not send directly to Kafka**. Debezium handles publication from the outbox. This is the purpose of the transactional outbox pattern: keeping database state and the events representing that state consistent. ([debezium.io](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html))
+
+### Exactly-once boundaries
+
+| Boundary | Required mechanism |
+|---|---|
+| CSV → PostgreSQL | Outbox inserts and checkpoint update in one database transaction |
+| PostgreSQL → Kafka | Debezium on Kafka Connect with source exactly-once support enabled |
+| Kafka → external side effects | Transactional or idempotent downstream processing |
+
+**An outbox alone is not exactly-once Kafka delivery.** Debezium is ordinarily at-least-once. Its PostgreSQL connector supports participating in Kafka Connect’s source exactly-once mechanism, which must be explicitly enabled. Debezium also documents correctness caveats around the underlying transaction implementation, so validate your deployed versions with failure tests. ([debezium.io](https://debezium.io/documentation/reference/stable/configuration/eos.html))
+
+Your **CSV checkpoint lives in PostgreSQL**. Kafka Connect still keeps its own CDC offsets in Kafka internal topics; these are separate from the filename/record checkpoint. ([kafka.apache.org](https://kafka.apache.org/41/configuration/kafka-connect-configs/))
+
+---
+
+## 3. PostgreSQL schema
+
+Apply this through your database migration system.
+
+```sql
+CREATE TABLE csv_checkpoint (
+    source_id       text        NOT NULL,
+    file_name       text        NOT NULL,
+    sha256          text        NOT NULL
+                                CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    next_record     bigint      NOT NULL DEFAULT 0
+                                CHECK (next_record >= 0),
+    completed       boolean     NOT NULL DEFAULT false,
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (source_id, file_name)
+);
+
+CREATE TABLE ingest_outbox (
+    id              text        PRIMARY KEY,
+
+    -- Standard Debezium outbox routing fields.
+    aggregatetype   text        NOT NULL,
+    aggregateid     text        NOT NULL,
+    type            text        NOT NULL,
+    payload         jsonb       NOT NULL,
+
+    -- Source identity and ordering.
+    source_id       text        NOT NULL,
+    file_name       text        NOT NULL,
+    record_index    bigint      NOT NULL CHECK (record_index >= 0),
+
+    created_at      timestamptz NOT NULL DEFAULT now(),
+
+    UNIQUE (source_id, file_name, record_index),
+
+    FOREIGN KEY (source_id, file_name)
+        REFERENCES csv_checkpoint (source_id, file_name)
+);
+
+CREATE INDEX csv_checkpoint_unfinished_idx
+    ON csv_checkpoint (source_id, file_name)
+    WHERE completed = false;
+```
+
+For this implementation:
+
+- `next_record` is the next **logical CSV data record** to read.
+- `completed=true` means the whole file has been **durably staged in PostgreSQL**.
+- It does **not** mean Debezium has already published the whole file to Kafka.
+- Event IDs remain deterministic, using the scheme from the previous implementation.
+
+---
+
+## 4. Dependencies and configuration
+
+Keep the CSV parser, Spring Boot application, and actuator dependencies from the previous implementation. Add:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-jdbc</artifactId>
+</dependency>
+
+<dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>runtime</scope>
+</dependency>
+```
+
+Add the datasource configuration:
+
+```yaml
+spring:
+  datasource:
+    # Include your deployment's TLS settings in this URL.
+    url: ${POSTGRES_JDBC_URL}
+    username: ${POSTGRES_USERNAME}
+    password: ${POSTGRES_PASSWORD}
+
+    hikari:
+      maximum-pool-size: 5
+      connection-timeout: 10000
+      validation-timeout: 5000
+
+ingest:
+  source-id: orders-directory
+```
+
+The CSV application no longer needs its own Kafka producer configuration. Kafka credentials belong to the separately deployed Kafka Connect workers.
+
+---
+
+## 5. PostgreSQL checkpoint and outbox implementation
+
+Reuse the previous `Checkpoint` and `OutgoingRecord` records:
+
+```java
+public record Checkpoint(
+        int version,
+        String sourceId,
+        String fileName,
+        String sha256,
+        long nextRecord,
+        boolean completed
+) {}
+
+public record OutgoingRecord(String key, String json) {}
+```
+
+Replace `KafkaJournal` with the following Spring-managed component.
+
+The database transaction locks the checkpoint row, verifies that the batch starts at the current position, inserts the events, and advances the checkpoint. PostgreSQL’s `FOR UPDATE` lock serializes competing updates to the same checkpoint. ([postgresql.org](https://www.postgresql.org/docs/17/explicit-locking.html?utm_source=openai))
+
+### `PostgresJournal.java`
+
+```java
+package com.example.ingest;
+
+import java.nio.charset.StandardCharsets;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+
+import javax.sql.DataSource;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.support.JdbcTransactionManager;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
+
+@Component
+public class PostgresJournal {
+
+    private final JdbcTemplate jdbc;
+    private final TransactionTemplate transaction;
+    private final String sourceId;
+
+    public PostgresJournal(
+            DataSource dataSource,
+            @Value("${ingest.source-id}") String sourceId
+    ) {
+        this.jdbc = new JdbcTemplate(dataSource);
+        this.sourceId = sourceId;
+
+        // Explicitly a JDBC transaction manager, not a Kafka manager.
+        this.transaction = new TransactionTemplate(
+                new JdbcTransactionManager(dataSource)
+        );
+
+        this.transaction.setIsolationLevel(
+                TransactionDefinition.ISOLATION_READ_COMMITTED
+        );
+        this.transaction.setTimeout(30);
+    }
+
+    public Checkpoint checkpoint(String fileName) {
+        List<Checkpoint> results = jdbc.query("""
+                SELECT source_id, file_name, sha256,
+                       next_record, completed
+                FROM csv_checkpoint
+                WHERE source_id = ? AND file_name = ?
+                """,
+                PostgresJournal::mapCheckpoint,
+                sourceId,
+                fileName
+        );
+
+        return results.isEmpty() ? null : results.getFirst();
+    }
+
+    public List<Checkpoint> checkpoints() {
+        return jdbc.query("""
+                SELECT source_id, file_name, sha256,
+                       next_record, completed
+                FROM csv_checkpoint
+                WHERE source_id = ?
+                """,
+                PostgresJournal::mapCheckpoint,
+                sourceId
+        );
+    }
+
+    public void commit(
+            List<OutgoingRecord> records,
+            Checkpoint next
+    ) {
+        // Defensive copy: caller must not change the batch during commit.
+        List<OutgoingRecord> batch = List.copyOf(records);
+
+        if (next.version() != 1
+                || !sourceId.equals(next.sourceId())
+                || next.nextRecord() < batch.size()
+                || next.sha256() == null
+                || !next.sha256().matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("Invalid checkpoint");
+        }
+
+        if (batch.isEmpty() && !next.completed()) {
+            throw new IllegalArgumentException(
+                    "An empty batch must complete the file"
+            );
+        }
+
+        long expectedPosition = next.nextRecord() - batch.size();
+
+        String fileId = sourceId + ":" +
+                Base64.getUrlEncoder()
+                        .withoutPadding()
+                        .encodeToString(
+                                next.fileName().getBytes(StandardCharsets.UTF_8)
+                        );
+
+        // Prepare parameters before acquiring database locks.
+        List<Object[]> inserts = new ArrayList<>(batch.size());
+
+        for (int i = 0; i < batch.size(); i++) {
+            long recordIndex = expectedPosition + i;
+            String eventId = fileId + ":" + recordIndex;
+
+            OutgoingRecord record = batch.get(i);
+
+            if (!eventId.equals(record.key())) {
+                throw new IllegalArgumentException(
+                        "Unexpected event ID at record " + recordIndex
+                );
+            }
+
+            inserts.add(new Object[] {
+                    eventId,
+                    "csv",
+                    fileId,
+                    "CsvRecord",
+                    record.json(),
+                    sourceId,
+                    next.fileName(),
+                    recordIndex
+            });
+        }
+
+        transaction.executeWithoutResult(status -> {
+            jdbc.update("""
+                    INSERT INTO csv_checkpoint (
+                        source_id, file_name, sha256,
+                        next_record, completed
+                    )
+                    VALUES (?, ?, ?, 0, false)
+                    ON CONFLICT (source_id, file_name) DO NOTHING
+                    """,
+                    sourceId,
+                    next.fileName(),
+                    next.sha256()
+            );
+
+            Checkpoint current = jdbc.queryForObject("""
+                    SELECT source_id, file_name, sha256,
+                           next_record, completed
+                    FROM csv_checkpoint
+                    WHERE source_id = ? AND file_name = ?
+                    FOR UPDATE
+                    """,
+                    PostgresJournal::mapCheckpoint,
+                    sourceId,
+                    next.fileName()
+            );
+
+            if (current == null) {
+                throw new IllegalStateException("Checkpoint missing");
+            }
+
+            if (!current.sha256().equals(next.sha256())) {
+                throw new IllegalStateException(
+                        "Source file changed: " + next.fileName()
+                );
+            }
+
+            if (current.completed()
+                    || current.nextRecord() != expectedPosition) {
+                throw new IllegalStateException(
+                        "Stale batch for " + next.fileName()
+                        + "; reload its checkpoint before continuing"
+                );
+            }
+
+            if (!inserts.isEmpty()) {
+                jdbc.batchUpdate("""
+                        INSERT INTO ingest_outbox (
+                            id, aggregatetype, aggregateid, type,
+                            payload, source_id, file_name, record_index
+                        )
+                        VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?)
+                        """,
+                        inserts
+                );
+            }
+
+            int updated = jdbc.update("""
+                    UPDATE csv_checkpoint
+                    SET next_record = ?,
+                        completed = ?,
+                        updated_at = now()
+                    WHERE source_id = ?
+                      AND file_name = ?
+                      AND next_record = ?
+                      AND completed = false
+                    """,
+                    next.nextRecord(),
+                    next.completed(),
+                    sourceId,
+                    next.fileName(),
+                    expectedPosition
+            );
+
+            if (updated != 1) {
+                throw new IllegalStateException(
+                        "Checkpoint update failed"
+                );
+            }
+        });
+
+        // Return only after the PostgreSQL transaction commits.
+    }
+
+    private static Checkpoint mapCheckpoint(
+            ResultSet rs,
+            int rowNumber
+    ) throws SQLException {
+        return new Checkpoint(
+                1,
+                rs.getString("source_id"),
+                rs.getString("file_name"),
+                rs.getString("sha256"),
+                rs.getLong("next_record"),
+                rs.getBoolean("completed")
+        );
+    }
+}
+```
+
+`TransactionTemplate` explicitly controls the transaction boundary, without depending on an internally called `@Transactional` method being intercepted by a Spring proxy. It is Spring’s recommended imperative programmatic transaction API. ([docs.spring.io](https://docs.spring.io/spring-framework/reference/data-access/transaction/programmatic.html))
+
+### Why no `ON CONFLICT DO NOTHING` for outbox inserts?
+
+In this design, a duplicate outbox event is an invariant violation. It should roll back the batch rather than be silently ignored.
+
+After an uncertain database commit, **reload the checkpoint before reading another batch**. Do not blindly retry using the same in-memory position.
+
+---
+
+## 6. Changes to the previous CSV reader
+
+Keep the directory scanning, hashing, CSV parsing, batch preparation, deterministic event IDs, and file-publication rules.
+
+Make these changes to `CsvSource`:
+
+### Inject the PostgreSQL journal
+
+```java
+private final PostgresJournal journal;
+
+public CsvSource(
+        IngestProperties config,
+        JsonMapper json,
+        MeterRegistry metrics,
+        PostgresJournal journal
+) {
+    this.config = config;
+    this.json = json;
+    this.journal = journal;
+
+    this.committedRecords =
+            metrics.counter("csv.ingest.records.staged");
+    this.committedTransactions =
+            metrics.counter("csv.ingest.db.transactions");
+    this.failures =
+            metrics.counter("csv.ingest.failures");
+}
+```
+
+### Remove Kafka journal initialization and shutdown
+
+Remove:
+
+```java
+journal = new KafkaJournal(config, json);
+journal.initialize();
+```
+
+Also remove `closeJournal()` and its calls. Spring manages the datasource.
+
+At startup, perform a database check before setting `initialized=true`, for example:
+
+```java
+if (!initialized) {
+    journal.checkpoints(); // Fails if PostgreSQL/schema is unavailable.
+    initialized = true;
+}
+```
+
+The batch call stays the same:
+
+```java
+journal.commit(batch, checkpoint);
+```
+
+Checkpoint recovery stays the same:
+
+```java
+Checkpoint checkpoint = journal.checkpoint(fileName);
+```
+
+Also:
+
+- Remove the Kafka-specific fields and their validation from `IngestProperties`.
+- Keep the existing fail-closed behavior on processing errors.
+- Rename metrics/log messages from “published” to **“staged”**.
+- Monitor CDC publication separately from file ingestion.
+
+New files are still discovered by the scheduled directory scans. Completed-file checkpoints remain in PostgreSQL, so a restart does not cause old files to be staged again.
+
+---
+
+## 7. Publishing the outbox with Debezium
+
+For your original exactly-once requirement, deploy Debezium as a **Kafka Connect source connector with source EOS enabled**.
+
+On every worker in a **new distributed Connect cluster**:
+
+```properties
+exactly.once.source.support=enabled
+```
+
+For an existing cluster, Kafka documents a staged `preparing` → `enabled` rollout rather than changing only one worker. ([kafka.apache.org](https://kafka.apache.org/41/configuration/kafka-connect-configs/))
+
+The following is a connector configuration template; secrets, TLS trust, ACLs, and infrastructure provisioning must be supplied by your deployment.
+
+```json
+{
+  "name": "csv-outbox",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "postgres.example.internal",
+    "database.port": "5432",
+    "database.user": "csv_cdc",
+    "database.password": "<inject-secret>",
+    "database.dbname": "ingestion",
+    "database.sslmode": "verify-full",
+
+    "topic.prefix": "csv_ingestion",
+    "plugin.name": "pgoutput",
+
+    "slot.name": "csv_outbox_slot",
+    "publication.name": "csv_outbox_publication",
+    "publication.autocreate.mode": "disabled",
+
+    "table.include.list": "public.ingest_outbox",
+    "snapshot.mode": "initial",
+
+    "exactly.once.support": "required",
+    "transaction.boundary": "poll",
+
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.route.topic.replacement": "csv.events",
+    "transforms.outbox.table.expand.json.payload": "true",
+    "transforms.outbox.table.op.invalid.behavior": "fatal",
+
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "errors.tolerance": "none"
+  }
+}
+```
+
+The outbox router uses `aggregateid` as the Kafka key and `payload` as the value. JSON expansion prevents publishing the JSON document as an escaped JSON string. Here, the file ID is the key, keeping records from a file on the same partition while the partition count remains unchanged. ([debezium.io](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html))
+
+Provision the publication with an appropriately privileged database role:
+
+```sql
+CREATE PUBLICATION csv_outbox_publication
+FOR TABLE public.ingest_outbox;
+```
+
+PostgreSQL must be configured for logical replication, with an appropriately permissioned CDC user and replication slot capacity. Monitor replication-slot WAL retention, especially while the connector is unavailable. ([debezium.io](https://debezium.io/documentation/reference/stable/connectors/postgresql.html))
+
+Consumers of `csv.events` must use:
+
+```properties
+isolation.level=read_committed
+```
+
+Source EOS makes Kafka Connect commit source records and source offsets transactionally; downstream consumers must respect those transaction boundaries. ([debezium.io](https://debezium.io/documentation/reference/stable/configuration/eos.html))
+
+---
+
+## 8. Failure behavior and operating rules
+
+For the proposed database transaction:
+
+| Failure | Result |
+|---|---|
+| Crash before PostgreSQL commit | Neither events nor checkpoint advance is committed |
+| Crash after PostgreSQL commit | Events remain in the outbox; restart resumes from the updated checkpoint |
+| Database commit outcome is uncertain | Stop and reload the checkpoint on recovery |
+| Kafka is unavailable | Already-staged events remain pending for CDC publication |
+| A second reader submits the same batch | Checkpoint-position validation rejects the stale batch |
+| New CSV arrives | A later directory scan discovers it |
+
+Keep these operating rules:
+
+1. **Publish immutable files using `.part` → `.csv` atomic rename.**
+2. **Never reuse filenames for a source.**
+3. **Keep checkpoints; do not truncate them to “start fresh.”**
+4. **Do not delete outbox rows merely because the file is marked complete.** Use a cleanup policy tied to verified CDC progress and your recovery requirements.
+5. **Preserve Connect offsets and the replication slot.** Resetting CDC state or intentionally re-snapshotting previously published outbox rows requires a controlled replay/deduplication plan. ([debezium.io](https://debezium.io/documentation/reference/stable/connectors/postgresql.html))
+6. **Apply backpressure:** pause CSV ingestion when database capacity, outbox growth, or CDC lag exceeds your limits.
+7. **Failure-test the whole deployment**, including database commit ambiguity, Connect restarts, and Kafka outages.
+
+**Bottom line:** PostgreSQL is a suitable checkpoint store. To preserve the original requirement, save **checkpoint + outbox events in one PostgreSQL transaction**, then use a correctly configured CDC publishing layer—not a separate `KafkaTemplate.send()` followed by a SQL checkpoint update.
