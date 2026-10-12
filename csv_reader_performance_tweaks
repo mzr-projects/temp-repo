@@ -1,0 +1,869 @@
+Yes. The main bottlenecks in the previous version are:
+
+1. **Reading the entire file to calculate SHA-256 before processing.**
+2. **Reparsing all previously committed records after a restart.**
+3. **Listing and sorting the entire directory in memory.**
+4. **Repeatedly scanning completed files.**
+5. **Creating JSON strings and then converting them to bytes again.**
+6. **Processing only one file at a time across the whole deployment.**
+
+I would fix the first five before adding concurrency.
+
+**Keep the correctness mechanism unchanged: events and their checkpoint must remain in the same Kafka transaction.** Also, do not run concurrent transactions through one producer; a producer supports only one open transaction at a time. ([kafka.apache.org](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html))
+
+Below are the changes to the previous implementation.
+
+---
+
+# 1. Store a byte offset, not just a record number
+
+Instead of restarting from the beginning and skipping millions of rows, save:
+
+```json
+{
+  "version": 2,
+  "sourceId": "orders-directory",
+  "fileName": "orders-000123.csv",
+  "fileSize": 9876543210,
+  "lastModifiedMillis": 1791720000000,
+  "headers": ["order_id", "customer", "amount"],
+  "nextRecord": 5000000,
+  "nextByteOffset": 7123456789,
+  "completed": false
+}
+```
+
+On recovery:
+
+```java
+channel.position(checkpoint.nextByteOffset());
+```
+
+**Important:** the offset must be the beginning of the next CSV record—not `FileChannel.position()` after parsing. Buffered readers read ahead, and physical newline boundaries are not necessarily CSV-record boundaries.
+
+Commons CSV exposes each record’s starting byte position when byte tracking is enabled. We will use that position with **one-record lookahead**. ([commons.apache.org](https://commons.apache.org/proper/commons-csv/apidocs/org/apache/commons/csv/CSVRecord.html?utm_source=openai))
+
+This avoids rereading the committed file prefix. It does not eliminate Kafka checkpoint-recovery time.
+
+### Replace `Checkpoint.java`
+
+```java
+package com.example.ingest;
+
+import java.util.HashSet;
+import java.util.List;
+
+public record Checkpoint(
+        int version,
+        String sourceId,
+        String fileName,
+        long fileSize,
+        long lastModifiedMillis,
+        List<String> headers,
+        long nextRecord,
+        long nextByteOffset,
+        boolean completed
+) {
+    public Checkpoint {
+        if (version != 2) {
+            throw new IllegalArgumentException(
+                    "Unsupported checkpoint version; migration required"
+            );
+        }
+
+        if (sourceId == null || sourceId.isBlank()
+                || fileName == null || fileName.isBlank()) {
+            throw new IllegalArgumentException("Missing source/file identity");
+        }
+
+        if (fileSize < 0
+                || nextRecord < 0
+                || nextByteOffset < 0
+                || nextByteOffset > fileSize) {
+            throw new IllegalArgumentException("Invalid checkpoint position");
+        }
+
+        if (completed && nextByteOffset != fileSize) {
+            throw new IllegalArgumentException(
+                    "Completed checkpoint must point to EOF"
+            );
+        }
+
+        headers = List.copyOf(headers);
+
+        if (headers.isEmpty()
+                || headers.stream().anyMatch(String::isBlank)
+                || new HashSet<>(headers).size() != headers.size()) {
+            throw new IllegalArgumentException("Invalid CSV headers");
+        }
+    }
+}
+```
+
+### File identity trade-off
+
+Remove full-file hashing from the ingestion hot path.
+
+The code below checks size and modification time, but **these are change detectors, not cryptographic identity checks**. This optimization relies on the original contract:
+
+- Files are immutable after publication.
+- Filenames are never reused.
+- Publication happens through an atomic rename.
+
+If you need a cryptographic fingerprint, have the publisher calculate it while writing the file and publish it in a trusted manifest. Do not add an extra full-file read before every restart.
+
+---
+
+# 2. Serialize directly to bytes
+
+Replace `OutgoingRecord.java`:
+
+```java
+package com.example.ingest;
+
+public record OutgoingRecord(String key, byte[] payload) {
+}
+```
+
+Use:
+
+```java
+byte[] payload = json.writeValueAsBytes(event);
+```
+
+instead of:
+
+```java
+String payload = json.writeValueAsString(event);
+int size = payload.getBytes(StandardCharsets.UTF_8).length;
+```
+
+That removes the intermediate JSON string from the application batch.
+
+---
+
+# 3. Increase batches, but keep memory bounded
+
+Use these as **benchmark starting points**, not universally optimal settings:
+
+```yaml
+ingest:
+  directory: /data/incoming
+  archive-directory: /data/archive
+
+  batch-rows: 10000
+  batch-bytes: 8388608       # 8 MiB soft target
+  max-record-bytes: 262144  # 256 KiB per JSON event
+  batch-max-age: 1s
+
+  scan-delay: 2s
+```
+
+The batch ends when it reaches the first of:
+
+- 10,000 records;
+- approximately 8 MiB;
+- one second preparing the batch.
+
+The byte limit remains a soft target: it can be exceeded by one event. Time is checked between records, so it is not a timeout for parsing a single pathological record.
+
+Add these fields to `IngestProperties`:
+
+```java
+Path archiveDirectory,
+Duration batchMaxAge,
+```
+
+Add to its compact constructor:
+
+```java
+Objects.requireNonNull(archiveDirectory,
+        "ingest.archive-directory is required");
+Objects.requireNonNull(batchMaxAge,
+        "ingest.batch-max-age is required");
+
+archiveDirectory = archiveDirectory.toAbsolutePath().normalize();
+
+if (archiveDirectory.equals(directory)) {
+    throw new IllegalArgumentException(
+            "Input and archive directories must differ"
+    );
+}
+
+if (batchMaxAge.isZero() || batchMaxAge.isNegative()) {
+    throw new IllegalArgumentException(
+            "batch-max-age must be positive"
+    );
+}
+```
+
+Create the archive directory during deployment, on the **same filesystem** as the incoming directory.
+
+---
+
+# 4. Replace `processFile()` with seek-based processing
+
+Keep the existing Spring component, health indicator, counters, fail-stop behavior, and transactional recovery.
+
+Replace its `processFile()` method and add the helpers below.
+
+Additional imports:
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.charset.CodingErrorAction;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.HashSet;
+```
+
+### Replacement method
+
+```java
+private void processFile(
+        Path file,
+        Checkpoint previous
+) throws Exception {
+
+    String fileName = file.getFileName().toString();
+
+    BasicFileAttributes attributes = Files.readAttributes(
+            file,
+            BasicFileAttributes.class,
+            LinkOption.NOFOLLOW_LINKS
+    );
+
+    if (!attributes.isRegularFile()) {
+        throw new IOException("Not a regular file: " + file);
+    }
+
+    long fileSize = attributes.size();
+    long modifiedMillis = attributes.lastModifiedTime().toMillis();
+
+    if (previous != null) {
+        if (previous.fileSize() != fileSize
+                || previous.lastModifiedMillis() != modifiedMillis) {
+            throw new IllegalStateException(
+                    "Previously checkpointed file changed: " + fileName
+            );
+        }
+    }
+
+    long nextRecord = previous == null ? 0 : previous.nextRecord();
+
+    String fileId = config.sourceId() + ":" +
+            Base64.getUrlEncoder()
+                    .withoutPadding()
+                    .encodeToString(
+                            fileName.getBytes(StandardCharsets.UTF_8)
+                    );
+
+    try (FileChannel channel = FileChannel.open(
+            file, StandardOpenOption.READ)) {
+
+        // For a new file, exclude an optional UTF-8 BOM from parser input.
+        // For a resumed file, jump directly to the next CSV record.
+        long baseOffset = previous == null
+                ? utf8BomLength(channel)
+                : previous.nextByteOffset();
+
+        channel.position(baseOffset);
+
+        CSVFormat format = previous == null
+                ? CSV_FORMAT
+                : CSV_FORMAT.builder()
+                        .setHeader(previous.headers().toArray(String[]::new))
+                        .setSkipHeaderRecord(false)
+                        .get();
+
+        var decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+
+        try (var reader = new BufferedReader(
+                    new InputStreamReader(
+                            Channels.newInputStream(channel),
+                            decoder
+                    ),
+                    256 * 1024
+             );
+             CSVParser parser = CSVParser.builder()
+                    .setReader(reader)
+                    .setCharset(StandardCharsets.UTF_8)
+                    .setFormat(format)
+                    .setTrackBytes(true)
+                    .get()) {
+
+            List<String> headers = List.copyOf(parser.getHeaderNames());
+
+            if (headers.isEmpty()
+                    || headers.stream().anyMatch(String::isBlank)
+                    || new HashSet<>(headers).size() != headers.size()) {
+                throw new IllegalStateException(
+                        "Invalid CSV headers: " + fileName
+                );
+            }
+
+            var iterator = parser.iterator();
+
+            // One-record lookahead:
+            // pending is always the next record NOT in the current batch.
+            CSVRecord pending = iterator.hasNext()
+                    ? iterator.next()
+                    : null;
+
+            while (!stopping) {
+                List<OutgoingRecord> batch = new ArrayList<>(
+                        Math.min(config.batchRows(), 4096)
+                );
+
+                long batchBytes = 0;
+                long started = System.nanoTime();
+
+                while (pending != null
+                        && batch.size() < config.batchRows()
+                        && batchBytes < config.batchBytes()
+                        && (batch.isEmpty()
+                            || System.nanoTime() - started
+                                < config.batchMaxAge().toNanos())) {
+
+                    if (stopping) {
+                        return;
+                    }
+
+                    CSVRecord csv = pending;
+
+                    if (!csv.isConsistent()) {
+                        throw new IllegalStateException(
+                                "Column count mismatch: file=" + fileName
+                                + ", record=" + nextRecord
+                        );
+                    }
+
+                    Map<String, String> data = new LinkedHashMap<>();
+
+                    for (int column = 0; column < headers.size(); column++) {
+                        data.put(headers.get(column), csv.get(column));
+                    }
+
+                    String eventId = fileId + ":" + nextRecord;
+
+                    Map<String, Object> event = new LinkedHashMap<>();
+                    event.put("schemaVersion", 2);
+                    event.put("eventId", eventId);
+                    event.put("sourceId", config.sourceId());
+                    event.put("fileName", fileName);
+                    event.put("recordIndex", nextRecord);
+                    event.put("data", data);
+
+                    byte[] payload = json.writeValueAsBytes(event);
+
+                    if (payload.length > config.maxRecordBytes()) {
+                        throw new IllegalStateException(
+                                "Event exceeds configured size limit: file="
+                                + fileName + ", record=" + nextRecord
+                        );
+                    }
+
+                    batch.add(new OutgoingRecord(eventId, payload));
+                    batchBytes += payload.length;
+                    nextRecord++;
+
+                    pending = iterator.hasNext()
+                            ? iterator.next()
+                            : null;
+                }
+
+                boolean completed = pending == null;
+
+                // getBytePosition() is relative to this parser's input.
+                // Add the file position at which that parser was opened.
+                long nextByteOffset = completed
+                        ? fileSize
+                        : Math.addExact(
+                                baseOffset,
+                                pending.getBytePosition()
+                        );
+
+                if (nextByteOffset < baseOffset
+                        || nextByteOffset > fileSize) {
+                    throw new IllegalStateException(
+                            "Invalid parser byte offset: " + fileName
+                    );
+                }
+
+                if (stopping) {
+                    return;
+                }
+
+                assertUnchanged(file, fileSize, modifiedMillis);
+
+                Checkpoint checkpoint = new Checkpoint(
+                        2,
+                        config.sourceId(),
+                        fileName,
+                        fileSize,
+                        modifiedMillis,
+                        headers,
+                        nextRecord,
+                        nextByteOffset,
+                        completed
+                );
+
+                // Same atomicity as before:
+                // output records + checkpoint in ONE transaction.
+                journal.commit(batch, checkpoint);
+
+                committedRecords.increment(batch.size());
+                committedTransactions.increment();
+
+                // Avoid an INFO log for every batch at high throughput.
+                log.debug(
+                        "Committed file={} rows={} nextRecord={} "
+                        + "nextByteOffset={} completed={}",
+                        fileName,
+                        batch.size(),
+                        nextRecord,
+                        nextByteOffset,
+                        completed
+                );
+
+                if (completed) {
+                    log.info(
+                            "Completed file={} records={} bytes={}",
+                            fileName,
+                            nextRecord,
+                            fileSize
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+```
+
+### Helpers
+
+```java
+private static long utf8BomLength(FileChannel channel) throws IOException {
+    ByteBuffer bytes = ByteBuffer.allocate(3);
+
+    // Positional reads do not change the channel's current position.
+    while (bytes.hasRemaining()) {
+        int count = channel.read(bytes, bytes.position());
+
+        if (count < 0) {
+            break;
+        }
+
+        if (count == 0) {
+            throw new IOException("Could not read file prefix");
+        }
+    }
+
+    return bytes.position() == 3
+            && (bytes.get(0) & 0xff) == 0xef
+            && (bytes.get(1) & 0xff) == 0xbb
+            && (bytes.get(2) & 0xff) == 0xbf
+            ? 3
+            : 0;
+}
+
+private static void assertUnchanged(
+        Path file,
+        long expectedSize,
+        long expectedModifiedMillis
+) throws IOException {
+
+    BasicFileAttributes attributes = Files.readAttributes(
+            file,
+            BasicFileAttributes.class,
+            LinkOption.NOFOLLOW_LINKS
+    );
+
+    if (!attributes.isRegularFile()
+            || attributes.size() != expectedSize
+            || attributes.lastModifiedTime().toMillis()
+                != expectedModifiedMillis) {
+        throw new IOException(
+                "Published file changed during processing: " + file
+        );
+    }
+}
+```
+
+### Why the lookahead matters
+
+Suppose a batch contains records `0–999`.
+
+The parser has also read record `1000` into `pending`, but that record is **not published yet**.
+
+The transaction saves:
+
+```text
+nextRecord     = 1000
+nextByteOffset = start of record 1000
+```
+
+If the process crashes, it seeks to record `1000`, not to wherever the buffered file channel happened to stop.
+
+This also accommodates quoted multiline fields and UTF-8 text. The relevant Commons CSV APIs track the record start separately from the underlying reader’s buffered position. ([commons.apache.org](https://commons.apache.org/proper/commons-csv/apidocs/org/apache/commons/csv/CSVRecord.html?utm_source=openai))
+
+**Performance caveat:** byte tracking itself adds CPU work; the pinned Commons CSV implementation calculates encoded character lengths. Benchmark steady-state parsing throughput as well as restart time rather than assuming byte tracking makes parsing faster. ([raw.githubusercontent.com](https://raw.githubusercontent.com/apache/commons-csv/rel/commons-csv-1.14.1/src/main/java/org/apache/commons/csv/ExtendedBufferedReader.java))
+
+---
+
+# 5. Update `KafkaJournal` for byte-array values
+
+Keep its transaction initialization and recovery-barrier algorithm unchanged.
+
+### Change producer type and serializer
+
+```java
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+
+private final KafkaProducer<String, byte[]> producer;
+```
+
+In its constructor:
+
+```java
+properties.put(
+        ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+        ByteArraySerializer.class
+);
+```
+
+### Tune producer batching
+
+Replace/add:
+
+```java
+properties.put(ProducerConfig.BATCH_SIZE_CONFIG, 128 * 1024);
+properties.put(ProducerConfig.LINGER_MS_CONFIG, 10);
+properties.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 64L * 1024 * 1024);
+properties.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "lz4");
+```
+
+Keep:
+
+```java
+properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+properties.put(ProducerConfig.ACKS_CONFIG, "all");
+properties.put(
+        ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION,
+        5
+);
+```
+
+`batch.size` is Kafka’s per-partition batching setting; it is not your transaction-size limit. `buffer.memory` is also not a hard limit on total producer memory. Benchmark `lz4` against the previous `zstd` setting with your actual data and CPU/network constraints. ([kafka.apache.org](https://kafka.apache.org/41/configuration/producer-configs/))
+
+### Encode the recovery marker
+
+In `initialize()`:
+
+```java
+producer.send(new ProducerRecord<>(
+        config.checkpointTopic(),
+        0,
+        BARRIER_KEY,
+        barrier.getBytes(StandardCharsets.UTF_8)
+));
+```
+
+The checkpoint recovery consumer can remain `KafkaConsumer<String, String>`: the stored values are still UTF-8 JSON or UTF-8 marker strings.
+
+### Replace `commit()`
+
+```java
+public void commit(
+        List<OutgoingRecord> records,
+        Checkpoint checkpoint
+) {
+    byte[] checkpointBytes = json.writeValueAsBytes(checkpoint);
+
+    producer.beginTransaction();
+
+    for (OutgoingRecord record : records) {
+        producer.send(new ProducerRecord<>(
+                config.outputTopic(),
+                record.key(),
+                record.payload()
+        ));
+    }
+
+    producer.send(new ProducerRecord<>(
+            config.checkpointTopic(),
+            0,
+            FILE_PREFIX + checkpoint.fileName(),
+            checkpointBytes
+    ));
+
+    producer.commitTransaction();
+
+    remember(checkpoint);
+}
+```
+
+Do not add `.get()` after every `send()`. The sends should remain asynchronous; transaction commit waits for outstanding sends and handles their failures. ([kafka.apache.org](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html))
+
+### Avoid copying/scanning all completed checkpoints on every scan
+
+Add a second index containing only unfinished files:
+
+```java
+private final Map<String, Checkpoint> unfinished = new HashMap<>();
+
+private void remember(Checkpoint checkpoint) {
+    checkpoints.put(checkpoint.fileName(), checkpoint);
+
+    if (checkpoint.completed()) {
+        unfinished.remove(checkpoint.fileName());
+    } else {
+        unfinished.put(checkpoint.fileName(), checkpoint);
+    }
+}
+
+public Collection<Checkpoint> unfinishedCheckpoints() {
+    // Owner-thread access only.
+    return unfinished.values();
+}
+```
+
+In `restoreUntil()`, replace:
+
+```java
+checkpoints.put(checkpoint.fileName(), checkpoint);
+```
+
+with:
+
+```java
+remember(checkpoint);
+```
+
+In `CsvSource.verifyUnfinishedFilesExist()`, iterate:
+
+```java
+for (Checkpoint checkpoint : journal.unfinishedCheckpoints()) {
+    Path file = config.directory().resolve(checkpoint.fileName());
+
+    if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+        throw new IllegalStateException(
+                "Unfinished source file is missing: "
+                + checkpoint.fileName()
+        );
+    }
+}
+```
+
+### Replace checkpoint validation
+
+The new record constructor validates the offset/header fields. Retain source and path validation in the journal:
+
+```java
+private void validateCheckpoint(String key, Checkpoint checkpoint) {
+    if (!config.sourceId().equals(checkpoint.sourceId())
+            || !key.equals(FILE_PREFIX + checkpoint.fileName())) {
+        throw new IllegalStateException("Invalid checkpoint identity");
+    }
+
+    Path name = Path.of(checkpoint.fileName());
+
+    if (name.isAbsolute()
+            || name.getNameCount() != 1
+            || !checkpoint.fileName().endsWith(".csv")) {
+        throw new IllegalStateException("Invalid checkpoint filename");
+    }
+
+    Path resolved = config.directory()
+            .resolve(name)
+            .normalize();
+
+    if (!config.directory().equals(resolved.getParent())) {
+        throw new IllegalStateException("Invalid checkpoint path");
+    }
+}
+```
+
+Add the corresponding `Path` and `StandardCharsets` imports.
+
+---
+
+# 6. Stream directory entries and archive completed files
+
+Replace the previous:
+
+```java
+Files.list(directory)
+        .sorted()
+        .toList();
+```
+
+with a `DirectoryStream`. This avoids building and sorting a list of every filename. Java exposes directory streams for iterating directory entries without materializing them all into a collection. ([docs.oracle.com](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html))
+
+Inside `scan()`, after initialization and `verifyUnfinishedFilesExist()`:
+
+```java
+try (var entries = Files.newDirectoryStream(
+        config.directory(), "*.csv")) {
+
+    for (Path file : entries) {
+        if (stopping) {
+            return;
+        }
+
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            continue;
+        }
+
+        String fileName = file.getFileName().toString();
+        Checkpoint checkpoint = journal.checkpoint(fileName);
+
+        if (checkpoint == null || !checkpoint.completed()) {
+            processFile(file, checkpoint);
+        }
+
+        Checkpoint committed = journal.checkpoint(fileName);
+
+        if (committed != null && committed.completed()) {
+            // processFile has returned and its reader/channel are closed.
+            archiveCompleted(file);
+        }
+    }
+}
+```
+
+Add:
+
+```java
+private void archiveCompleted(Path file) throws IOException {
+    Path target = config.archiveDirectory()
+            .resolve(file.getFileName());
+
+    if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+        throw new IOException(
+                "Archive destination already exists: " + target
+        );
+    }
+
+    Files.move(
+            file,
+            target,
+            java.nio.file.StandardCopyOption.ATOMIC_MOVE
+    );
+}
+```
+
+Use a dedicated archive directory with no competing writers. `ATOMIC_MOVE` support depends on the filesystem/provider; configure the directories on the same filesystem and fail rather than silently falling back to copying multi-gigabyte files. ([docs.oracle.com](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html))
+
+### The ordering is important
+
+```text
+Commit final records + completed checkpoint
+                    ↓
+Close CSV reader
+                    ↓
+Move file to archive
+```
+
+The move is **not** part of the Kafka transaction. That is safe here because it is cleanup:
+
+- Crash before final commit: resume from the previous checkpoint.
+- Crash after commit, before move: recognize the completed checkpoint and move the file without republishing it.
+- Crash after move: the completed checkpoint remains authoritative.
+
+**Never move or delete an unfinished file.**
+
+The archive should have its own retention policy. Do not delete its Kafka completion checkpoint merely because the source file was archived.
+
+---
+
+# 7. Add parallelism through stable file ownership
+
+After those changes, scale using **a small fixed number of independent workers**, rather than one thread per file.
+
+For example:
+
+```text
+incoming/
+  shard-0/ → worker 0 → producer 0 → checkpoint topic 0
+  shard-1/ → worker 1 → producer 1 → checkpoint topic 1
+  shard-2/ → worker 2 → producer 2 → checkpoint topic 2
+  shard-3/ → worker 3 → producer 3 → checkpoint topic 3
+
+All workers → same output topic
+```
+
+Each worker runs the code above with its own configuration:
+
+```yaml
+# Worker 0
+ingest:
+  source-id: orders-shard-0
+  directory: /data/incoming/shard-0
+  archive-directory: /data/archive/shard-0
+  checkpoint-topic: csv.checkpoints.orders.shard-0
+  output-topic: csv.events
+```
+
+### Ownership rules
+
+- One active owner per shard.
+- One transactional producer per worker.
+- Stable source ID and transactional ID across restarts.
+- Exactly one checkpoint partition per worker under the existing recovery design.
+- A file is published to exactly one shard.
+- Do not change shard assignment for files already being processed.
+
+The publisher can select the shard using a stable hash of a unique file ID. Physical shard directories also avoid every worker scanning every filename.
+
+**Do not use `parallelStream()` around the existing `processFile()` method:** it would share mutable journal state and attempt overlapping transactions through the same producer. ([kafka.apache.org](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html))
+
+I would benchmark **1, 2, and 4 workers**, then choose based on disk utilization, CPU, Kafka throughput, and commit latency—not assume that more workers always help.
+
+---
+
+# 8. Remaining large-scale limits
+
+These patches substantially change file I/O behavior, but they do not solve every scaling issue.
+
+| Area | After these changes |
+|---|---|
+| Resuming a large file | Seek directly to the next uncommitted record |
+| Full-file hash pass | Removed from ingestion |
+| Filename enumeration | Streaming, unsorted |
+| Completed files in incoming directory | Archived after commit |
+| Event memory | Bounded batch plus parser/producer overhead |
+| File concurrency | Configurable through independent shards |
+| Checkpoint index | Still retains one entry per historical file |
+| Kafka checkpoint recovery | Still replays the compacted checkpoint topic |
+
+If you have **millions of historical files**, replace the in-memory `checkpoints` map with a disk-backed index. Kafka should remain authoritative; any local index/snapshot must be rebuilt or caught up through the committed recovery boundary before ingestion starts.
+
+Also:
+
+- A filesystem watcher can reduce discovery latency, but retain reconciliation scans. Java watch services can overflow or have implementation-specific limitations, particularly on remote filesystems. ([docs.oracle.com](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/WatchService.html))
+- Do not split large CSV files at arbitrary newlines. Prefer having the publisher produce smaller independently valid CSV files if a single huge file becomes the parallelism bottleneck.
+- Retain parser/input limits. Bounding serialized event size does not stop the parser from allocating a huge malformed field.
+
+## Migration warning
+
+**Do not deploy the version-2 checkpoint model over existing version-1 checkpoints without migration. Do not delete the checkpoint topic to “start fresh.”**
+
+For an existing deployment, stop the old writer and perform a one-time migration:
+
+1. Recover the old committed checkpoint.
+2. Verify the old file hash.
+3. Parse the header and skip the old `nextRecord` once.
+4. Determine the next record’s byte offset.
+5. Commit the version-2 checkpoint without emitting events.
+
+Preserve the source identity and transactional ownership during migration. Also note that the example output is now `schemaVersion: 2` and no longer contains `fileSha256`.
+
+**My recommended order: byte-offset recovery → byte-array serialization → streaming discovery/archive → benchmark batching → add stable shards.** This removes unnecessary work before introducing concurrency.
