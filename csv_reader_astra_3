@@ -1,0 +1,504 @@
+**You can keep all the files in one directory.** You do not need separate physical folders to process them concurrently.
+
+The next change I recommend is:
+
+> **One directory scanner → a bounded set of independent file-processing workers → one transactional Kafka producer per worker.**
+
+Start by benchmarking **4 workers**, not thousands of threads. Each worker processes a different file while preserving the transactional checkpoint design.
+
+## 1. Change the architecture—not just the parser
+
+```mermaid
+flowchart LR
+    D["One directory<br/>thousands of CSV files"] --> S["One directory scanner"]
+    S --> H["Stable filename-to-worker assignment"]
+    H --> Q0["Bounded queue 0"]
+    H --> Q1["Bounded queue 1"]
+    H --> Q2["Bounded queue 2"]
+    H --> Q3["Bounded queue 3"]
+
+    Q0 --> W0["Worker 0<br/>Parser + producer"]
+    Q1 --> W1["Worker 1<br/>Parser + producer"]
+    Q2 --> W2["Worker 2<br/>Parser + producer"]
+    Q3 --> W3["Worker 3<br/>Parser + producer"]
+
+    W0 --> K["Kafka events"]
+    W1 --> K
+    W2 --> K
+    W3 --> K
+
+    W0 --> C0["Checkpoint topic 0"]
+    W1 --> C1["Checkpoint topic 1"]
+    W2 --> C2["Checkpoint topic 2"]
+    W3 --> C3["Checkpoint topic 3"]
+```
+
+Each worker owns:
+
+- Its CSV parser and current file.
+- Its bounded JSON batch.
+- Its Kafka producer.
+- Its checkpoint index.
+- Its stable transactional ID.
+- Its dedicated, single-partition checkpoint topic.
+
+**Do not share the previous `KafkaJournal` across workers.** Kafka producers are thread-safe, but each producer can have only one open transaction. Independent concurrent transactions require independent producers. ([kafka.apache.org](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html))
+
+All workers can publish to the same output topic.
+
+---
+
+## 2. Keep file ownership stable
+
+Assign files deterministically:
+
+```java
+static int workerFor(String fileName, int workerCount) {
+    return Math.floorMod(fileName.hashCode(), workerCount);
+}
+```
+
+For example:
+
+```text
+orders-001.csv → worker 2
+orders-002.csv → worker 3
+orders-003.csv → worker 0
+```
+
+This is a design choice that makes recovery straightforward: after restart, the same worker recovers the checkpoint for the same file.
+
+Use identities such as:
+
+```text
+Worker 0:
+  transactional.id = csv-orders-worker-0
+  checkpoint topic = csv.checkpoints.orders.w0
+
+Worker 1:
+  transactional.id = csv-orders-worker-1
+  checkpoint topic = csv.checkpoints.orders.w1
+```
+
+The transactional ID must remain stable for that logical worker across restarts. Kafka uses this identity for transaction recovery and fencing. ([kafka.apache.org](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html))
+
+**Important:** with this simple assignment scheme, do not change `workerCount` after deployment without migrating checkpoints. Also keep the logical `sourceId` used in event IDs unchanged; worker identity and source identity are different things.
+
+---
+
+## 3. Add bounded parallel scheduling
+
+The following is the **new orchestration layer** around the parser and journal from the previous answer. It is not a replacement for the parsing/checkpoint code.
+
+First, extract the previous file-processing logic behind this interface:
+
+### `FileProcessor.java`
+
+```java
+package com.example.ingest;
+
+import java.nio.file.Path;
+
+public interface FileProcessor extends AutoCloseable {
+
+    // Initialize this worker's producer, fence its previous instance,
+    // recover its checkpoints, and validate unfinished files.
+    void initialize() throws Exception;
+
+    // Check this worker's checkpoint, resume/process the file,
+    // and archive it only after its completion checkpoint commits.
+    void process(Path file) throws Exception;
+
+    @Override
+    void close() throws Exception;
+}
+```
+
+### `FileProcessorFactory.java`
+
+```java
+package com.example.ingest;
+
+import java.util.function.BooleanSupplier;
+
+@FunctionalInterface
+public interface FileProcessorFactory {
+
+    // Must return a NEW processor with its OWN KafkaJournal.
+    FileProcessor create(
+            int workerId,
+            BooleanSupplier shouldStop
+    ) throws Exception;
+}
+```
+
+### `ParallelFileDispatcher.java`
+
+```java
+package com.example.ingest;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class ParallelFileDispatcher implements AutoCloseable {
+
+    private static final Logger log =
+            LoggerFactory.getLogger(ParallelFileDispatcher.class);
+
+    private final Path directory;
+    private final int workerCount;
+    private final FileProcessorFactory factory;
+
+    private final List<BlockingQueue<Path>> queues;
+    private final Set<Path> admitted = ConcurrentHashMap.newKeySet();
+
+    private final ExecutorService executor;
+    private final AtomicBoolean stopping = new AtomicBoolean();
+    private final AtomicInteger initializedWorkers = new AtomicInteger();
+    private final AtomicReference<Throwable> failure =
+            new AtomicReference<>();
+
+    public ParallelFileDispatcher(
+            Path directory,
+            int workerCount,
+            int queueCapacity,
+            FileProcessorFactory factory
+    ) {
+        if (workerCount <= 0 || queueCapacity <= 0) {
+            throw new IllegalArgumentException(
+                    "Worker count and queue capacity must be positive"
+            );
+        }
+
+        this.directory = directory.toAbsolutePath().normalize();
+        this.workerCount = workerCount;
+        this.factory = factory;
+
+        this.queues = new ArrayList<>(workerCount);
+
+        for (int i = 0; i < workerCount; i++) {
+            queues.add(new ArrayBlockingQueue<>(queueCapacity));
+        }
+
+        this.executor = Executors.newFixedThreadPool(
+                workerCount,
+                Thread.ofPlatform()
+                        .name("csv-worker-", 0)
+                        .factory()
+        );
+
+        for (int i = 0; i < workerCount; i++) {
+            final int workerId = i;
+            executor.execute(() -> runWorker(workerId));
+        }
+    }
+
+    public synchronized void scan() {
+        if (shouldStop()
+                || initializedWorkers.get() != workerCount) {
+            return;
+        }
+
+        try (var entries =
+                     Files.newDirectoryStream(directory, "*.csv")) {
+
+            for (Path entry : entries) {
+                if (shouldStop()) {
+                    return;
+                }
+
+                Path file = entry.toAbsolutePath().normalize();
+
+                if (!Files.isRegularFile(
+                        file, LinkOption.NOFOLLOW_LINKS)) {
+                    continue;
+                }
+
+                int workerId = Math.floorMod(
+                        file.getFileName().toString().hashCode(),
+                        workerCount
+                );
+
+                BlockingQueue<Path> queue = queues.get(workerId);
+
+                // Optimization: do not block the scanner behind one worker.
+                if (queue.remainingCapacity() == 0) {
+                    continue;
+                }
+
+                // Prevent repeated scans from queuing the same active file.
+                if (!admitted.add(file)) {
+                    continue;
+                }
+
+                if (!queue.offer(file)) {
+                    admitted.remove(file);
+                    // The file remains on disk; a later scan retries it.
+                }
+            }
+
+        } catch (IOException | RuntimeException exception) {
+            fail(exception);
+        }
+    }
+
+    private void runWorker(int workerId) {
+        try (FileProcessor processor =
+                     factory.create(workerId, this::shouldStop)) {
+
+            processor.initialize();
+            initializedWorkers.incrementAndGet();
+
+            BlockingQueue<Path> queue = queues.get(workerId);
+
+            while (!shouldStop()) {
+                Path file = queue.poll(500, TimeUnit.MILLISECONDS);
+
+                if (file == null) {
+                    continue;
+                }
+
+                try {
+                    if (shouldStop()) {
+                        return;
+                    }
+
+                    processor.process(file);
+                } finally {
+                    admitted.remove(file);
+                }
+            }
+
+        } catch (Throwable exception) {
+            if (!stopping.get()) {
+                fail(exception);
+            }
+
+            if (exception instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+
+            if (exception instanceof Error error) {
+                throw error;
+            }
+        }
+    }
+
+    private void fail(Throwable exception) {
+        if (failure.compareAndSet(null, exception)) {
+            log.error(
+                    "CSV pipeline failed; processing is stopping. "
+                    + "Restart must recover Kafka checkpoints.",
+                    exception
+            );
+        }
+    }
+
+    public boolean shouldStop() {
+        return stopping.get() || failure.get() != null;
+    }
+
+    public boolean isReady() {
+        return !shouldStop()
+                && initializedWorkers.get() == workerCount;
+    }
+
+    public Throwable failure() {
+        return failure.get();
+    }
+
+    @Override
+    public void close() {
+        stopping.set(true);
+        executor.shutdown();
+
+        try {
+            if (!executor.awaitTermination(150, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException exception) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+### Why this uses bounded queues
+
+With 4 workers and queue capacity 32:
+
+- At most 4 files are being processed.
+- At most 128 additional file paths are queued.
+- File contents are not loaded into the queues.
+- A full queue does not prevent other workers receiving files.
+- Files that could not be queued remain on disk for the next scan.
+
+`ArrayBlockingQueue` provides the fixed-capacity queue used here. ([docs.oracle.com](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ArrayBlockingQueue.html))
+
+The `admitted` set is only an in-process scheduling optimization. **Kafka checkpoints—not this set—provide recovery correctness.**
+
+---
+
+## 4. Connect it to the existing Spring application
+
+Create the dispatcher as a bean:
+
+```java
+@Bean(destroyMethod = "close")
+ParallelFileDispatcher dispatcher(
+        IngestProperties properties,
+        FileProcessorFactory factory,
+        @Value("${ingest.workers:4}") int workers,
+        @Value("${ingest.queue-capacity:32}") int queueCapacity
+) {
+    return new ParallelFileDispatcher(
+            properties.directory(),
+            workers,
+            queueCapacity,
+            factory
+    );
+}
+```
+
+Use one scanner:
+
+```java
+@Component
+public class DirectoryScanner {
+
+    private final ParallelFileDispatcher dispatcher;
+
+    public DirectoryScanner(ParallelFileDispatcher dispatcher) {
+        this.dispatcher = dispatcher;
+    }
+
+    @Scheduled(fixedDelayString = "${ingest.scan-delay:2s}")
+    public void scan() {
+        dispatcher.scan();
+    }
+}
+```
+
+### Required refactor of the previous classes
+
+Implement `FileProcessorFactory` by constructing your extracted CSV processor. For each worker:
+
+1. Create a **new** `KafkaJournal`.
+2. Give the journal worker-specific transactional and checkpoint-topic names.
+3. Keep the previous seek-based `processFile()` implementation.
+4. Replace its `stopping` checks with `shouldStop.getAsBoolean()`.
+5. Keep checkpoint and parser state confined to that worker.
+6. Check completed checkpoints before opening files.
+7. Archive completed files after the reader closes.
+8. Expose dispatcher failure/readiness through the health indicator.
+
+**Remove the old `CsvSource` scanner bean.** Otherwise, the old scanner and the new workers would both ingest the directory.
+
+A queued path can become stale after a previous completion/archive. If its checkpoint says completed and the source file is already absent, processing that path should be a no-op—not an attempt to republish.
+
+---
+
+## 5. Keep transactions batched
+
+A starting configuration to benchmark:
+
+```yaml
+ingest:
+  workers: 4
+  queue-capacity: 32
+
+  batch-rows: 10000
+  batch-bytes: 8388608
+  batch-max-age: 1s
+
+  scan-delay: 2s
+```
+
+For every worker:
+
+```text
+Parse and serialize a bounded batch
+                 ↓
+Begin Kafka transaction
+                 ↓
+Send events asynchronously
+                 ↓
+Send checkpoint
+                 ↓
+Commit transaction
+```
+
+Do not call `.get()` after every `send()`. Kafka’s asynchronous sends permit batching; transaction commit completes outstanding sends. ([kafka.apache.org](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html))
+
+Keep the previous producer tuning as a benchmark baseline:
+
+```properties
+batch.size=131072
+linger.ms=10
+compression.type=lz4
+buffer.memory=67108864
+```
+
+**Memory now multiplies by worker count.** Four producers configured with 64 MiB buffers represent approximately 256 MiB of configured producer buffering alone, excluding JSON batches, parsing, compression, checkpoint maps, and other allocations. Kafka documents that `buffer.memory` is not a hard bound on total producer memory. ([kafka.apache.org](https://kafka.apache.org/41/configuration/producer-configs/))
+
+---
+
+## 6. Measure parsing separately from Kafka
+
+Before replacing the CSV library, run these benchmarks against representative files:
+
+| Test | Purpose |
+|---|---|
+| Parse CSV and count records, without JSON/Kafka | Measure CSV-reading throughput |
+| Parse CSV and serialize JSON, without Kafka | Measure serialization overhead |
+| Full pipeline with 1 worker | Establish end-to-end baseline |
+| Full pipeline with 2, 4, then 8 workers | Find useful concurrency |
+
+Record:
+
+- Committed records/second.
+- Input bytes/second.
+- CPU utilization and GC time.
+- Disk throughput and latency.
+- Transaction commit latency.
+- Queue depth per worker.
+
+Choose the smallest worker count that gives near-maximum measured throughput.
+
+**Do not assume virtual threads will make parsing faster.** They help scale waiting tasks; they do not make CPU-intensive parsing or serialization execute faster. ([docs.oracle.com](https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html))
+
+---
+
+## 7. Two correctness warnings
+
+### Do not launch another identical application instance casually
+
+This design assumes one active dispatcher for the directory. Multiple active instances need explicit worker ownership; otherwise, they can compete and repeatedly fence the same transactional producers.
+
+### Migrate existing checkpoints before enabling this layout
+
+If the previous deployment has one checkpoint topic, new worker-specific topics will initially be empty. Starting workers against them would reprocess files.
+
+Stop and fence the old writer, recover its committed state, then redistribute checkpoints using the new filename-to-worker assignment. Preserve event identities and verify the migration before starting ingestion.
+
+---
+
+**My recommendation for your case:** keep the single directory, add **4 bounded, independent file workers**, retain byte-offset checkpoints and transactional batches, and benchmark against 1/2/8 workers. That is the next practical throughput improvement without sacrificing recovery semantics.
