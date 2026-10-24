@@ -1,0 +1,1153 @@
+Below is a complete, opinionated blueprint I'd actually ship for this use case: **Spring Boot 3.x (Java 21) + StarRocks via its MySQL protocol**, a shared "query engine" library, and thin per-domain services on top. The key design decisions for billions of rows are explained first, then the code.
+
+## 1. Design decisions that matter at this scale
+
+| Decision | Why |
+|---|---|
+| **Spring JDBC (`NamedParameterJdbcTemplate`), not JPA/Hibernate** | StarRocks is an OLAP engine, not an OLTP DB. No entity lifecycle, no dirty checking, no lazy loading, no dialect quirks. Plain SQL is faster and predictable. |
+| **Keyset (cursor) pagination, never `OFFSET`** | `LIMIT 100 OFFSET 50_000_000` makes StarRocks scan & sort 50M rows per page. Keyset uses `WHERE (sort_key) < (last_seen) ORDER BY sort_key LIMIT n` → constant cost per page. |
+| **Opaque, self-describing cursor** | Client can't forge/misuse it, and the server can detect if the sort changed mid-pagination. |
+| **No `COUNT(*)` per page** | Counting billions of rows per request kills the cluster. Return `hasNext` only; expose counts as a separate, cached, optional endpoint. |
+| **Mandatory bounded filter on the partition column** | Guarantees partition pruning; forbids accidental full-table scans. |
+| **Column whitelisting via `TableDefinition`** | Every sortable/filterable field is declared; SQL identifiers are never taken from user input → zero SQL injection surface, and each service self-documents its contract. |
+| **Multiple FE nodes via `jdbc:mysql:loadbalance://`** | Connector/J balances across StarRocks frontends with no extra proxy. |
+| **Virtual threads** | Requests are I/O-bound on StarRocks; virtual threads give high concurrency with a small pool. |
+
+```mermaid
+flowchart LR
+    subgraph Clients
+        C[Web / Mobile / Other services]
+    end
+    subgraph "service-orders (deployable)"
+        OC[OrderController] --> OS[OrderQueryService]
+        OS --> OR[OrderRepository]
+    end
+    subgraph "service-events (deployable)"
+        EC[EventController] --> ES[EventQueryService]
+        ES --> ER[EventRepository]
+    end
+    subgraph "platform-starrocks (library)"
+        BR[AbstractStarRocksReadRepository]
+        QB[KeysetQueryBuilder]
+        CC[CursorCodec]
+        DS[HikariCP DataSource]
+    end
+    subgraph "platform-core (library)"
+        TD[TableDefinition]
+        PG[CursorPage / QueryRequest / Filter / SortOrder]
+    end
+    C --> OC
+    C --> EC
+    OR --> BR
+    ER --> BR
+    BR --> QB --> TD
+    BR --> CC
+    BR --> DS
+    DS -->|MySQL protocol, load-balanced| FE[(StarRocks FE1..N)]
+    FE --> BE[(StarRocks BE / CN nodes)]
+```
+
+## 2. Project layout (multi-module Maven)
+
+```
+analytics-platform/
+├── pom.xml                      # parent: versions, dependencyManagement
+├── platform-core/               # pure Java: paging/filter model, TableDefinition, exceptions
+├── platform-starrocks/          # Spring JDBC: DataSource, query builder, base repository
+├── platform-web/                # Spring Web: error handling, param parsing (shared by services)
+├── service-orders/              # deployable Spring Boot app #1
+├── service-events/              # deployable Spring Boot app #2
+└── service-.../                 # add more: each is ~5 small classes
+```
+
+Each `service-*` depends on the three platform libraries. Adding a new service = add a `TableDefinition`, a view record, a row mapper, a repository subclass, a service and a controller.
+
+### Parent `pom.xml` (relevant parts)
+
+```xml
+<properties>
+    <java.version>21</java.version>
+    <spring-boot.version>3.3.4</spring-boot.version>
+    <mysql.version>8.4.0</mysql.version>
+</properties>
+
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-dependencies</artifactId>
+            <version>${spring-boot.version}</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>${mysql.version}</version>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+```
+
+`platform-starrocks` dependencies: `spring-boot-starter-jdbc`, `mysql-connector-j`, `jackson-databind`, `jackson-datatype-jsr310`, `micrometer-core`.
+`service-*` dependencies: `platform-core`, `platform-starrocks`, `platform-web`, `spring-boot-starter-web`, `spring-boot-starter-actuator`, `spring-boot-starter-validation`, `micrometer-registry-prometheus`.
+
+---
+
+## 3. `platform-core` — the shared model
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/SortOrder.java
+package com.acme.platform.query;
+
+public record SortOrder(String field, Direction direction) {
+    public enum Direction { ASC, DESC }
+    public static SortOrder asc(String f)  { return new SortOrder(f, Direction.ASC); }
+    public static SortOrder desc(String f) { return new SortOrder(f, Direction.DESC); }
+}
+```
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/Filter.java
+package com.acme.platform.query;
+
+import java.util.List;
+
+public record Filter(String field, Operator op, List<Object> values) {
+    public enum Operator { EQ, NE, GT, GTE, LT, LTE, IN, BETWEEN, LIKE }
+
+    public static Filter eq(String f, Object v)             { return new Filter(f, Operator.EQ, List.of(v)); }
+    public static Filter gte(String f, Object v)            { return new Filter(f, Operator.GTE, List.of(v)); }
+    public static Filter lt(String f, Object v)             { return new Filter(f, Operator.LT, List.of(v)); }
+    public static Filter in(String f, List<?> vs)           { return new Filter(f, Operator.IN, List.copyOf(vs)); }
+    public static Filter between(String f, Object a, Object b) { return new Filter(f, Operator.BETWEEN, List.of(a, b)); }
+}
+```
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/QueryRequest.java
+package com.acme.platform.query;
+
+import java.util.List;
+
+/** What every read-service hands to the repository. Immutable and framework-free. */
+public record QueryRequest(List<Filter> filters, List<SortOrder> sort, int pageSize, String cursor) {
+    public QueryRequest {
+        filters = filters == null ? List.of() : List.copyOf(filters);
+        sort    = sort    == null ? List.of() : List.copyOf(sort);
+    }
+}
+```
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/CursorPage.java
+package com.acme.platform.query;
+
+import java.util.List;
+import java.util.function.Function;
+
+public record CursorPage<T>(List<T> items, String nextCursor, boolean hasNext) {
+    public static <T> CursorPage<T> empty() { return new CursorPage<>(List.of(), null, false); }
+
+    public <R> CursorPage<R> map(Function<T, R> fn) {
+        return new CursorPage<>(items.stream().map(fn).toList(), nextCursor, hasNext);
+    }
+}
+```
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/TableDefinition.java
+package com.acme.platform.query;
+
+import java.util.*;
+
+/**
+ * Declarative contract of one queryable StarRocks table/view.
+ * Everything user-controllable (filter/sort fields) is resolved through this whitelist,
+ * so no SQL identifier ever comes from the request.
+ */
+public final class TableDefinition {
+
+    public enum ColumnType { STRING, INT, LONG, DECIMAL, BOOLEAN, DATE, TIMESTAMP }
+    public enum Flag { FILTERABLE, SORTABLE, REQUIRED_RANGE /* forces partition pruning */ }
+
+    public record Column(String apiName, String sqlName, ColumnType type, Set<Flag> flags) {
+        public boolean is(Flag f) { return flags.contains(f); }
+    }
+
+    private final String table;
+    private final Map<String, Column> columns;      // apiName -> column (insertion ordered)
+    private final List<SortOrder> defaultSort;
+    private final String tieBreaker;                // unique column guaranteeing total order
+    private final int maxPageSize;
+    private final int defaultPageSize;
+
+    private TableDefinition(Builder b) {
+        this.table = b.table;
+        this.columns = Collections.unmodifiableMap(new LinkedHashMap<>(b.columns));
+        this.defaultSort = List.copyOf(b.defaultSort);
+        this.tieBreaker = Objects.requireNonNull(b.tieBreaker, "tieBreaker is mandatory for keyset paging");
+        this.maxPageSize = b.maxPageSize;
+        this.defaultPageSize = b.defaultPageSize;
+        column(tieBreaker); // fail fast if misconfigured
+        defaultSort.forEach(s -> requireSortable(s.field()));
+    }
+
+    public String table()                 { return table; }
+    public Collection<Column> columns()   { return columns.values(); }
+    public List<SortOrder> defaultSort()  { return defaultSort; }
+    public String tieBreaker()            { return tieBreaker; }
+    public int maxPageSize()              { return maxPageSize; }
+    public int defaultPageSize()          { return defaultPageSize; }
+
+    public Column column(String apiName) {
+        Column c = columns.get(apiName);
+        if (c == null) throw new QueryValidationException("Unknown field '" + apiName + "'");
+        return c;
+    }
+
+    public Column requireFilterable(String apiName) {
+        Column c = column(apiName);
+        if (!c.is(Flag.FILTERABLE)) throw new QueryValidationException("Field '" + apiName + "' is not filterable");
+        return c;
+    }
+
+    public Column requireSortable(String apiName) {
+        Column c = column(apiName);
+        if (!c.is(Flag.SORTABLE)) throw new QueryValidationException("Field '" + apiName + "' is not sortable");
+        return c;
+    }
+
+    public List<Column> requiredRangeColumns() {
+        return columns.values().stream().filter(c -> c.is(Flag.REQUIRED_RANGE)).toList();
+    }
+
+    public static Builder builder(String table) { return new Builder(table); }
+
+    public static final class Builder {
+        private final String table;
+        private final Map<String, Column> columns = new LinkedHashMap<>();
+        private List<SortOrder> defaultSort = List.of();
+        private String tieBreaker;
+        private int maxPageSize = 500;
+        private int defaultPageSize = 100;
+
+        private Builder(String table) { this.table = table; }
+
+        public Builder col(String api, String sql, ColumnType type, Flag... flags) {
+            columns.put(api, new Column(api, sql, type, flags.length == 0 ? Set.of() : EnumSet.of(flags[0], flags)));
+            return this;
+        }
+        public Builder defaultSort(SortOrder... s)   { this.defaultSort = List.of(s); return this; }
+        public Builder tieBreaker(String apiName)    { this.tieBreaker = apiName; return this; }
+        public Builder maxPageSize(int n)            { this.maxPageSize = n; return this; }
+        public Builder defaultPageSize(int n)        { this.defaultPageSize = n; return this; }
+        public TableDefinition build()               { return new TableDefinition(this); }
+    }
+}
+```
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/QueryValidationException.java
+package com.acme.platform.query;
+
+public class QueryValidationException extends RuntimeException {
+    public QueryValidationException(String message) { super(message); }
+}
+
+// platform-core/src/main/java/com/acme/platform/query/InvalidCursorException.java
+package com.acme.platform.query;
+
+public class InvalidCursorException extends QueryValidationException {
+    public InvalidCursorException(String message) { super(message); }
+}
+```
+
+---
+
+## 4. `platform-starrocks` — connection, query engine, base repository
+
+### 4.1 Configuration
+
+```yaml
+# Each service's application.yml
+spring:
+  application:
+    name: service-orders
+  threads:
+    virtual:
+      enabled: true          # Boot 3.2+, Java 21
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+starrocks:
+  # Connector/J balances across multiple FE nodes; StarRocks speaks MySQL protocol on 9030
+  jdbc-url: >-
+    jdbc:mysql:loadbalance://fe-1:9030,fe-2:9030,fe-3:9030/dw
+    ?useSSL=false
+    &characterEncoding=UTF-8
+    &connectTimeout=3000
+    &socketTimeout=65000
+    &useServerPrepStmts=false
+    &cachePrepStmts=false
+    &rewriteBatchedStatements=false
+    &tcpKeepAlive=true
+    &loadBalanceBlocklistTimeout=30000
+    &loadBalanceStrategy=random
+  username: ${STARROCKS_USER}
+  password: ${STARROCKS_PASSWORD}
+  query-timeout-seconds: 30
+  slow-query-threshold-ms: 2000
+  pool:
+    maximum-pool-size: 32      # OLAP: few, long queries. Don't go huge; StarRocks FE has a connection cap.
+    minimum-idle: 4
+    connection-timeout-ms: 3000
+    max-lifetime-ms: 1800000
+    keepalive-time-ms: 300000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+```
+
+> `useServerPrepStmts=false` is deliberate: StarRocks' server-side prepared statement support is limited; client-side substitution is fully supported and still parameter-safe.
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/StarRocksProperties.java
+package com.acme.platform.starrocks;
+
+import jakarta.validation.constraints.*;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+@Validated
+@ConfigurationProperties(prefix = "starrocks")
+public record StarRocksProperties(
+        @NotBlank String jdbcUrl,
+        @NotBlank String username,
+        String password,
+        @Min(1) int queryTimeoutSeconds,
+        @Min(0) long slowQueryThresholdMs,
+        Pool pool) {
+
+    public record Pool(@Min(1) int maximumPoolSize, @Min(0) int minimumIdle,
+                       long connectionTimeoutMs, long maxLifetimeMs, long keepaliveTimeMs) {}
+}
+```
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/StarRocksAutoConfiguration.java
+package com.acme.platform.starrocks;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+
+import javax.sql.DataSource;
+
+@AutoConfiguration
+@EnableConfigurationProperties(StarRocksProperties.class)
+public class StarRocksAutoConfiguration {
+
+    @Bean(destroyMethod = "close")
+    public HikariDataSource starRocksDataSource(StarRocksProperties p, MeterRegistry registry) {
+        HikariConfig cfg = new HikariConfig();
+        cfg.setPoolName("starrocks");
+        cfg.setJdbcUrl(p.jdbcUrl());
+        cfg.setUsername(p.username());
+        cfg.setPassword(p.password());
+        cfg.setDriverClassName("com.mysql.cj.jdbc.Driver");
+        cfg.setReadOnly(true);
+        cfg.setAutoCommit(true);                       // no transactions on OLAP reads
+        cfg.setMaximumPoolSize(p.pool().maximumPoolSize());
+        cfg.setMinimumIdle(p.pool().minimumIdle());
+        cfg.setConnectionTimeout(p.pool().connectionTimeoutMs());
+        cfg.setMaxLifetime(p.pool().maxLifetimeMs());
+        cfg.setKeepaliveTime(p.pool().keepaliveTimeMs());
+        cfg.setConnectionTestQuery("SELECT 1");
+        // Session-level guard rails applied to every pooled connection:
+        cfg.setConnectionInitSql("SET query_timeout = " + p.queryTimeoutSeconds());
+        cfg.setMetricRegistry(registry);               // Hikari metrics -> Micrometer -> Prometheus
+        return new HikariDataSource(cfg);
+    }
+
+    @Bean
+    public NamedParameterJdbcTemplate starRocksJdbc(DataSource ds, StarRocksProperties p) {
+        JdbcTemplate t = new JdbcTemplate(ds);
+        t.setQueryTimeout(p.queryTimeoutSeconds()); // JDBC-side timeout (belt and braces)
+        t.setFetchSize(1_000);
+        return new NamedParameterJdbcTemplate(t);
+    }
+
+    @Bean
+    public CursorCodec cursorCodec(ObjectMapper objectMapper) { return new CursorCodec(objectMapper); }
+
+    @Bean
+    public ValueCoercer valueCoercer() { return new ValueCoercer(); }
+}
+```
+
+Register it in `platform-starrocks/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`:
+
+```
+com.acme.platform.starrocks.StarRocksAutoConfiguration
+```
+
+### 4.2 Value coercion (JSON/HTTP strings ⇄ typed JDBC params)
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/ValueCoercer.java
+package com.acme.platform.starrocks;
+
+import com.acme.platform.query.QueryValidationException;
+import com.acme.platform.query.TableDefinition.Column;
+import com.acme.platform.query.TableDefinition.ColumnType;
+
+import java.math.BigDecimal;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+public final class ValueCoercer {
+
+    /** Normalises any incoming value (String from HTTP/JSON, Number, temporal) to the column's Java type. */
+    public Object coerce(Object v, Column c) {
+        if (v == null) return null;
+        try {
+            return switch (c.type()) {
+                case STRING    -> v.toString();
+                case INT       -> v instanceof Number n ? n.intValue()  : Integer.parseInt(v.toString());
+                case LONG      -> v instanceof Number n ? n.longValue() : Long.parseLong(v.toString());
+                case DECIMAL   -> v instanceof BigDecimal b ? b : new BigDecimal(v.toString());
+                case BOOLEAN   -> v instanceof Boolean b ? b : Boolean.parseBoolean(v.toString());
+                case DATE      -> v instanceof LocalDate d ? d : LocalDate.parse(v.toString());
+                case TIMESTAMP -> v instanceof LocalDateTime d ? d : LocalDateTime.parse(v.toString());
+            };
+        } catch (RuntimeException e) {
+            throw new QueryValidationException("Invalid value '" + v + "' for field '" + c.apiName() + "' (" + c.type() + ")");
+        }
+    }
+
+    /** Reads a column from the ResultSet as the declared Java type (used to build the next cursor). */
+    public Object read(ResultSet rs, Column c) throws SQLException {
+        return switch (c.type()) {
+            case STRING    -> rs.getString(c.sqlName());
+            case INT       -> rs.getObject(c.sqlName(), Integer.class);
+            case LONG      -> rs.getObject(c.sqlName(), Long.class);
+            case DECIMAL   -> rs.getBigDecimal(c.sqlName());
+            case BOOLEAN   -> rs.getObject(c.sqlName(), Boolean.class);
+            case DATE      -> rs.getObject(c.sqlName(), LocalDate.class);
+            case TIMESTAMP -> rs.getObject(c.sqlName(), LocalDateTime.class);
+        };
+    }
+}
+```
+
+### 4.3 Opaque cursor
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/CursorCodec.java
+package com.acme.platform.starrocks;
+
+import com.acme.platform.query.InvalidCursorException;
+import com.acme.platform.query.SortOrder;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * Cursor = base64url( JSON { "s": "<sort signature>", "k": { field: lastValue, ... } } ).
+ * The sort signature lets us reject a cursor that was issued for a different ordering.
+ * If cursors must be tamper-proof across trust boundaries, wrap the payload in an HMAC here.
+ */
+public final class CursorCodec {
+
+    public record Payload(String s, Map<String, Object> k) {}
+
+    private final ObjectMapper om;
+
+    public CursorCodec(ObjectMapper om) { this.om = om; }
+
+    public String encode(List<SortOrder> sort, Map<String, Object> lastKeys) {
+        try {
+            byte[] json = om.writeValueAsBytes(new Payload(signature(sort), lastKeys));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(json);
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot encode cursor", e);
+        }
+    }
+
+    /** @return the last-seen key values, or null when no cursor (first page). */
+    public Map<String, Object> decode(String cursor, List<SortOrder> expectedSort) {
+        if (cursor == null || cursor.isBlank()) return null;
+        Payload p;
+        try {
+            p = om.readValue(Base64.getUrlDecoder().decode(cursor), Payload.class);
+        } catch (Exception e) {
+            throw new InvalidCursorException("Malformed cursor");
+        }
+        if (!signature(expectedSort).equals(p.s()))
+            throw new InvalidCursorException("Cursor was issued for a different sort order");
+        if (p.k() == null || p.k().size() != expectedSort.size())
+            throw new InvalidCursorException("Cursor keys do not match sort fields");
+        return p.k();
+    }
+
+    private static String signature(List<SortOrder> sort) {
+        return sort.stream().map(s -> s.field() + ":" + s.direction())
+                   .collect(Collectors.joining(",")).intern();
+    }
+
+    @SuppressWarnings("unused")
+    private static String utf8(byte[] b) { return new String(b, StandardCharsets.UTF_8); }
+}
+```
+
+### 4.4 The keyset query builder (the heart of it)
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/KeysetQueryBuilder.java
+package com.acme.platform.starrocks;
+
+import com.acme.platform.query.*;
+import com.acme.platform.query.SortOrder.Direction;
+import com.acme.platform.query.TableDefinition.Column;
+import com.acme.platform.query.TableDefinition.Flag;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Turns a validated QueryRequest into a single StarRocks SELECT with keyset pagination.
+ * Pure function – no I/O – so it is trivially unit-testable.
+ */
+public final class KeysetQueryBuilder {
+
+    public record SqlQuery(String sql, Map<String, Object> params, List<SortOrder> effectiveSort, int limit) {}
+
+    private final TableDefinition def;
+    private final ValueCoercer coercer;
+
+    public KeysetQueryBuilder(TableDefinition def, ValueCoercer coercer) {
+        this.def = def;
+        this.coercer = coercer;
+    }
+
+    public List<SortOrder> effectiveSort(QueryRequest req) {
+        List<SortOrder> sort = new ArrayList<>(req.sort().isEmpty() ? def.defaultSort() : req.sort());
+        sort.forEach(s -> def.requireSortable(s.field()));
+        // Guarantee a total order: the tie-breaker must be the last sort key.
+        boolean hasTieBreaker = sort.stream().anyMatch(s -> s.field().equals(def.tieBreaker()));
+        if (!hasTieBreaker) {
+            Direction dir = sort.isEmpty() ? Direction.DESC : sort.get(sort.size() - 1).direction();
+            sort.add(new SortOrder(def.tieBreaker(), dir));
+        }
+        return List.copyOf(sort);
+    }
+
+    public int pageSize(QueryRequest req) {
+        int size = req.pageSize() <= 0 ? def.defaultPageSize() : req.pageSize();
+        if (size > def.maxPageSize())
+            throw new QueryValidationException("pageSize must be <= " + def.maxPageSize());
+        return size;
+    }
+
+    public SqlQuery build(QueryRequest req, List<String> selectApiNames, Map<String, Object> cursorKeys) {
+        List<SortOrder> sort = effectiveSort(req);
+        int size = pageSize(req);
+        Map<String, Object> params = new LinkedHashMap<>();
+        List<String> where = new ArrayList<>();
+
+        validateRequiredRanges(req.filters());
+
+        // --- user filters -----------------------------------------------------------------
+        int i = 0;
+        for (Filter f : req.filters()) {
+            Column c = def.requireFilterable(f.field());
+            where.add(predicate(c, f, "f" + (i++), params));
+        }
+
+        // --- keyset predicate -------------------------------------------------------------
+        if (cursorKeys != null) {
+            where.add(keysetPredicate(sort, cursorKeys, params));
+        }
+
+        // --- select list: requested columns + sort columns (needed for next cursor) -------
+        LinkedHashSet<String> select = new LinkedHashSet<>(selectApiNames);
+        sort.forEach(s -> select.add(s.field()));
+        String selectSql = select.stream()
+                .map(api -> { Column c = def.column(api); return c.sqlName(); })
+                .collect(Collectors.joining(", "));
+
+        String orderBy = sort.stream()
+                .map(s -> def.column(s.field()).sqlName() + " " + s.direction())
+                .collect(Collectors.joining(", "));
+
+        StringBuilder sql = new StringBuilder(256)
+                .append("SELECT ").append(selectSql)
+                .append(" FROM ").append(def.table());
+        if (!where.isEmpty()) sql.append(" WHERE ").append(String.join(" AND ", where));
+        sql.append(" ORDER BY ").append(orderBy)
+           .append(" LIMIT ").append(size + 1);           // +1 row to compute hasNext cheaply
+
+        return new SqlQuery(sql.toString(), params, sort, size);
+    }
+
+    // -------------------------------------------------------------------------------------
+
+    private void validateRequiredRanges(List<Filter> filters) {
+        for (Column c : def.requiredRangeColumns()) {
+            boolean lower = false, upper = false;
+            for (Filter f : filters) {
+                if (!f.field().equals(c.apiName())) continue;
+                switch (f.op()) {
+                    case EQ, BETWEEN -> { lower = true; upper = true; }
+                    case GT, GTE     -> lower = true;
+                    case LT, LTE     -> upper = true;
+                    default -> {}
+                }
+            }
+            if (!(lower && upper))
+                throw new QueryValidationException(
+                        "Field '" + c.apiName() + "' requires a bounded range (both lower and upper bound)");
+        }
+    }
+
+    private String predicate(Column c, Filter f, String p, Map<String, Object> params) {
+        String col = c.sqlName();
+        List<Object> v = f.values();
+        return switch (f.op()) {
+            case EQ  -> { one(f); params.put(p, coercer.coerce(v.get(0), c)); yield col + " = :" + p; }
+            case NE  -> { one(f); params.put(p, coercer.coerce(v.get(0), c)); yield col + " <> :" + p; }
+            case GT  -> { one(f); params.put(p, coercer.coerce(v.get(0), c)); yield col + " > :" + p; }
+            case GTE -> { one(f); params.put(p, coercer.coerce(v.get(0), c)); yield col + " >= :" + p; }
+            case LT  -> { one(f); params.put(p, coercer.coerce(v.get(0), c)); yield col + " < :" + p; }
+            case LTE -> { one(f); params.put(p, coercer.coerce(v.get(0), c)); yield col + " <= :" + p; }
+            case LIKE -> {
+                one(f);
+                if (c.type() != TableDefinition.ColumnType.STRING)
+                    throw new QueryValidationException("LIKE only allowed on string field '" + c.apiName() + "'");
+                params.put(p, v.get(0).toString());
+                yield col + " LIKE :" + p;
+            }
+            case IN -> {
+                if (v.isEmpty() || v.size() > 1000)
+                    throw new QueryValidationException("IN requires 1..1000 values for '" + c.apiName() + "'");
+                params.put(p, v.stream().map(x -> coercer.coerce(x, c)).toList());
+                yield col + " IN (:" + p + ")";           // NamedParameterJdbcTemplate expands the list
+            }
+            case BETWEEN -> {
+                if (v.size() != 2) throw new QueryValidationException("BETWEEN requires exactly 2 values");
+                params.put(p + "a", coercer.coerce(v.get(0), c));
+                params.put(p + "b", coercer.coerce(v.get(1), c));
+                yield col + " BETWEEN :" + p + "a AND :" + p + "b";
+            }
+        };
+    }
+
+    private static void one(Filter f) {
+        if (f.values().size() != 1)
+            throw new QueryValidationException(f.op() + " requires exactly one value for '" + f.field() + "'");
+    }
+
+    /**
+     * Row-value comparison expanded into an OR chain so that mixed ASC/DESC works and
+     * StarRocks can still prune on the leading sort column:
+     *   (c1 < :k0) OR (c1 = :k0 AND c2 < :k1) OR (c1 = :k0 AND c2 = :k1 AND c3 < :k2)
+     * NOTE: sort columns must be NOT NULL (NULLs break the total order).
+     */
+    private String keysetPredicate(List<SortOrder> sort, Map<String, Object> keys, Map<String, Object> params) {
+        List<String> ors = new ArrayList<>(sort.size());
+        for (int i = 0; i < sort.size(); i++) {
+            List<String> ands = new ArrayList<>(i + 1);
+            for (int j = 0; j < i; j++) ands.add(def.column(sort.get(j).field()).sqlName() + " = :k" + j);
+            SortOrder s = sort.get(i);
+            String cmp = s.direction() == Direction.DESC ? " < " : " > ";
+            ands.add(def.column(s.field()).sqlName() + cmp + ":k" + i);
+            ors.add("(" + String.join(" AND ", ands) + ")");
+        }
+        for (int i = 0; i < sort.size(); i++) {
+            Column c = def.column(sort.get(i).field());
+            Object raw = keys.get(c.apiName());
+            if (raw == null) throw new InvalidCursorException("Cursor missing key '" + c.apiName() + "'");
+            params.put("k" + i, coercer.coerce(raw, c));
+        }
+        return "(" + String.join(" OR ", ors) + ")";
+    }
+}
+```
+
+### 4.5 Base repository — every service extends this
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/AbstractStarRocksReadRepository.java
+package com.acme.platform.starrocks;
+
+import com.acme.platform.query.*;
+import com.acme.platform.query.TableDefinition.Column;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Generic, read-only, keyset-paginated repository for one StarRocks table.
+ * Subclasses only provide: the TableDefinition, the columns to select, and a RowMapper.
+ */
+public abstract class AbstractStarRocksReadRepository<T> {
+
+    private static final Logger log = LoggerFactory.getLogger(AbstractStarRocksReadRepository.class);
+
+    protected final NamedParameterJdbcTemplate jdbc;
+    protected final TableDefinition def;
+    private final KeysetQueryBuilder builder;
+    private final CursorCodec cursorCodec;
+    private final ValueCoercer coercer;
+    private final Timer queryTimer;
+    private final long slowQueryThresholdMs;
+
+    protected AbstractStarRocksReadRepository(NamedParameterJdbcTemplate jdbc,
+                                              TableDefinition def,
+                                              CursorCodec cursorCodec,
+                                              ValueCoercer coercer,
+                                              MeterRegistry registry,
+                                              StarRocksProperties props) {
+        this.jdbc = jdbc;
+        this.def = def;
+        this.cursorCodec = cursorCodec;
+        this.coercer = coercer;
+        this.builder = new KeysetQueryBuilder(def, coercer);
+        this.slowQueryThresholdMs = props.slowQueryThresholdMs();
+        this.queryTimer = Timer.builder("starrocks.query")
+                .tag("table", def.table())
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry);
+    }
+
+    /** API names of the columns this repository selects (must be a subset of def.columns()). */
+    protected abstract List<String> selectColumns();
+
+    protected abstract RowMapper<T> rowMapper();
+
+    public CursorPage<T> findPage(QueryRequest req) {
+        List<SortOrder> sort = builder.effectiveSort(req);
+        Map<String, Object> cursorKeys = cursorCodec.decode(req.cursor(), sort);
+        KeysetQueryBuilder.SqlQuery q = builder.build(req, selectColumns(), cursorKeys);
+        RowMapper<T> mapper = rowMapper();
+        List<Column> sortCols = sort.stream().map(s -> def.column(s.field())).toList();
+
+        long start = System.nanoTime();
+        try {
+            CursorPage<T> page = jdbc.query(q.sql(), q.params(), rs -> {
+                List<T> items = new ArrayList<>(q.limit());
+                Map<String, Object> lastKeys = null;
+                int n = 0;
+                boolean hasNext = false;
+                while (rs.next()) {
+                    if (n == q.limit()) { hasNext = true; break; }   // the extra row
+                    items.add(mapper.mapRow(rs, n));
+                    lastKeys = new LinkedHashMap<>(sortCols.size());
+                    for (Column c : sortCols) lastKeys.put(c.apiName(), coercer.read(rs, c));
+                    n++;
+                }
+                String next = hasNext ? cursorCodec.encode(sort, lastKeys) : null;
+                return new CursorPage<>(items, next, hasNext);
+            });
+            return page == null ? CursorPage.empty() : page;
+        } finally {
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            queryTimer.record(elapsedMs, TimeUnit.MILLISECONDS);
+            if (elapsedMs >= slowQueryThresholdMs) {
+                log.warn("Slow StarRocks query ({} ms) on {}: {} params={}", elapsedMs, def.table(), q.sql(), q.params());
+            } else if (log.isDebugEnabled()) {
+                log.debug("StarRocks query ({} ms): {} params={}", elapsedMs, q.sql(), q.params());
+            }
+        }
+    }
+
+    /**
+     * Counts are expensive on billions of rows. Keep them on a separate endpoint,
+     * cache them, and *always* require the same bounded range filters.
+     */
+    public long count(QueryRequest req) {
+        KeysetQueryBuilder.SqlQuery q = builder.build(req, List.of(def.tieBreaker()), null);
+        String countSql = "SELECT COUNT(*) FROM " + def.table()
+                + extractWhere(q.sql());
+        Long c = jdbc.queryForObject(countSql, q.params(), Long.class);
+        return c == null ? 0 : c;
+    }
+
+    private static String extractWhere(String selectSql) {
+        int w = selectSql.indexOf(" WHERE ");
+        int o = selectSql.indexOf(" ORDER BY ");
+        return w < 0 ? "" : selectSql.substring(w, o);
+    }
+}
+```
+
+---
+
+## 5. `platform-web` — shared HTTP concerns
+
+```java
+// platform-web/src/main/java/com/acme/platform/web/ApiExceptionHandler.java
+package com.acme.platform.web;
+
+import com.acme.platform.query.QueryValidationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.QueryTimeoutException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class ApiExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(ApiExceptionHandler.class);
+
+    @ExceptionHandler(QueryValidationException.class)
+    ProblemDetail badRequest(QueryValidationException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, e.getMessage());
+    }
+
+    @ExceptionHandler(QueryTimeoutException.class)
+    ProblemDetail timeout(QueryTimeoutException e) {
+        log.warn("StarRocks query timed out: {}", e.getMessage());
+        return ProblemDetail.forStatusAndDetail(HttpStatus.GATEWAY_TIMEOUT,
+                "Query exceeded the time limit. Narrow the time range or filters.");
+    }
+
+    @ExceptionHandler(DataAccessException.class)
+    ProblemDetail dataAccess(DataAccessException e) {
+        log.error("StarRocks access failure", e);
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, "Data store unavailable");
+    }
+}
+```
+
+```java
+// platform-web/src/main/java/com/acme/platform/web/SortParam.java
+package com.acme.platform.web;
+
+import com.acme.platform.query.QueryValidationException;
+import com.acme.platform.query.SortOrder;
+
+import java.util.List;
+
+/** Parses ?sort=orderTime,desc&sort=orderId,desc  */
+public final class SortParam {
+    private SortParam() {}
+
+    public static List<SortOrder> parse(List<String> raw) {
+        if (raw == null) return List.of();
+        return raw.stream().map(s -> {
+            String[] parts = s.split(",", 2);
+            SortOrder.Direction d = parts.length == 2 && parts[1].equalsIgnoreCase("asc")
+                    ? SortOrder.Direction.ASC : SortOrder.Direction.DESC;
+            if (parts[0].isBlank()) throw new QueryValidationException("Empty sort field");
+            return new SortOrder(parts[0].trim(), d);
+        }).toList();
+    }
+}
+```
+
+---
+
+## 6. `service-orders` — a concrete service (template for all others)
+
+### StarRocks table (design the table for the access pattern)
+
+```sql
+CREATE TABLE dw.fact_orders (
+    customer_id  BIGINT        NOT NULL,
+    order_time   DATETIME      NOT NULL,
+    order_id     BIGINT        NOT NULL,
+    status       VARCHAR(16)   NOT NULL,
+    amount       DECIMAL(18,2) NOT NULL,
+    currency     VARCHAR(3)    NOT NULL
+) ENGINE = OLAP
+DUPLICATE KEY(customer_id, order_time, order_id)   -- prefix index matches the hot filter + sort
+PARTITION BY date_trunc('day', order_time)         -- bounded time range => partition pruning
+DISTRIBUTED BY HASH(order_id)
+PROPERTIES ("replication_num" = "3");
+```
+
+### The five classes
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrderTable.java
+package com.acme.orders;
+
+import com.acme.platform.query.TableDefinition;
+import static com.acme.platform.query.SortOrder.desc;
+import static com.acme.platform.query.TableDefinition.ColumnType.*;
+import static com.acme.platform.query.TableDefinition.Flag.*;
+
+final class OrderTable {
+    private OrderTable() {}
+
+    static final TableDefinition DEF = TableDefinition.builder("dw.fact_orders")
+            .col("orderId",    "order_id",    LONG,      FILTERABLE, SORTABLE)
+            .col("orderTime",  "order_time",  TIMESTAMP, FILTERABLE, SORTABLE, REQUIRED_RANGE)
+            .col("customerId", "customer_id", LONG,      FILTERABLE)
+            .col("status",     "status",      STRING,    FILTERABLE)
+            .col("amount",     "amount",      DECIMAL,   FILTERABLE, SORTABLE)
+            .col("currency",   "currency",    STRING)
+            .defaultSort(desc("orderTime"), desc("orderId"))
+            .tieBreaker("orderId")
+            .defaultPageSize(100)
+            .maxPageSize(500)
+            .build();
+}
+```
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrderView.java
+package com.acme.orders;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+public record OrderView(long orderId, LocalDateTime orderTime, long customerId,
+                        String status, BigDecimal amount, String currency) {}
+```
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrderRepository.java
+package com.acme.orders;
+
+import com.acme.platform.starrocks.*;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Repository
+public class OrderRepository extends AbstractStarRocksReadRepository<OrderView> {
+
+    private static final List<String> SELECT =
+            List.of("orderId", "orderTime", "customerId", "status", "amount", "currency");
+
+    private static final RowMapper<OrderView> MAPPER = (rs, i) -> new OrderView(
+            rs.getLong("order_id"),
+            rs.getObject("order_time", LocalDateTime.class),
+            rs.getLong("customer_id"),
+            rs.getString("status"),
+            rs.getBigDecimal("amount"),
+            rs.getString("currency"));
+
+    public OrderRepository(NamedParameterJdbcTemplate jdbc, CursorCodec codec, ValueCoercer coercer,
+                           MeterRegistry registry, StarRocksProperties props) {
+        super(jdbc, OrderTable.DEF, codec, coercer, registry, props);
+    }
+
+    @Override protected List<String> selectColumns() { return SELECT; }
+    @Override protected RowMapper<OrderView> rowMapper() { return MAPPER; }
+}
+```
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrderQueryService.java
+package com.acme.orders;
+
+import com.acme.platform.query.*;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+
+/** Typed, domain-specific API on top of the generic engine. This is the layer you extend. */
+@Service
+public class OrderQueryService {
+
+    public record OrderSearch(LocalDateTime from, LocalDateTime to, Long customerId,
+                              Set<String> statuses, List<SortOrder> sort, int pageSize, String cursor) {}
+
+    private final OrderRepository repo;
+
+    public OrderQueryService(OrderRepository repo) { this.repo = repo; }
+
+    public CursorPage<OrderView> search(OrderSearch s) {
+        List<Filter> filters = new ArrayList<>();
+        filters.add(Filter.gte("orderTime", s.from()));
+        filters.add(Filter.lt("orderTime", s.to()));
+        if (s.customerId() != null)                       filters.add(Filter.eq("customerId", s.customerId()));
+        if (s.statuses() != null && !s.statuses().isEmpty()) filters.add(Filter.in("status", List.copyOf(s.statuses())));
+
+        return repo.findPage(new QueryRequest(filters, s.sort(), s.pageSize(), s.cursor()));
+    }
+}
+```
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrderController.java
+package com.acme.orders;
+
+import com.acme.platform.query.CursorPage;
+import com.acme.platform.query.QueryValidationException;
+import com.acme.platform.web.SortParam;
+import jakarta.validation.constraints.*;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Set;
+
+@Validated
+@RestController
+@RequestMapping("/api/v1/orders")
+public class OrderController {
+
+    private static final Duration MAX_RANGE = Duration.ofDays(31);
+
+    private final OrderQueryService service;
+
+    public OrderController(OrderQueryService service) { this.service = service; }
+
+    /**
+     * GET /api/v1/orders?from=2025-01-01T00:00:00&to=2025-01-08T00:00:00
+     *                    &customerId=42&status=PAID&status=SHIPPED
+     *                    &sort=orderTime,desc&size=100&cursor=eyJz...
+     */
+    @GetMapping
+    public CursorPage<OrderView> search(
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime from,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime to,
+            @RequestParam(required = false) Long customerId,
+            @RequestParam(required = false) Set<@Size(max = 16) String> status,
+            @RequestParam(required = false) List<String> sort,
+            @RequestParam(defaultValue = "100") @Min(1) @Max(500) int size,
+            @RequestParam(required = false) String cursor) {
+
+        if (!to.isAfter(from) || Duration.between(from, to).compareTo(MAX_RANGE) > 0)
+            throw new QueryValidationException("Time range must be positive and at most " + MAX_RANGE.toDays() + " days");
+
+        return service.search(new OrderQueryService.OrderSearch(
+                from, to, customerId, status, SortParam.parse(sort), size, cursor));
+    }
+}
+```
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrdersApplication.java
+package com.acme.orders;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class OrdersApplication {
+    public static void main(String[] args) { SpringApplication.run(OrdersApplication.class, args); }
+}
+```
+
+### Example response
+
+```json
+{
+  "items": [
+    { "orderId": 918273645, "orderTime": "2025-01-07T23:59:58", "customerId": 42,
+      "status": "PAID", "amount": 129.90, "currency": "EUR" }
+  ],
+  "nextCursor": "eyJzIjoib3JkZXJUaW1lOkRFU0Msb3JkZXJJZDpERVNDIiwiayI6eyJvcmRlclRpbWUiOiIyMDI1LTAxLTA3VDIzOjU5OjU4Iiwib3JkZXJJZCI6OTE4MjczNjQ1fX0",
+  "hasNext": true
+}
+```
+
+The client just echoes `nextCursor` back as `?cursor=`; the SQL generated for page 2 is:
+
+```sql
+SELECT order_id, order_time, customer_id, status, amount, currency
+FROM dw.fact_orders
+WHERE order_time >= :f0 AND order_time < :f1 AND customer_id = :f2
+  AND ((order_time < :k0) OR (order_time = :k0 AND order_id < :k1))
+ORDER BY order_time DESC, order_id DESC
+LIMIT 101
+```
+
+---
+
+## 7. Testing
+
+**Unit-test the builder** (pure, fast, this is where bugs hide):
+
+```java
+class KeysetQueryBuilderTest {
+    private final KeysetQueryBuilder b = new KeysetQueryBuilder(OrderTable.DEF, new ValueCoercer());
+
+    @Test
+    void appendsTieBreakerAndKeysetPredicate() {
+        var req = new QueryRequest(
+                List.of(Filter.gte("orderTime", "2025-01-01T00:00:00"), Filter.lt("orderTime", "2025-01-02T00:00:00")),
+                List.of(SortOrder.desc("amount")), 50, null);
+        var q = b.build(req, List.of("orderId", "amount"), Map.of("amount", "10.00", "orderId", 7));
+        assertThat(q.sql()).contains("ORDER BY amount DESC, order_id DESC LIMIT 51")
+                           .contains("(amount < :k0) OR (amount = :k0 AND order_id < :k1)");
+    }
+
+    @Test
+    void rejectsUnboundedTimeRange() {
+        var req = new QueryRequest(List.of(Filter.gte("orderTime", "2025-01-01T00:00:00")), List.of(), 50, null);
+        assertThrows(QueryValidationException.class, () -> b.build(req, List.of("orderId"), null));
+    }
+}
+```
+
+**Integration-test against real StarRocks** with Testcontainers using the `starrocks/allin1-ubuntu` image (exposes FE on 9030), seeding a few thousand rows and walking all pages to assert no duplicates/gaps.
+
+---
+
+## 8. StarRocks-specific production checklist
+
+1. **Align sort/filter with the table's sort key.** Keyset paging is only O(page) when `ORDER BY` matches (or is a prefix of) `DUPLICATE KEY`/`ORDER BY` of the table. If a service needs a different ordering, create a **synchronous materialized view** or a second table with that sort key instead of fighting the planner.
+2. **Always partition-prune.** The `REQUIRED_RANGE` flag + max-range check in the controller enforces this. Add a `Duration` cap per service.
+3. **Sort columns `NOT NULL`.** NULLs break keyset total ordering.
+4. **Never `SELECT *`.** The select list is explicit per repository; columnar storage means fewer columns = fewer bytes read.
+5. **Session guard rails** via `connectionInitSql`: `query_timeout`, optionally `SET exec_mem_limit`, `SET pipeline_dop` for very hot, small queries.
+6. **Pool sizing**: 16–32 connections per instance is usually right; horizontal scaling of the service is preferable to huge pools. Watch `hikaricp_connections_pending` in Prometheus.
+7. **Caching**: if several clients page over the same hot queries, add Caffeine on `(filters, sort, cursor)` with a short TTL — but only on first pages; deep pages are rarely re-read.
+8. **Counts**: expose `/count` separately, cache 1–5 min, and consider `approx_count_distinct` or pre-aggregated materialized views.
+9. **Deep export use cases** (someone wants "all 2 billion rows"): don't paginate over HTTP; run a `SELECT ... INTO OUTFILE S3` export job and hand back a link.
+
+## 9. Adding a new service (e.g. `service-events`) — the 5-step recipe
+
+1. Create `EventTable.DEF` — declare columns, flags, default sort, tie-breaker.
+2. Create `EventView` record.
+3. Create `EventRepository extends AbstractStarRocksReadRepository<EventView>` (select list + mapper).
+4. Create `EventQueryService` with a typed `EventSearch` record → `QueryRequest`.
+5. Create `EventController`.
+
+Nothing in the platform modules changes, and every service automatically gets keyset paging, cursor validation, column whitelisting, partition-pruning enforcement, timeouts, metrics, slow-query logging and consistent error responses.
