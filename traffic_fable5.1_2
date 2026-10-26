@@ -1,0 +1,428 @@
+Yes, that's a legitimate choice — and the architecture was built so the pagination strategy is swappable. But first, one thing you need to know, because it affects offset paging just as much as keyset:
+
+## The real problem isn't keyset — it's non-deterministic ordering
+
+Without a unique sort key, **offset pagination is also unstable** on StarRocks. `ORDER BY order_time LIMIT 100 OFFSET 200` is executed in parallel across tablets/BEs, and rows that tie on `order_time` come back in whatever order the merge happened to produce *that run*. So between page 2 and page 3 you can see the same row twice and miss another entirely. Nothing in SQL guarantees otherwise; this is true on MySQL/Postgres too, it's just more visible on a distributed engine.
+
+Three ways out, from best to "acceptable":
+
+| Option | How | Keyset possible? |
+|---|---|---|
+| **A. Add a synthetic tiebreaker** | `AUTO_INCREMENT BIGINT` column (StarRocks 3.0+), or compute an id at ingestion (Kafka offset, snowflake id, `murmur_hash3_32` of the row…) | ✅ |
+| **B. Sort on enough columns to be unique** | e.g. `(order_time, customer_id, amount)` — if that's unique in practice, keyset works with the full row-value comparison the builder already generates | ✅ |
+| **C. Accept approximate paging with offset** | Sort by as many columns as you can to minimise ties, cap the max offset, document that deep pages may shift | ❌ |
+
+If the table is a `DUPLICATE KEY` table with *truly* identical rows, there is no way to distinguish them anyway, so C is your only option — and that's fine for dashboards/browsing. Below is the offset implementation as a first-class strategy, so each service picks its mode in its `TableDefinition`.
+
+## 1. `platform-core` changes
+
+### Pagination as a sealed type
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/Pagination.java
+package com.acme.platform.query;
+
+public sealed interface Pagination permits Pagination.Keyset, Pagination.Offset {
+    int pageSize();
+
+    /** Cursor-based: constant cost per page, needs a tie-breaker. */
+    record Keyset(int pageSize, String cursor) implements Pagination {}
+
+    /** Offset-based: page is zero-based. Cost grows with page number. */
+    record Offset(int pageSize, int page, boolean includeTotal) implements Pagination {
+        public Offset {
+            if (page < 0) throw new QueryValidationException("page must be >= 0");
+        }
+    }
+}
+```
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/QueryRequest.java
+package com.acme.platform.query;
+
+import java.util.List;
+
+public record QueryRequest(List<Filter> filters, List<SortOrder> sort, Pagination pagination) {
+    public QueryRequest {
+        filters = filters == null ? List.of() : List.copyOf(filters);
+        sort    = sort    == null ? List.of() : List.copyOf(sort);
+        if (pagination == null) throw new QueryValidationException("pagination is required");
+    }
+}
+```
+
+### One result type for both modes (replaces `CursorPage`)
+
+```java
+// platform-core/src/main/java/com/acme/platform/query/Page.java
+package com.acme.platform.query;
+
+import java.util.List;
+import java.util.function.Function;
+
+/**
+ * Flat so JSON stays simple. Fields irrelevant to the mode are null
+ * (configure Jackson with default-property-inclusion: non_null).
+ *   keyset  -> nextCursor set, page/total null
+ *   offset  -> page set, total set only if requested, nextCursor null
+ */
+public record Page<T>(List<T> items, int pageSize, boolean hasNext,
+                      String nextCursor, Integer page, Long total) {
+
+    public static <T> Page<T> keyset(List<T> items, int size, boolean hasNext, String next) {
+        return new Page<>(items, size, hasNext, next, null, null);
+    }
+    public static <T> Page<T> offset(List<T> items, int size, boolean hasNext, int page, Long total) {
+        return new Page<>(items, size, hasNext, null, page, total);
+    }
+    public <R> Page<R> map(Function<T, R> fn) {
+        return new Page<>(items.stream().map(fn).toList(), pageSize, hasNext, nextCursor, page, total);
+    }
+}
+```
+
+### `TableDefinition`: tie-breaker becomes optional, add offset guard rails
+
+Only the changed parts:
+
+```java
+public final class TableDefinition {
+
+    public enum PaginationMode { KEYSET, OFFSET }
+
+    private final String tieBreaker;                 // may be null
+    private final Set<PaginationMode> allowedModes;
+    private final long maxOffset;                    // hard cap on rows StarRocks must skip
+
+    private TableDefinition(Builder b) {
+        // ... as before ...
+        this.tieBreaker = b.tieBreaker;
+        this.allowedModes = Set.copyOf(b.allowedModes);
+        this.maxOffset = b.maxOffset;
+
+        if (allowedModes.contains(PaginationMode.KEYSET) && tieBreaker == null)
+            throw new IllegalStateException(table + ": KEYSET pagination requires a tieBreaker column");
+        if (tieBreaker != null) column(tieBreaker);
+        if (defaultSort.isEmpty())
+            throw new IllegalStateException(table + ": defaultSort is mandatory – unordered paging is meaningless");
+        defaultSort.forEach(s -> requireSortable(s.field()));
+    }
+
+    public Optional<String> tieBreaker()        { return Optional.ofNullable(tieBreaker); }
+    public long maxOffset()                     { return maxOffset; }
+    public boolean allows(PaginationMode m)     { return allowedModes.contains(m); }
+
+    public static final class Builder {
+        private String tieBreaker;                                  // optional now
+        private Set<PaginationMode> allowedModes = EnumSet.of(PaginationMode.KEYSET);
+        private long maxOffset = 100_000;
+
+        public Builder tieBreaker(String apiName)          { this.tieBreaker = apiName; return this; }
+        public Builder pagination(PaginationMode... modes) { this.allowedModes = EnumSet.of(modes[0], modes); return this; }
+        public Builder maxOffset(long rows)                { this.maxOffset = rows; return this; }
+        // ... rest as before
+    }
+}
+```
+
+## 2. `platform-starrocks`: the builder gets a second strategy
+
+Rename `KeysetQueryBuilder` → `SelectQueryBuilder`. The filter/select/order-by logic is shared; only the tail of the statement differs. This also replaces the `extractWhere` string hack from the `count()` method with a proper `buildCount`.
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/SelectQueryBuilder.java
+package com.acme.platform.starrocks;
+
+import com.acme.platform.query.*;
+import com.acme.platform.query.Pagination.Offset;
+import com.acme.platform.query.SortOrder.Direction;
+import com.acme.platform.query.TableDefinition.Column;
+import com.acme.platform.query.TableDefinition.PaginationMode;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+public final class SelectQueryBuilder {
+
+    public record SqlQuery(String sql, Map<String, Object> params, List<SortOrder> effectiveSort, int limit) {}
+
+    /** Shared skeleton: SELECT list, WHERE (filters only), ORDER BY, bound params. */
+    private record Skeleton(String select, String where, String orderBy,
+                            Map<String, Object> params, List<SortOrder> sort) {}
+
+    private final TableDefinition def;
+    private final ValueCoercer coercer;
+
+    public SelectQueryBuilder(TableDefinition def, ValueCoercer coercer) {
+        this.def = def; this.coercer = coercer;
+    }
+
+    // ---------------------------------------------------------------- public API
+
+    public List<SortOrder> effectiveSort(QueryRequest req) {
+        List<SortOrder> sort = new ArrayList<>(req.sort().isEmpty() ? def.defaultSort() : req.sort());
+        sort.forEach(s -> def.requireSortable(s.field()));
+        def.tieBreaker().ifPresent(tb -> {
+            if (sort.stream().noneMatch(s -> s.field().equals(tb))) {
+                sort.add(new SortOrder(tb, sort.get(sort.size() - 1).direction()));
+            }
+        });
+        return List.copyOf(sort);
+    }
+
+    public int pageSize(QueryRequest req) {
+        int size = req.pagination().pageSize() <= 0 ? def.defaultPageSize() : req.pagination().pageSize();
+        if (size > def.maxPageSize())
+            throw new QueryValidationException("pageSize must be <= " + def.maxPageSize());
+        return size;
+    }
+
+    /** Keyset: ... WHERE filters AND (keyset predicate) ORDER BY ... LIMIT n+1 */
+    public SqlQuery buildKeyset(QueryRequest req, List<String> selectApi, Map<String, Object> cursorKeys) {
+        requireMode(PaginationMode.KEYSET);
+        Skeleton s = skeleton(req, selectApi);
+        int size = pageSize(req);
+
+        List<String> where = new ArrayList<>();
+        if (!s.where().isEmpty()) where.add(s.where());
+        if (cursorKeys != null) where.add(keysetPredicate(s.sort(), cursorKeys, s.params()));
+
+        String sql = "SELECT " + s.select() + " FROM " + def.table()
+                + (where.isEmpty() ? "" : " WHERE " + String.join(" AND ", where))
+                + " ORDER BY " + s.orderBy()
+                + " LIMIT " + (size + 1);
+        return new SqlQuery(sql, s.params(), s.sort(), size);
+    }
+
+    /** Offset: ... WHERE filters ORDER BY ... LIMIT n+1 OFFSET page*n */
+    public SqlQuery buildOffset(QueryRequest req, List<String> selectApi) {
+        requireMode(PaginationMode.OFFSET);
+        Offset p = (Offset) req.pagination();
+        int size = pageSize(req);
+        long offset = (long) p.page() * size;
+        if (offset > def.maxOffset())
+            throw new QueryValidationException(
+                "Page too deep: offset " + offset + " exceeds the limit of " + def.maxOffset()
+                + " rows. Narrow the filters or time range.");
+
+        Skeleton s = skeleton(req, selectApi);
+        String sql = "SELECT " + s.select() + " FROM " + def.table()
+                + (s.where().isEmpty() ? "" : " WHERE " + s.where())
+                + " ORDER BY " + s.orderBy()
+                + " LIMIT " + (size + 1) + " OFFSET " + offset;   // validated ints – safe to inline
+        return new SqlQuery(sql, s.params(), s.sort(), size);
+    }
+
+    /** COUNT(*) with the same filters (no ORDER BY, no LIMIT). */
+    public SqlQuery buildCount(QueryRequest req) {
+        Skeleton s = skeleton(req, List.of());
+        String sql = "SELECT COUNT(*) FROM " + def.table()
+                + (s.where().isEmpty() ? "" : " WHERE " + s.where());
+        return new SqlQuery(sql, s.params(), s.sort(), 1);
+    }
+
+    // ---------------------------------------------------------------- internals
+
+    private void requireMode(PaginationMode m) {
+        if (!def.allows(m))
+            throw new QueryValidationException(m + " pagination is not supported for this resource");
+    }
+
+    private Skeleton skeleton(QueryRequest req, List<String> selectApi) {
+        List<SortOrder> sort = effectiveSort(req);
+        Map<String, Object> params = new LinkedHashMap<>();
+        validateRequiredRanges(req.filters());
+
+        List<String> where = new ArrayList<>();
+        int i = 0;
+        for (Filter f : req.filters()) {
+            Column c = def.requireFilterable(f.field());
+            where.add(predicate(c, f, "f" + (i++), params));
+        }
+
+        LinkedHashSet<String> select = new LinkedHashSet<>(selectApi);
+        sort.forEach(s -> select.add(s.field()));            // sort cols needed for cursor; harmless for offset
+        String selectSql = select.stream().map(a -> def.column(a).sqlName()).collect(Collectors.joining(", "));
+        String orderBy = sort.stream()
+                .map(s -> def.column(s.field()).sqlName() + " " + s.direction())
+                .collect(Collectors.joining(", "));
+
+        return new Skeleton(selectSql, String.join(" AND ", where), orderBy, params, sort);
+    }
+
+    // validateRequiredRanges(...), predicate(...), one(...), keysetPredicate(...)
+    // are unchanged from the previous version.
+}
+```
+
+## 3. Repository: dispatch on the pagination type
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/AbstractStarRocksReadRepository.java
+public abstract class AbstractStarRocksReadRepository<T> {
+
+    // fields / constructor as before, with `SelectQueryBuilder builder`
+
+    protected abstract List<String> selectColumns();
+    protected abstract RowMapper<T> rowMapper();
+
+    public Page<T> findPage(QueryRequest req) {
+        return switch (req.pagination()) {
+            case Pagination.Keyset k -> findKeyset(req, k);
+            case Pagination.Offset o -> findOffset(req, o);
+        };
+    }
+
+    // ---------------------------------------------------------------- keyset (as before, adapted)
+
+    private Page<T> findKeyset(QueryRequest req, Pagination.Keyset k) {
+        List<SortOrder> sort = builder.effectiveSort(req);
+        Map<String, Object> keys = cursorCodec.decode(k.cursor(), sort);
+        SelectQueryBuilder.SqlQuery q = builder.buildKeyset(req, selectColumns(), keys);
+        List<Column> sortCols = sort.stream().map(s -> def.column(s.field())).toList();
+        RowMapper<T> mapper = rowMapper();
+
+        return timed(q, () -> jdbc.query(q.sql(), q.params(), rs -> {
+            List<T> items = new ArrayList<>(q.limit());
+            Map<String, Object> last = null;
+            boolean hasNext = false;
+            int n = 0;
+            while (rs.next()) {
+                if (n == q.limit()) { hasNext = true; break; }
+                items.add(mapper.mapRow(rs, n++));
+                last = new LinkedHashMap<>();
+                for (Column c : sortCols) last.put(c.apiName(), coercer.read(rs, c));
+            }
+            return Page.keyset(items, q.limit(), hasNext, hasNext ? cursorCodec.encode(sort, last) : null);
+        }));
+    }
+
+    // ---------------------------------------------------------------- offset
+
+    private Page<T> findOffset(QueryRequest req, Pagination.Offset o) {
+        SelectQueryBuilder.SqlQuery q = builder.buildOffset(req, selectColumns());
+        RowMapper<T> mapper = rowMapper();
+
+        Page<T> page = timed(q, () -> jdbc.query(q.sql(), q.params(), rs -> {
+            List<T> items = new ArrayList<>(q.limit());
+            boolean hasNext = false;
+            int n = 0;
+            while (rs.next()) {
+                if (n == q.limit()) { hasNext = true; break; }   // the +1 row
+                items.add(mapper.mapRow(rs, n++));
+            }
+            return Page.offset(items, q.limit(), hasNext, o.page(), null);
+        }));
+
+        if (!o.includeTotal()) return page;
+        long total = count(req);
+        return new Page<>(page.items(), page.pageSize(), page.hasNext(), null, o.page(), total);
+    }
+
+    /** Separate so services can cache it (Caffeine/@Cacheable keyed on filters). */
+    public long count(QueryRequest req) {
+        SelectQueryBuilder.SqlQuery q = builder.buildCount(req);
+        Long c = timed(q, () -> jdbc.queryForObject(q.sql(), q.params(), Long.class));
+        return c == null ? 0 : c;
+    }
+
+    // ---------------------------------------------------------------- metrics / slow log
+
+    private <R> R timed(SelectQueryBuilder.SqlQuery q, Supplier<R> body) {
+        long start = System.nanoTime();
+        try {
+            return body.get();
+        } finally {
+            long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            queryTimer.record(ms, TimeUnit.MILLISECONDS);
+            if (ms >= slowQueryThresholdMs)
+                log.warn("Slow StarRocks query ({} ms) on {}: {} params={}", ms, def.table(), q.sql(), q.params());
+            else if (log.isDebugEnabled())
+                log.debug("StarRocks query ({} ms): {} params={}", ms, q.sql(), q.params());
+        }
+    }
+}
+```
+
+## 4. A service using offset mode — no tie-breaker
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrderTable.java
+static final TableDefinition DEF = TableDefinition.builder("dw.fact_orders")
+        .col("orderTime",  "order_time",  TIMESTAMP, FILTERABLE, SORTABLE, REQUIRED_RANGE)
+        .col("customerId", "customer_id", LONG,      FILTERABLE, SORTABLE)
+        .col("status",     "status",      STRING,    FILTERABLE)
+        .col("amount",     "amount",      DECIMAL,   FILTERABLE, SORTABLE)
+        .col("currency",   "currency",    STRING)
+        // Sort on several columns to minimise ties -> fewer "shifting rows" between pages
+        .defaultSort(desc("orderTime"), desc("customerId"), desc("amount"))
+        .pagination(PaginationMode.OFFSET)     // no tieBreaker() call
+        .maxOffset(50_000)                     // 500 pages of 100 – deeper pages are a smell
+        .defaultPageSize(100)
+        .maxPageSize(500)
+        .build();
+```
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrderQueryService.java
+public record OrderSearch(LocalDateTime from, LocalDateTime to, Long customerId, Set<String> statuses,
+                          List<SortOrder> sort, int page, int size, boolean includeTotal) {}
+
+public Page<OrderView> search(OrderSearch s) {
+    List<Filter> filters = new ArrayList<>();
+    filters.add(Filter.gte("orderTime", s.from()));
+    filters.add(Filter.lt("orderTime", s.to()));
+    if (s.customerId() != null) filters.add(Filter.eq("customerId", s.customerId()));
+    if (s.statuses() != null && !s.statuses().isEmpty()) filters.add(Filter.in("status", List.copyOf(s.statuses())));
+
+    return repo.findPage(new QueryRequest(filters, s.sort(),
+            new Pagination.Offset(s.size(), s.page(), s.includeTotal())));
+}
+```
+
+```java
+// service-orders/src/main/java/com/acme/orders/OrderController.java
+/** GET /api/v1/orders?from=...&to=...&page=0&size=100&includeTotal=true&sort=orderTime,desc */
+@GetMapping
+public Page<OrderView> search(
+        @RequestParam @DateTimeFormat(iso = ISO.DATE_TIME) LocalDateTime from,
+        @RequestParam @DateTimeFormat(iso = ISO.DATE_TIME) LocalDateTime to,
+        @RequestParam(required = false) Long customerId,
+        @RequestParam(required = false) Set<@Size(max = 16) String> status,
+        @RequestParam(required = false) List<String> sort,
+        @RequestParam(defaultValue = "0")   @Min(0) int page,
+        @RequestParam(defaultValue = "100") @Min(1) @Max(500) int size,
+        @RequestParam(defaultValue = "false") boolean includeTotal) {
+
+    if (!to.isAfter(from) || Duration.between(from, to).compareTo(MAX_RANGE) > 0)
+        throw new QueryValidationException("Time range must be positive and at most " + MAX_RANGE.toDays() + " days");
+
+    return service.search(new OrderQueryService.OrderSearch(
+            from, to, customerId, status, SortParam.parse(sort), page, size, includeTotal));
+}
+```
+
+Response:
+
+```json
+{ "items": [ ... ], "pageSize": 100, "hasNext": true, "page": 3, "total": 48213 }
+```
+
+Add to `application.yml` so the unused mode's fields are omitted:
+
+```yaml
+spring:
+  jackson:
+    default-property-inclusion: non_null
+```
+
+A service that *does* have a unique key simply declares `.tieBreaker("eventId").pagination(KEYSET, OFFSET)` and can serve both — e.g. offset for a UI with numbered pages, keyset for API consumers that walk the whole result.
+
+## 5. Offset-specific production notes for StarRocks
+
+1. **Cost model.** `ORDER BY … LIMIT 100 OFFSET 50 000` makes each BE keep a top-50 100 heap over its scanned data and the FE merge them. It's fine for tens of thousands of rows; it's terrible for millions. That's why `maxOffset` is a hard cap, not a suggestion. The error message tells the user to narrow filters, which is the correct UX for billions of rows.
+2. **The bounded range filter matters even more now.** Partition pruning is what keeps the per-BE heap small. Keep `REQUIRED_RANGE` + the `Duration` cap.
+3. **`includeTotal` is the expensive flag.** Default it to `false`, let the UI request it once on the first page, and cache `count()` per filter set for 1–5 minutes (Caffeine `@Cacheable` on a service method keyed by the filters). Don't let every page request re-count.
+4. **Match the table sort key.** If the service sorts by `order_time DESC` and the table's `DUPLICATE KEY(customer_id, order_time, …)` leads with `customer_id`, StarRocks can't use the prefix index for ordering unless `customer_id` is filtered with `=`. Either make the default sort match the key or build a sync materialized view with the right ordering.
+5. **Honest contract.** Document in the API that, without a unique key, rows with identical sort values may shift between pages. If the business later says "we can't have that", add an `AUTO_INCREMENT` column or an ingestion-time id and flip the definition to `KEYSET` — nothing else in the service changes.
