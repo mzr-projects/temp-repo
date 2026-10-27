@@ -1,0 +1,436 @@
+Caching counts correctly has two traps: Spring's `@Cacheable` won't fire when `findOffset()` calls `count()` on the same object (self-invocation bypasses the proxy), and without per-key locking a popular first page triggers N identical `COUNT(*)` queries at the same instant (cache stampede). So instead of `@Cacheable`, the platform gets a small `CountCache` abstraction backed by Caffeine, which does per-key synchronous loading out of the box. Every repository gets it for free; services only decide the TTL.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as OrderRepository
+    participant CC as CountCache (Caffeine, per table)
+    participant SR as StarRocks
+    C->>R: findPage(page=0, includeTotal=true)
+    R->>SR: SELECT ... LIMIT 101 OFFSET 0
+    R->>CC: getOrLoad(key = count SQL + bound params)
+    alt miss (first caller locks the key)
+        CC->>SR: SELECT COUNT(*) ... WHERE filters
+        SR-->>CC: 48213
+    else hit / concurrent callers wait on the same key
+        CC-->>R: 48213
+    end
+    R-->>C: { items, page:0, total:48213 }
+```
+
+## 1. Dependency (`platform-starrocks/pom.xml`)
+
+```xml
+<dependency>
+    <groupId>com.github.ben-manes.caffeine</groupId>
+    <artifactId>caffeine</artifactId>   <!-- version managed by the Boot BOM -->
+</dependency>
+```
+
+## 2. Configuration
+
+```yaml
+starrocks:
+  # ...jdbc-url, pool, etc. as before
+  count-cache:
+    enabled: true
+    ttl: 5m          # global default; a TableDefinition may override
+    max-entries: 10000
+```
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/StarRocksProperties.java
+package com.acme.platform.starrocks;
+
+import jakarta.validation.constraints.*;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
+import org.springframework.validation.annotation.Validated;
+
+import java.time.Duration;
+
+@Validated
+@ConfigurationProperties(prefix = "starrocks")
+public record StarRocksProperties(
+        @NotBlank String jdbcUrl,
+        @NotBlank String username,
+        String password,
+        @Min(1) int queryTimeoutSeconds,
+        @Min(0) long slowQueryThresholdMs,
+        Pool pool,
+        @DefaultValue CountCache countCache) {          // @DefaultValue => instantiated even if the block is absent
+
+    public record Pool(@Min(1) int maximumPoolSize, @Min(0) int minimumIdle,
+                       long connectionTimeoutMs, long maxLifetimeMs, long keepaliveTimeMs) {}
+
+    public record CountCache(@DefaultValue("true") boolean enabled,
+                             @DefaultValue("5m") Duration ttl,
+                             @DefaultValue("10000") @Min(1) long maxEntries) {}
+}
+```
+
+## 3. `platform-core`: optional per-table TTL
+
+Only the additions to `TableDefinition`:
+
+```java
+public final class TableDefinition {
+    private final Duration countCacheTtl;            // null => use starrocks.count-cache.ttl
+
+    private TableDefinition(Builder b) {
+        // ... existing ...
+        this.countCacheTtl = b.countCacheTtl;
+    }
+
+    public Optional<Duration> countCacheTtl() { return Optional.ofNullable(countCacheTtl); }
+
+    public static final class Builder {
+        private Duration countCacheTtl;
+        public Builder countCacheTtl(Duration d) { this.countCacheTtl = d; return this; }
+        // ... existing ...
+    }
+}
+```
+
+## 4. `platform-starrocks`: the cache
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/cache/CountKey.java
+package com.acme.platform.starrocks.cache;
+
+import java.util.Map;
+
+/**
+ * Identity of a count = the final COUNT(*) SQL plus its *coerced* bind values.
+ * Using the built query (not the raw request) means "2025-01-01T00:00:00" as a String
+ * and as a LocalDateTime hit the same entry, and sort/pagination never pollute the key.
+ */
+public record CountKey(String sql, Map<String, Object> params) {}
+```
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/cache/CountCache.java
+package com.acme.platform.starrocks.cache;
+
+import com.acme.platform.query.TableDefinition;
+
+import java.util.function.LongSupplier;
+
+/** Swap the implementation (e.g. Redis for a shared cross-pod cache) by defining your own bean. */
+public interface CountCache {
+
+    /** Returns the cached count, or runs {@code loader} exactly once per key and caches its result. */
+    long getOrLoad(TableDefinition def, CountKey key, LongSupplier loader);
+
+    void evict(String table);
+
+    void evictAll();
+
+    static CountCache noop() {
+        return new CountCache() {
+            @Override public long getOrLoad(TableDefinition d, CountKey k, LongSupplier l) { return l.getAsLong(); }
+            @Override public void evict(String table) {}
+            @Override public void evictAll() {}
+        };
+    }
+}
+```
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/cache/CaffeineCountCache.java
+package com.acme.platform.starrocks.cache;
+
+import com.acme.platform.query.TableDefinition;
+import com.acme.platform.starrocks.StarRocksProperties;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
+
+/**
+ * One Caffeine cache per table so each table can have its own TTL and its own metrics
+ * (cache.gets{result=hit|miss}, cache.size, cache.evictions – tagged with table=...).
+ * Caffeine's get(key, mappingFunction) is atomic per key: concurrent requests for the same
+ * filters block on one COUNT(*) instead of all hitting StarRocks (no stampede).
+ */
+public final class CaffeineCountCache implements CountCache {
+
+    private static final Logger log = LoggerFactory.getLogger(CaffeineCountCache.class);
+
+    private final StarRocksProperties.CountCache props;
+    private final MeterRegistry registry;
+    private final Map<String, Cache<CountKey, Long>> caches = new ConcurrentHashMap<>();
+
+    public CaffeineCountCache(StarRocksProperties.CountCache props, MeterRegistry registry) {
+        this.props = props;
+        this.registry = registry;
+    }
+
+    @Override
+    public long getOrLoad(TableDefinition def, CountKey key, LongSupplier loader) {
+        Cache<CountKey, Long> cache = caches.computeIfAbsent(def.table(), t -> create(def));
+        Long v = cache.get(key, k -> loader.getAsLong());
+        return v == null ? 0L : v;
+    }
+
+    @Override
+    public void evict(String table) {
+        Cache<CountKey, Long> c = caches.get(table);
+        if (c != null) { c.invalidateAll(); log.info("Evicted count cache for {}", table); }
+    }
+
+    @Override
+    public void evictAll() {
+        caches.values().forEach(Cache::invalidateAll);
+        log.info("Evicted all count caches");
+    }
+
+    private Cache<CountKey, Long> create(TableDefinition def) {
+        Duration ttl = def.countCacheTtl().orElse(props.ttl());
+        Cache<CountKey, Long> cache = Caffeine.newBuilder()
+                .expireAfterWrite(ttl)
+                .maximumSize(props.maxEntries())
+                .recordStats()
+                .build();
+        CaffeineCacheMetrics.monitor(registry, cache, "starrocks.count", Tags.of("table", def.table()));
+        log.info("Count cache for {}: ttl={}, maxEntries={}", def.table(), ttl, props.maxEntries());
+        return cache;
+    }
+}
+```
+
+## 5. Bundle infra dependencies (`StarRocksQuerySupport`)
+
+Repository constructors were already taking six beans; adding a seventh is the moment to stop. This holder is injected once and every repository becomes `super(support, DEF)`. Future platform additions never touch service code again.
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/StarRocksQuerySupport.java
+package com.acme.platform.starrocks;
+
+import com.acme.platform.starrocks.cache.CountCache;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+
+/** Everything a read repository needs from the platform, in one injectable unit. */
+public record StarRocksQuerySupport(NamedParameterJdbcTemplate jdbc,
+                                    CursorCodec cursorCodec,
+                                    ValueCoercer coercer,
+                                    CountCache countCache,
+                                    MeterRegistry registry,
+                                    StarRocksProperties props) {}
+```
+
+```java
+// StarRocksAutoConfiguration.java – additions
+@Bean
+@ConditionalOnMissingBean(CountCache.class)
+public CountCache countCache(StarRocksProperties p, MeterRegistry registry) {
+    return p.countCache().enabled()
+            ? new CaffeineCountCache(p.countCache(), registry)
+            : CountCache.noop();
+}
+
+@Bean
+public StarRocksQuerySupport starRocksQuerySupport(NamedParameterJdbcTemplate jdbc, CursorCodec codec,
+                                                   ValueCoercer coercer, CountCache countCache,
+                                                   MeterRegistry registry, StarRocksProperties props) {
+    return new StarRocksQuerySupport(jdbc, codec, coercer, countCache, registry, props);
+}
+```
+
+## 6. Repository changes
+
+```java
+// platform-starrocks/src/main/java/com/acme/platform/starrocks/AbstractStarRocksReadRepository.java
+public abstract class AbstractStarRocksReadRepository<T> {
+
+    private static final Logger log = LoggerFactory.getLogger(AbstractStarRocksReadRepository.class);
+
+    protected final NamedParameterJdbcTemplate jdbc;
+    protected final TableDefinition def;
+    private final SelectQueryBuilder builder;
+    private final CursorCodec cursorCodec;
+    private final ValueCoercer coercer;
+    private final CountCache countCache;
+    private final Timer queryTimer;
+    private final Timer countTimer;
+    private final long slowQueryThresholdMs;
+
+    protected AbstractStarRocksReadRepository(StarRocksQuerySupport s, TableDefinition def) {
+        this.jdbc = s.jdbc();
+        this.def = def;
+        this.cursorCodec = s.cursorCodec();
+        this.coercer = s.coercer();
+        this.countCache = s.countCache();
+        this.builder = new SelectQueryBuilder(def, s.coercer());
+        this.slowQueryThresholdMs = s.props().slowQueryThresholdMs();
+        this.queryTimer = Timer.builder("starrocks.query").tag("table", def.table())
+                .publishPercentiles(0.5, 0.95, 0.99).register(s.registry());
+        this.countTimer = Timer.builder("starrocks.count").tag("table", def.table())
+                .publishPercentiles(0.5, 0.95, 0.99).register(s.registry());
+    }
+
+    // findPage / findKeyset unchanged
+
+    private Page<T> findOffset(QueryRequest req, Pagination.Offset o) {
+        SelectQueryBuilder.SqlQuery q = builder.buildOffset(req, selectColumns());
+        RowMapper<T> mapper = rowMapper();
+
+        Page<T> page = timed(queryTimer, q, () -> jdbc.query(q.sql(), q.params(), rs -> {
+            List<T> items = new ArrayList<>(q.limit());
+            boolean hasNext = false;
+            int n = 0;
+            while (rs.next()) {
+                if (n == q.limit()) { hasNext = true; break; }
+                items.add(mapper.mapRow(rs, n++));
+            }
+            return Page.offset(items, q.limit(), hasNext, o.page(), null);
+        }));
+
+        if (!o.includeTotal()) return page;
+        return new Page<>(page.items(), page.pageSize(), page.hasNext(), null, o.page(), count(req));
+    }
+
+    // ---------------------------------------------------------------- counting
+
+    /** Cached count for the request's filters (sort/pagination are ignored for the key). */
+    public long count(QueryRequest req) {
+        SelectQueryBuilder.SqlQuery q = builder.buildCount(req);
+        CountKey key = new CountKey(q.sql(), q.params());
+        return countCache.getOrLoad(def, key, () -> executeCount(q));
+    }
+
+    /** Bypasses the cache – for admin/ops or when a caller explicitly asks for a fresh number. */
+    public long countFresh(QueryRequest req) {
+        return executeCount(builder.buildCount(req));
+    }
+
+    /** Call after a backfill/reload of this table. */
+    public void evictCounts() {
+        countCache.evict(def.table());
+    }
+
+    private long executeCount(SelectQueryBuilder.SqlQuery q) {
+        Long c = timed(countTimer, q, () -> jdbc.queryForObject(q.sql(), q.params(), Long.class));
+        return c == null ? 0L : c;
+    }
+
+    private <R> R timed(Timer timer, SelectQueryBuilder.SqlQuery q, Supplier<R> body) {
+        long start = System.nanoTime();
+        try {
+            return body.get();
+        } finally {
+            long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            timer.record(ms, TimeUnit.MILLISECONDS);
+            if (ms >= slowQueryThresholdMs)
+                log.warn("Slow StarRocks query ({} ms) on {}: {} params={}", ms, def.table(), q.sql(), q.params());
+            else if (log.isDebugEnabled())
+                log.debug("StarRocks query ({} ms): {} params={}", ms, q.sql(), q.params());
+        }
+    }
+}
+```
+
+Note that a failed `COUNT(*)` (timeout, FE down) throws out of `getOrLoad` and nothing is cached — Caffeine only stores on successful completion, so a transient failure can't poison the cache.
+
+## 7. Operational eviction endpoint (`platform-web`)
+
+After a nightly reload you'll want to drop stale totals without a restart. This is an Actuator endpoint, so it lives on the management port and under Actuator security — never on the public API.
+
+```java
+// platform-web/src/main/java/com/acme/platform/web/CountCacheEndpoint.java
+package com.acme.platform.web;
+
+import com.acme.platform.starrocks.cache.CountCache;
+import org.springframework.boot.actuate.endpoint.annotation.DeleteOperation;
+import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
+import org.springframework.boot.actuate.endpoint.annotation.Selector;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+
+/**
+ *  DELETE /actuator/countcache            -> evict all tables
+ *  DELETE /actuator/countcache/dw.fact_orders -> evict one table
+ */
+@Component
+@Endpoint(id = "countcache")
+public class CountCacheEndpoint {
+
+    private final CountCache cache;
+
+    public CountCacheEndpoint(CountCache cache) { this.cache = cache; }
+
+    @DeleteOperation
+    public Map<String, String> evictAll() {
+        cache.evictAll();
+        return Map.of("status", "evicted", "scope", "all");
+    }
+
+    @DeleteOperation
+    public Map<String, String> evict(@Selector String table) {
+        cache.evict(table);
+        return Map.of("status", "evicted", "scope", table);
+    }
+}
+```
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,countcache
+```
+
+## 8. Service side — what changes
+
+```java
+// OrderTable.java – only if you want to differ from the global 5 minutes
+static final TableDefinition DEF = TableDefinition.builder("dw.fact_orders")
+        // ... columns, sort, pagination as before
+        .countCacheTtl(Duration.ofMinutes(2))   // orders land continuously; keep totals fresher
+        .build();
+```
+
+```java
+// OrderRepository.java – constructor shrinks to this
+public OrderRepository(StarRocksQuerySupport support) {
+    super(support, OrderTable.DEF);
+}
+```
+
+Nothing changes in `OrderQueryService` or `OrderController`: `includeTotal=true` now transparently returns a cached total.
+
+If you also want a dedicated count endpoint (so the UI can request the total once and then page with `includeTotal=false`):
+
+```java
+// OrderQueryService.java
+public long count(OrderSearch s) {
+    return repo.count(new QueryRequest(filtersOf(s), List.of(), new Pagination.Offset(1, 0, false)));
+}
+
+// OrderController.java
+@GetMapping("/count")
+public Map<String, Long> count(/* same from/to/customerId/status params */) {
+    return Map.of("total", service.count(new OrderQueryService.OrderSearch(from, to, customerId, status,
+            List.of(), 0, 1, false)));
+}
+```
+
+(Extract the filter-building into a private `filtersOf(OrderSearch)` so `search()` and `count()` share it — that keeps the cache key identical for both paths.)
+
+## 9. Things to be aware of
+
+1. **Total and items can disagree slightly.** `hasNext` comes from the live `LIMIT n+1` row; `total` may be up to one TTL old. For an append-only fact table that means the last page might show `hasNext: true` while `page*size >= total`. UIs should trust `hasNext` for navigation and treat `total` as informative — document this in the API.
+2. **Key cardinality.** Each distinct filter combination is an entry. Free-form filters (`customerId`, arbitrary time ranges) can produce many keys; `max-entries` bounds memory (an entry is ~ the SQL string + a few boxed values, so 10 000 entries is a couple of MB). Watch `cache_gets_total{result="miss"}` vs `hit` in Prometheus — if the hit rate is low, caching isn't buying you anything for that service and you can set `countCacheTtl` to a longer value or round time ranges to the minute in the controller so near-identical requests share entries.
+3. **Multiple instances.** Caffeine is per JVM; with 4 pods you'll run up to 4 counts per key per TTL. That's usually fine. If it's not, implement `CountCache` over Redis (`SETNX` for the lock, `SET … EX ttl` for the value) and declare it as a bean — the `@ConditionalOnMissingBean` makes the platform back off automatically.
+4. **Don't cache deep-page `hasNext`.** It's tempting, but it's cheap already (the +1 row) and caching it would make pagination lie.
