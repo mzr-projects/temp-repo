@@ -1,1 +1,7 @@
 LC_ALL=C grep -rhoF --include='*.csv' 'your string' /path/to/dir | wc -l
+
+
+export LC_ALL=C
+find /path/to/dir -name '*.csv' -print0 \
+  | xargs -0 -P "$(nproc)" -n 100 grep -hoF 'your string' \
+  | wc -l
