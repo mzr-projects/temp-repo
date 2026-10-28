@@ -5,3 +5,8 @@ export LC_ALL=C
 find /path/to/dir -name '*.csv' -print0 \
   | xargs -0 -P "$(nproc)" -n 100 grep -hoF 'your string' \
   | wc -l
+
+
+find /path/to/dir -name '*.csv' -print0 \
+  | xargs -0 -P "$(nproc)" -n 100 grep -cF 'your string' \
+  | awk -F: '{s+=$NF} END{print s}'
