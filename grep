@@ -1,0 +1,1 @@
+LC_ALL=C grep -rhoF --include='*.csv' 'your string' /path/to/dir | wc -l
